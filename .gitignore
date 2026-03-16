@@ -1,0 +1,12 @@
+# Data and model artifacts
+NCAABB/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/

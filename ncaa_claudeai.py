@@ -68,8 +68,15 @@ USAGE (Colab):
 # !apt-get -qq install -y r-base
 # !pip -q install rpy2 pyarrow pandas lightgbm scikit-learn xgboost ipywidgets
 
-from google.colab import drive
-drive.mount("/content/drive")
+try:
+    from google.colab import drive
+    IN_COLAB = True
+except ImportError:
+    drive = None
+    IN_COLAB = False
+
+if IN_COLAB:
+    drive.mount("/content/drive")
 
 import os, sys, re, glob, json, warnings, contextlib, unicodedata, hashlib
 from pathlib import Path
@@ -95,7 +102,10 @@ warnings.filterwarnings("ignore")
 
 CURRENT_SEASON = 2026
 
-BASE_DIR        = "/content/drive/MyDrive/NCAABB"
+if IN_COLAB:
+    BASE_DIR = "/content/drive/MyDrive/NCAABB"
+else:
+    BASE_DIR = os.environ.get("NCAABB_BASE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "NCAABB")
 RAW_DIR         = os.path.join(BASE_DIR, "raw_hoopr_parquets")
 ROTOWIRE_DIR    = os.path.join(BASE_DIR, "roto-odds")
 INJURY_DIR      = os.path.join(BASE_DIR, "cbb-injuries")
@@ -692,6 +702,7 @@ def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: st
 #   Total = Over-Under from home row (or away row as fallback)
 
 RW_FIELDS = ["rw_away_ml", "rw_home_ml", "rw_spread_home", "rw_total"]
+ROTOWIRE_DATE_CACHE = {}
 
 
 def _to_float(x):
@@ -702,6 +713,17 @@ def _to_float(x):
     s2 = re.sub(r"[^0-9.\-]", "", s)
     try: return float(s2) if s2 not in ("", "-", ".") else np.nan
     except: return np.nan
+
+
+def _rotowire_file_signature(files) -> tuple:
+    parts = []
+    for f in sorted(files):
+        try:
+            st = os.stat(f)
+            parts.append((f, int(st.st_mtime_ns), int(st.st_size)))
+        except OSError:
+            parts.append((f, None, None))
+    return tuple(parts)
 
 
 def _parse_rotowire_csv(path: str) -> pd.DataFrame:
@@ -814,17 +836,26 @@ def find_rotowire_files_for_date(date_et, rotowire_dir: str) -> list:
 
 def load_rotowire_all_for_date(date_et, rotowire_dir: str) -> pd.DataFrame:
     """Loads and concatenates all Rotowire files for a slate date."""
+    date_key = str(pd.Timestamp(date_et).date())
     files = find_rotowire_files_for_date(date_et, rotowire_dir)
     if not files:
+        ROTOWIRE_DATE_CACHE.pop(date_key, None)
         return pd.DataFrame()
+    sig = _rotowire_file_signature(files)
+    cached = ROTOWIRE_DATE_CACHE.get(date_key)
+    if cached and cached.get("signature") == sig:
+        return cached["df"].copy()
     dfs = [_parse_rotowire_csv(f) for f in files]
     dfs = [d for d in dfs if len(d) > 0]
     if not dfs:
+        ROTOWIRE_DATE_CACHE[date_key] = {"signature": sig, "df": pd.DataFrame()}
         return pd.DataFrame()
     out = pd.concat(dfs, ignore_index=True)
     out = out.dropna(subset=["away_team", "home_team"])
     out = out[out["away_team"].str.strip().ne("") & out["home_team"].str.strip().ne("")]
-    return out.reset_index(drop=True)
+    out = out.reset_index(drop=True)
+    ROTOWIRE_DATE_CACHE[date_key] = {"signature": sig, "df": out.copy()}
+    return out.copy()
 
 
 # ============================================================
