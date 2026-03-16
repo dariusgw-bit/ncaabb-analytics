@@ -1331,6 +1331,42 @@ def ensure_board_team_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _dedupe_game_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame() if df is None else df.copy()
+
+    out = df.copy()
+
+    if "game_id" in out.columns:
+        gid = out["game_id"].astype(str).str.strip()
+        valid_gid = gid.ne("") & ~gid.isin(["nan", "None"])
+        if valid_gid.any():
+            return pd.concat(
+                [
+                    out.loc[~valid_gid],
+                    out.loc[valid_gid].drop_duplicates(subset=["game_id"], keep="last"),
+                ]
+            ).sort_index().reset_index(drop=True)
+
+    if {"game_dt_et", "home_id", "away_id"}.issubset(out.columns):
+        key = out[["game_dt_et", "home_id", "away_id"]].copy()
+        if key.notna().all(axis=1).any():
+            return out.drop_duplicates(subset=["game_dt_et", "home_id", "away_id"], keep="last").reset_index(drop=True)
+
+    if {"game_dt_et", "away_team", "home_team"}.issubset(out.columns):
+        key = out[["game_dt_et", "away_team", "home_team"]].copy()
+        valid_key = key["game_dt_et"].notna()
+        if valid_key.any():
+            return pd.concat(
+                [
+                    out.loc[~valid_key],
+                    out.loc[valid_key].drop_duplicates(subset=["game_dt_et", "away_team", "home_team"], keep="last"),
+                ]
+            ).sort_index().reset_index(drop=True)
+
+    return out.reset_index(drop=True)
+
+
 def build_pregame_dataset_for_slate(
     schedule_df: pd.DataFrame,
     team_snaps: pd.DataFrame,
@@ -1507,7 +1543,8 @@ def build_pregame_dataset_for_slate(
     if joined.columns.duplicated().any():
         joined = joined.loc[:, ~joined.columns.duplicated()].copy()
 
-    return ensure_board_team_columns(joined).reset_index(drop=True)
+    joined = ensure_board_team_columns(joined).reset_index(drop=True)
+    return _dedupe_game_rows(joined)
 
 # ============================================================
 # CELL 8b: SAFETY PATCH FOR DOWNSTREAM
@@ -2839,9 +2876,7 @@ def build_board_for_date(
     board = normalize_board_for_downstream(board)
 
     # dedupe
-    dedupe_cols = [c for c in ["game_id", "away_team", "home_team", "game_dt_et"] if c in board.columns]
-    if dedupe_cols:
-        board = board.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
+    board = _dedupe_game_rows(board)
 
     return board
 
