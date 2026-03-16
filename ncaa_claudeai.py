@@ -634,14 +634,16 @@ def _parse_injury_file(path: str) -> pd.DataFrame:
         if s in {"out", "doubtful", "d", "dnp", "suspended", "out for season"}:
             return "out"
         if s in {"game time decision", "gtd", "questionable", "q", "day-to-day",
-                 "dtd", "probable", "p", "50/50"}:
+                 "dtd", "50/50"}:
             return "questionable"
+        if s in {"probable", "p"}:
+            return "probable"
         return "active"
 
     out["status_bucket"] = out["status_raw"].map(_bucket)
 
-    # Impact weight: out=1.0, questionable=0.5, active=0.0
-    _weight = {"out": 1.0, "questionable": 0.5, "active": 0.0}
+    # Impact weight: out=1.0, questionable=0.5, probable=0.1, active=0.0
+    _weight = {"out": 1.0, "questionable": 0.5, "probable": 0.1, "active": 0.0}
     out["impact_weight"] = out["status_bucket"].map(_weight)
 
     # Canonical team name for matching
