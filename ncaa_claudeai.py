@@ -506,6 +506,8 @@ def add_elo_asof_features(joined: pd.DataFrame, elo_df: pd.DataFrame) -> pd.Data
 #   Also accepts .csv variants with same columns.
 # ============================================================
 
+INJURY_DATE_CACHE = {}
+
 def find_injury_files_for_date(date_et, injury_dir: str) -> list:
     """
     Finds injury files for a given date.
@@ -537,6 +539,17 @@ def find_injury_files_for_date(date_et, injury_dir: str) -> list:
 
     hits.sort(key=lambda x: (x[0] != "", x[0]))  # base first, then a, b, c...
     return [f for _, f in hits]
+
+
+def _injury_file_signature(files) -> tuple:
+    parts = []
+    for f in sorted(files):
+        try:
+            st = os.stat(f)
+            parts.append((f, int(st.st_mtime_ns), int(st.st_size)))
+        except OSError:
+            parts.append((f, None, None))
+    return tuple(parts)
 
 
 def _parse_injury_file(path: str) -> pd.DataFrame:
@@ -680,10 +693,31 @@ def compute_injury_impact(injury_df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
-def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: str) -> pd.DataFrame:
-    """Merges injury impact features into board (home/away columns)."""
+def _load_injury_impact_for_date(date_et, injury_dir: str) -> pd.DataFrame:
+    date_key = str(pd.Timestamp(date_et).date())
+    files = find_injury_files_for_date(date_et, injury_dir)
+    if not files:
+        INJURY_DATE_CACHE.pop(date_key, None)
+        return pd.DataFrame()
+
+    sig = _injury_file_signature(files)
+    cached = INJURY_DATE_CACHE.get(date_key)
+    if cached and cached.get("signature") == sig:
+        return cached["impact_df"].copy()
+
     inj_raw = load_injury_data_for_date(date_et, injury_dir)
     inj = compute_injury_impact(inj_raw)
+    INJURY_DATE_CACHE[date_key] = {
+        "signature": sig,
+        "raw_df": inj_raw.copy(),
+        "impact_df": inj.copy(),
+    }
+    return inj.copy()
+
+
+def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: str) -> pd.DataFrame:
+    """Merges injury impact features into board (home/away columns)."""
+    inj = _load_injury_impact_for_date(date_et, injury_dir)
 
     if len(inj) == 0:
         for col in ["home_injury_impact", "away_injury_impact", "diff_injury_impact",
