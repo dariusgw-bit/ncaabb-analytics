@@ -312,6 +312,16 @@ def canonical_team(x: str) -> str:
     return s
 
 
+CANONICAL_MISMATCH_DEBUG = {}
+
+
+def _record_canonical_mismatch(bucket, sample):
+    entry = CANONICAL_MISMATCH_DEBUG.setdefault(bucket, {"count": 0, "samples": []})
+    entry["count"] += 1
+    if len(entry["samples"]) < 10:
+        entry["samples"].append(sample)
+
+
 # ============================================================
 # CELL 5: ELO RATING ENGINE
 # FULL REWRITE — fixes merge_asof datetime dtype mismatch
@@ -732,6 +742,18 @@ def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: st
     inj_dict = inj.set_index("team_canon")["injury_impact_score"].to_dict()
     out_dict  = inj.set_index("team_canon")["injury_count_out"].to_dict()
 
+    board_canon = set(b["k_home"].dropna().tolist()) | set(b["k_away"].dropna().tolist())
+    date_key = str(pd.Timestamp(date_et).date())
+    inj_raw = INJURY_DATE_CACHE.get(date_key, {}).get("raw_df", pd.DataFrame())
+    unmatched_inj = inj_raw[~inj_raw["team_canon"].isin(board_canon)].copy() if len(inj_raw) else pd.DataFrame()
+    for _, row in unmatched_inj.drop_duplicates(subset=["team_canon", "team"]).head(10).iterrows():
+        _record_canonical_mismatch("injury_board_unmatched", {
+            "date": str(pd.Timestamp(date_et).date()),
+            "team": row.get("team"),
+            "team_canon": row.get("team_canon"),
+            "player": row.get("player", ""),
+        })
+
     b["home_injury_impact"] = b["k_home"].map(inj_dict).fillna(0.0)
     b["away_injury_impact"] = b["k_away"].map(inj_dict).fillna(0.0)
     b["diff_injury_impact"] = b["home_injury_impact"] - b["away_injury_impact"]
@@ -1105,6 +1127,16 @@ def _build_rotowire_fallback_slate(
     out["away_id"] = out["away_canon"].map(name_to_id)
     out["home_id"] = out["home_canon"].map(name_to_id)
 
+    missing_ids = out[out["away_id"].isna() | out["home_id"].isna()]
+    for _, row in missing_ids.head(10).iterrows():
+        _record_canonical_mismatch("rotowire_fallback_id_unmapped", {
+            "date": str(pd.Timestamp(slate_date_et).date()),
+            "away_team": row.get("away_team"),
+            "home_team": row.get("home_team"),
+            "away_canon": row.get("away_canon"),
+            "home_canon": row.get("home_canon"),
+        })
+
     out = out.dropna(subset=["away_id", "home_id"]).copy()
     if len(out) == 0:
         return pd.DataFrame()
@@ -1211,6 +1243,13 @@ def _fill_tbd_schedule_from_rotowire(
                 cand = remaining
 
         if len(cand) == 0:
+            _record_canonical_mismatch("rotowire_tbd_unresolved", {
+                "date": str(pd.Timestamp(slate_date_et).date()),
+                "home_team": home_name,
+                "away_team": away_name,
+                "home_canon": canonical_team(home_name) if not home_bad else "tbd",
+                "away_canon": canonical_team(away_name) if not away_bad else "tbd",
+            })
             continue
 
         row = cand.iloc[0]
@@ -2802,6 +2841,17 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
         m[["k_game","rw_spread_home","rw_home_ml","rw_away_ml","rw_total","k_home","k_away"]],
         on="k_game", how="left", suffixes=("", "_rw")
     )
+
+    missing_rw = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
+    for _, row in merged.loc[~missing_rw].head(10).iterrows():
+        _record_canonical_mismatch("rotowire_board_unmatched", {
+            "date": str(pd.Timestamp(slate_date_et).date()),
+            "away_team": row.get("away_team"),
+            "home_team": row.get("home_team"),
+            "away_canon": row.get("k_away"),
+            "home_canon": row.get("k_home"),
+            "k_game": row.get("k_game"),
+        })
 
     if "k_home_rw" in merged.columns:
         same_home = merged["home_team"].map(canonical_team) == merged["k_home_rw"]
