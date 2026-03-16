@@ -173,6 +173,27 @@ def _days_since(ts_str) -> float:
     return _hours_since(ts_str) / 24
 
 
+def _training_input_signature(*base_dirs) -> str:
+    parts = []
+    for base_dir in base_dirs:
+        root = os.path.abspath(base_dir)
+        if not os.path.exists(root):
+            parts.append((root, None, None, None))
+            continue
+        for cur_root, _, files in os.walk(root):
+            for fn in sorted(files):
+                path = os.path.join(cur_root, fn)
+                try:
+                    st = os.stat(path)
+                    rel_path = os.path.relpath(path, root)
+                    parts.append((root, rel_path, int(st.st_mtime_ns), int(st.st_size)))
+                except OSError:
+                    rel_path = os.path.relpath(path, root)
+                    parts.append((root, rel_path, None, None))
+    payload = json.dumps(parts, sort_keys=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 # ============================================================
 # CELL 4: TEAM ALIAS + CANONICAL NAME
 # ============================================================
@@ -2440,6 +2461,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     team_box_hist = load_team_box_history(TEAM_BOX_DIR, HIST_SEASONS)
     tb_hist = team_box_hist.copy()
     schedule_cur = load_schedule(SCHEDULE_DIR, CURRENT_SEASON)
+    current_training_sig = _training_input_signature(TEAM_BOX_DIR, SCHEDULE_DIR)
     print(f"  team_box rows: {len(tb_hist):,}  |  schedule rows: {len(schedule_cur):,}")
 
     print("📊 Building rolling snapshots + Elo...")
@@ -2447,6 +2469,18 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
     # full Elo history for as-of merges
     elo_snap = compute_elo_ratings(tb_hist)
+
+    if not force_model and need_model:
+        saved_training_sig = meta.get("training_input_signature")
+        model_paths = [
+            os.path.join(MODEL_DIR, "spread_booster.json"),
+            os.path.join(MODEL_DIR, "winner_booster.json"),
+            os.path.join(MODEL_DIR, "lgb_spread.txt"),
+            os.path.join(MODEL_DIR, "iso_calibrator.pkl"),
+            os.path.join(MODEL_DIR, "imputer.pkl"),
+        ]
+        if saved_training_sig and saved_training_sig == current_training_sig and all(os.path.exists(p) for p in model_paths):
+            need_model = False
 
     if need_model:
         print(f"🔁 Full model retrain triggered (last: {meta.get('last_model_fit', 'never')})")
@@ -2469,6 +2503,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         save_models(spread_booster, winner_booster, lgb_spread, iso, imp, MODEL_DIR)
         meta["last_model_fit"] = now_str
         meta["feature_cols"] = feature_cols
+        meta["training_input_signature"] = current_training_sig
         _save_metadata(meta)
         print("✅ Model retrain complete")
 
