@@ -2314,6 +2314,38 @@ def load_schedule(schedule_dir: str, season: int) -> pd.DataFrame:
     return out
 
 
+def load_schedule_history(schedule_dir: str, seasons: list) -> pd.DataFrame:
+    """
+    Loads schedule files recursively and returns the requested seasons.
+    """
+    files = _find_files_recursive(schedule_dir, exts=(".parquet", ".csv", ".xlsx", ".xls"))
+    if not files:
+        raise FileNotFoundError(f"No schedule files found in {schedule_dir}")
+
+    dfs = []
+    for f in files:
+        df = _read_any_table(f)
+        if len(df) == 0:
+            continue
+        df = _normalize_schedule_columns(df)
+        if len(df) == 0:
+            continue
+        dfs.append(df)
+
+    if not dfs:
+        raise ValueError(f"No readable schedule data found in {schedule_dir}")
+
+    out = pd.concat(dfs, ignore_index=True)
+
+    if "season" in out.columns and out["season"].notna().any():
+        out = out[out["season"].isin(seasons)].copy()
+
+    out = out.sort_values(["game_date_time", "game_id"]).reset_index(drop=True)
+    out = out.drop_duplicates(subset=["game_id"], keep="last").reset_index(drop=True)
+
+    return out
+
+
 def build_team_rolling_snapshots(team_box_all: pd.DataFrame, window: int = ROLL_WINDOW):
     """
     Builds one row per team per played game with leakage-safe rolling features.
@@ -2461,6 +2493,10 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     team_box_hist = load_team_box_history(TEAM_BOX_DIR, HIST_SEASONS)
     tb_hist = team_box_hist.copy()
     schedule_cur = load_schedule(SCHEDULE_DIR, CURRENT_SEASON)
+    try:
+        schedule_hist = load_schedule_history(SCHEDULE_DIR, HIST_SEASONS)
+    except Exception:
+        schedule_hist = schedule_cur.copy()
     current_training_sig = _training_input_signature(TEAM_BOX_DIR, SCHEDULE_DIR)
     print(f"  team_box rows: {len(tb_hist):,}  |  schedule rows: {len(schedule_cur):,}")
 
@@ -2488,7 +2524,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
         dataset_all = build_game_dataset_from_team_box(
             team_box=tb_hist,
-            schedule_df=schedule_cur,
+            schedule_df=schedule_hist,
             window=ROLL_WINDOW,
             elo_df=elo_snap,
         )
