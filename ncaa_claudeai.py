@@ -849,6 +849,7 @@ def _parse_rotowire_csv(path: str) -> pd.DataFrame:
         return None
 
     team_col   = _find(["team", "teams"])
+    date_col   = _find(["date", "game date", "game_date", "game_date_time", "datetime", "start_date"])
     ml_col     = _find(["moneyline", "ml"])
     spread_col = _find(["spread"])
     total_col  = _find(["over-under", "over/under", "o/u", "ou", "total", "totals"])
@@ -861,6 +862,33 @@ def _parse_rotowire_csv(path: str) -> pd.DataFrame:
         s = str(s).strip().lower()
         return s in {"", "team", "teams", "nan", "none"} or re.fullmatch(r"[\d:apm /\-]+", s) is not None
 
+    def _norm_ts(v):
+        if not date_col:
+            return None
+        try:
+            ts = pd.to_datetime(v, errors="coerce")
+        except Exception:
+            return None
+        if pd.isna(ts):
+            return None
+        return str(ts)
+
+    def _pair_looks_valid(r1, r2):
+        t1 = str(r1.get(team_col, "")).strip()
+        t2 = str(r2.get(team_col, "")).strip()
+
+        if _bad(t1) or _bad(t2):
+            return False
+        if canonical_team(t1) == canonical_team(t2):
+            return False
+
+        ts1 = _norm_ts(r1.get(date_col)) if date_col else None
+        ts2 = _norm_ts(r2.get(date_col)) if date_col else None
+        if ts1 is not None and ts2 is not None and ts1 != ts2:
+            return False
+
+        return True
+
     data = data[~data[team_col].map(_bad)].reset_index(drop=True)
 
     rows = []
@@ -872,7 +900,7 @@ def _parse_rotowire_csv(path: str) -> pd.DataFrame:
         away_name = str(r_away[team_col]).strip()
         home_name = str(r_home[team_col]).strip()
 
-        if _bad(away_name) or _bad(home_name):
+        if not _pair_looks_valid(r_away, r_home):
             i += 1
             continue
 
