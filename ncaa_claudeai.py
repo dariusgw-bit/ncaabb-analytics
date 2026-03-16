@@ -1499,6 +1499,25 @@ def build_pregame_dataset_for_slate(
                     tb = tb[tb["game_id"].isin(completed_ids) & (tb["game_dt_et"].dt.date == slate_date_et)].copy()
                     if len(tb) > 0:
                         id_to_name = _build_id_team_name_map(schedule_df, team_snaps)
+                        def _pick_hist_team_name(row, suffix: str) -> str:
+                            display_name = str(row.get(f"team_display_name{suffix}", "")).strip()
+                            if not _bad_team_name(display_name):
+                                return display_name
+
+                            team_name = str(row.get(f"team_name{suffix}", "")).strip()
+                            if not _bad_team_name(team_name):
+                                return team_name
+
+                            location = str(row.get(f"team_location{suffix}", "")).strip()
+                            mascot = str(row.get(f"team_mascot{suffix}", "")).strip()
+                            if not _bad_team_name(location) and not _bad_team_name(mascot):
+                                return f"{location} {mascot}".strip()
+                            if not _bad_team_name(location):
+                                return location
+                            if not _bad_team_name(mascot):
+                                return mascot
+                            return ""
+
                         if "team_name" not in tb.columns:
                             tb["team_name"] = np.nan
                         tb["team_name"] = tb["team_name"].astype(str).str.strip()
@@ -1517,8 +1536,8 @@ def build_pregame_dataset_for_slate(
                                     suffixes=("_home", "_away"),
                                 )
                                 for _, r in merged_tb.iterrows():
-                                    home_name = str(r.get("team_name_home", "")).strip()
-                                    away_name = str(r.get("team_name_away", "")).strip()
+                                    home_name = _pick_hist_team_name(r, "_home")
+                                    away_name = _pick_hist_team_name(r, "_away")
                                     home_id = pd.to_numeric(pd.Series([r.get("team_id_home")]), errors="coerce").iloc[0]
                                     away_id = pd.to_numeric(pd.Series([r.get("team_id_away")]), errors="coerce").iloc[0]
                                     if _bad_team_name(home_name) and pd.notna(home_id):
@@ -4461,7 +4480,7 @@ def build_or_update_season_accuracy_cache():
     updated = False
 
     for wk, dates_in_week in weeks.items():
-        if wk in cache:
+        if wk in cache and int(cache.get(wk, {}).get("games_graded", 0) or 0) > 0:
             continue
 
         boards = []
@@ -4928,7 +4947,13 @@ def refresh(_=None, force_rebuild=False):
 
     # build season snapshot once only
     if SEASON_ACC is None:
-        SEASON_ACC = {}
+        try:
+            build_or_update_season_accuracy_cache()
+            SEASON_ACC = load_cached_season_accuracy_snapshot()
+        except Exception:
+            SEASON_ACC = load_cached_season_accuracy_snapshot()
+        if not SEASON_ACC:
+            SEASON_ACC = {}
         SEASON_ACC_DATE = "Season-to-Date"
 
     # blank initial render
