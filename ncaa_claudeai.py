@@ -998,7 +998,10 @@ def _bad_team_name(x) -> bool:
 def _safe_team_text_col(df: pd.DataFrame, candidates: list, default="TBD") -> pd.Series:
     for c in candidates:
         if c in df.columns:
-            return df[c].astype(str).fillna(default)
+            out = df[c]
+            if isinstance(out, pd.DataFrame):
+                out = out.iloc[:, 0]
+            return out.astype(str).fillna(default)
     return pd.Series([default] * len(df), index=df.index)
 
 
@@ -1056,6 +1059,60 @@ def _build_team_id_name_map(schedule_df: pd.DataFrame, team_snaps: pd.DataFrame 
 
     out = out.drop_duplicates(subset=["team_canon"], keep="last")
     return dict(zip(out["team_canon"], out["team_id"]))
+
+
+def _build_id_team_name_map(schedule_df: pd.DataFrame, team_snaps: pd.DataFrame = None) -> dict:
+    frames = []
+
+    if schedule_df is not None and len(schedule_df) > 0:
+        s = schedule_df.copy()
+
+        if {"home_id", "home_short_display_name"}.issubset(s.columns):
+            x = s[["home_id", "home_short_display_name"]].copy()
+            x.columns = ["team_id", "team_name"]
+            frames.append(x)
+
+        if {"away_id", "away_short_display_name"}.issubset(s.columns):
+            x = s[["away_id", "away_short_display_name"]].copy()
+            x.columns = ["team_id", "team_name"]
+            frames.append(x)
+
+        if "home_id" in s.columns:
+            x = pd.DataFrame({
+                "team_id": s["home_id"],
+                "team_name": _safe_team_text_col(s, ["home_team", "home_display_name", "home_name"], default="TBD"),
+            })
+            x.columns = ["team_id", "team_name"]
+            frames.append(x)
+
+        if "away_id" in s.columns:
+            x = pd.DataFrame({
+                "team_id": s["away_id"],
+                "team_name": _safe_team_text_col(s, ["away_team", "away_display_name", "away_name"], default="TBD"),
+            })
+            x.columns = ["team_id", "team_name"]
+            frames.append(x)
+
+    if team_snaps is not None and len(team_snaps) > 0:
+        ts = team_snaps.copy()
+        if "team_id" in ts.columns:
+            for nm_col in ["team_name", "display_name", "short_display_name", "team"]:
+                if nm_col in ts.columns:
+                    x = ts[["team_id", nm_col]].copy()
+                    x.columns = ["team_id", "team_name"]
+                    frames.append(x)
+
+    if not frames:
+        return {}
+
+    out = pd.concat(frames, ignore_index=True)
+    out["team_id"] = pd.to_numeric(out["team_id"], errors="coerce")
+    out["team_name"] = out["team_name"].astype(str).str.strip()
+    out = out.dropna(subset=["team_id"]).copy()
+    out = out[~out["team_name"].map(_bad_team_name)].copy()
+    out["team_id"] = out["team_id"].astype(int)
+    out = out.drop_duplicates(subset=["team_id"], keep="last")
+    return dict(zip(out["team_id"], out["team_name"]))
 
 
 def _extract_valid_schedule_slate(schedule_df: pd.DataFrame, slate_date_et) -> pd.DataFrame:
@@ -1222,13 +1279,21 @@ def _fill_tbd_schedule_from_rotowire(
 
     rw = load_rotowire_all_for_date(slate_date_et, rotowire_dir)
     if rw is None or len(rw) == 0:
-        return slate
+        rw = pd.DataFrame()
 
     name_to_id = _build_team_id_name_map(schedule_df, team_snaps)
+    id_to_name = _build_id_team_name_map(schedule_df, team_snaps)
     rw = rw.copy()
     rw["rw_idx"] = np.arange(len(rw))
-    rw["home_team"] = rw["home_team"].astype(str).str.strip()
-    rw["away_team"] = rw["away_team"].astype(str).str.strip()
+    rw["home_team"] = _safe_team_text_col(
+        rw, ["home_team", "home_short_display_name", "home_display_name", "home_name"], default="TBD"
+    ).astype(str).str.strip()
+    rw["away_team"] = _safe_team_text_col(
+        rw, ["away_team", "away_short_display_name", "away_display_name", "away_name"], default="TBD"
+    ).astype(str).str.strip()
+    bad_home = rw["home_team"].map(_bad_team_name).astype(bool)
+    bad_away = rw["away_team"].map(_bad_team_name).astype(bool)
+    rw = rw[~(bad_home | bad_away)].copy()
     rw["home_canon"] = rw["home_team"].map(canonical_team)
     rw["away_canon"] = rw["away_team"].map(canonical_team)
     rw["home_id"] = rw["home_canon"].map(name_to_id)
@@ -1240,6 +1305,14 @@ def _fill_tbd_schedule_from_rotowire(
     b["home_short_display_name"] = _safe_team_text_col(b, ["home_short_display_name", "home_team"], default="TBD")
     b["away_short_display_name"] = _safe_team_text_col(b, ["away_short_display_name", "away_team"], default="TBD")
 
+    def _relaxed_canon_keys(name: str) -> list:
+        c = canonical_team(name)
+        keys = [c]
+        toks = c.split()
+        if len(toks) >= 2:
+            keys.append(" ".join(toks[:-1]))
+        return [k for k in keys if k]
+
     used_rw = set()
 
     for idx in b.index:
@@ -1248,7 +1321,30 @@ def _fill_tbd_schedule_from_rotowire(
         home_bad = _bad_team_name(home_name)
         away_bad = _bad_team_name(away_name)
 
+        if home_bad:
+            home_id = pd.to_numeric(pd.Series([b.at[idx, "home_id"]]), errors="coerce").iloc[0] if "home_id" in b.columns else np.nan
+            if pd.notna(home_id):
+                mapped = id_to_name.get(int(home_id))
+                if mapped and not _bad_team_name(mapped):
+                    b.at[idx, "home_team"] = mapped
+                    b.at[idx, "home_short_display_name"] = mapped
+        if away_bad:
+            away_id = pd.to_numeric(pd.Series([b.at[idx, "away_id"]]), errors="coerce").iloc[0] if "away_id" in b.columns else np.nan
+            if pd.notna(away_id):
+                mapped = id_to_name.get(int(away_id))
+                if mapped and not _bad_team_name(mapped):
+                    b.at[idx, "away_team"] = mapped
+                    b.at[idx, "away_short_display_name"] = mapped
+
+        home_name = str(b.at[idx, "home_team"]).strip()
+        away_name = str(b.at[idx, "away_team"]).strip()
+        home_bad = _bad_team_name(home_name)
+        away_bad = _bad_team_name(away_name)
+
         if not (home_bad or away_bad):
+            continue
+
+        if len(rw) == 0:
             continue
 
         cand = rw.copy()
@@ -1257,10 +1353,14 @@ def _fill_tbd_schedule_from_rotowire(
         if not home_bad:
             hc = canonical_team(home_name)
             cand = cand[cand["home_canon"] == hc].copy()
+            if len(cand) == 0:
+                cand = rw[rw["home_canon"].isin(_relaxed_canon_keys(home_name))].copy()
 
         if not away_bad:
             ac = canonical_team(away_name)
             cand = cand[cand["away_canon"] == ac].copy()
+            if len(cand) == 0:
+                cand = rw[rw["away_canon"].isin(_relaxed_canon_keys(away_name))].copy()
 
         # if still multiple, prefer one not used yet
         if len(cand) > 1:
@@ -1279,6 +1379,7 @@ def _fill_tbd_schedule_from_rotowire(
                 "away_team": away_name,
                 "home_canon": canonical_team(home_name) if not home_bad else "tbd",
                 "away_canon": canonical_team(away_name) if not away_bad else "tbd",
+                "rw_candidates": rw[["away_team", "home_team", "away_canon", "home_canon"]].head(10).to_dict("records"),
             })
             continue
 
@@ -1376,11 +1477,93 @@ def build_pregame_dataset_for_slate(
     elo_snap: pd.DataFrame = None,
 ) -> pd.DataFrame:
     slate_date_et = pd.Timestamp(slate_date_et).date()
+    today_et = pd.Timestamp.now(tz="America/New_York").date()
+    is_past_date = slate_date_et < today_et
 
     slate = _extract_valid_schedule_slate(schedule_df, slate_date_et)
 
+    if is_past_date:
+        if "team_box_hist" in globals() and team_box_hist is not None and len(team_box_hist) > 0:
+            tb = team_box_hist.copy()
+            if {"game_id", "game_date_time"}.issubset(tb.columns):
+                tb["game_id"] = tb["game_id"].astype(str)
+                tb["game_date_time"] = pd.to_datetime(tb["game_date_time"], errors="coerce", utc=True)
+                tb = tb.dropna(subset=["game_id", "game_date_time"]).copy()
+                tb["game_dt_et"] = tb["game_date_time"].dt.tz_convert("America/New_York").dt.tz_localize(None)
+                completed_ids = set(tb.loc[tb["game_dt_et"].dt.date == slate_date_et, "game_id"].astype(str))
+                if completed_ids:
+                    if slate is None or len(slate) == 0 or "game_id" not in slate.columns:
+                        slate = pd.DataFrame(columns=["game_id"])
+                    else:
+                        slate = slate[slate["game_id"].astype(str).isin(completed_ids)].copy()
+                    tb = tb[tb["game_id"].isin(completed_ids) & (tb["game_dt_et"].dt.date == slate_date_et)].copy()
+                    if len(tb) > 0:
+                        id_to_name = _build_id_team_name_map(schedule_df, team_snaps)
+                        if "team_name" not in tb.columns:
+                            tb["team_name"] = np.nan
+                        tb["team_name"] = tb["team_name"].astype(str).str.strip()
+
+                        rows = []
+                        if "team_home_away" in tb.columns:
+                            home = tb[tb["team_home_away"].astype(str).str.lower().eq("home")].copy()
+                            away = tb[tb["team_home_away"].astype(str).str.lower().eq("away")].copy()
+                            if len(home) and len(away):
+                                home = home.sort_values(["game_dt_et", "game_id"]).drop_duplicates(["game_id"], keep="last")
+                                away = away.sort_values(["game_dt_et", "game_id"]).drop_duplicates(["game_id"], keep="last")
+                                merged_tb = home.merge(
+                                    away,
+                                    on="game_id",
+                                    how="inner",
+                                    suffixes=("_home", "_away"),
+                                )
+                                for _, r in merged_tb.iterrows():
+                                    home_name = str(r.get("team_name_home", "")).strip()
+                                    away_name = str(r.get("team_name_away", "")).strip()
+                                    home_id = pd.to_numeric(pd.Series([r.get("team_id_home")]), errors="coerce").iloc[0]
+                                    away_id = pd.to_numeric(pd.Series([r.get("team_id_away")]), errors="coerce").iloc[0]
+                                    if _bad_team_name(home_name) and pd.notna(home_id):
+                                        home_name = id_to_name.get(int(home_id), home_name)
+                                    if _bad_team_name(away_name) and pd.notna(away_id):
+                                        away_name = id_to_name.get(int(away_id), away_name)
+                                    rows.append({
+                                        "game_id": str(r["game_id"]),
+                                        "game_dt_et": r.get("game_dt_et_home", r.get("game_dt_et_away")),
+                                        "neutral_site": False,
+                                        "home_id": home_id,
+                                        "away_id": away_id,
+                                        "home_team": home_name if not _bad_team_name(home_name) else "TBD",
+                                        "away_team": away_name if not _bad_team_name(away_name) else "TBD",
+                                        "home_short_display_name": home_name if not _bad_team_name(home_name) else "TBD",
+                                        "away_short_display_name": away_name if not _bad_team_name(away_name) else "TBD",
+                                        "home_score": pd.to_numeric(pd.Series([r.get("team_score_home")]), errors="coerce").iloc[0],
+                                        "away_score": pd.to_numeric(pd.Series([r.get("team_score_away")]), errors="coerce").iloc[0],
+                                        "status_type_completed": True,
+                                        "status_type_state": "post",
+                                        "status_type_name": "STATUS_FINAL",
+                                        "status_type_short_detail": "Final",
+                                    })
+
+                        if rows:
+                            tb_slate = pd.DataFrame(rows).drop_duplicates(subset=["game_id"], keep="last")
+                            slate["game_id"] = slate["game_id"].astype(str)
+                            if {"home_team", "away_team"}.issubset(slate.columns):
+                                bad_hist = (
+                                    slate["home_team"].map(_bad_team_name)
+                                    | slate["away_team"].map(_bad_team_name)
+                                    | pd.to_numeric(slate.get("home_id"), errors="coerce").fillna(-1).le(0)
+                                    | pd.to_numeric(slate.get("away_id"), errors="coerce").fillna(-1).le(0)
+                                )
+                                bad_ids = set(slate.loc[bad_hist, "game_id"].astype(str))
+                                keep = slate.loc[~slate["game_id"].isin(bad_ids)].copy()
+                            else:
+                                bad_ids = set()
+                                keep = slate.copy()
+                            repl = tb_slate[tb_slate["game_id"].isin(bad_ids)].copy()
+                            extras = tb_slate[~tb_slate["game_id"].isin(set(slate["game_id"].astype(str)))].copy()
+                            slate = pd.concat([keep, repl, extras], ignore_index=True, sort=False)
+
     # fill partial schedule rows like "TBD vs Prairie View" using Rotowire
-    if slate is not None and len(slate) > 0:
+    if (not is_past_date) and slate is not None and len(slate) > 0:
         slate = _fill_tbd_schedule_from_rotowire(
             slate=slate,
             slate_date_et=slate_date_et,
@@ -1390,14 +1573,14 @@ def build_pregame_dataset_for_slate(
         )
 
     # if slate is still bad/incomplete, replace with full Rotowire slate
-    if slate is None or len(slate) == 0:
+    if (not is_past_date) and (slate is None or len(slate) == 0):
         slate = _build_rotowire_fallback_slate(
             slate_date_et=slate_date_et,
             schedule_df=schedule_df,
             rotowire_dir=ROTOWIRE_DIR,
             team_snaps=team_snaps,
         )
-    else:
+    elif not is_past_date:
         bad_mask = (
             slate["home_team"].map(_bad_team_name)
             | slate["away_team"].map(_bad_team_name)
@@ -1418,6 +1601,12 @@ def build_pregame_dataset_for_slate(
         return pd.DataFrame()
 
     slate = ensure_board_team_columns(slate)
+    if slate_date_et < today_et:
+        keep_mask = ~(slate["home_team"].map(_bad_team_name) | slate["away_team"].map(_bad_team_name))
+        slate = slate[keep_mask].copy()
+
+    if slate is None or len(slate) == 0:
+        return pd.DataFrame()
 
     snaps = team_snaps.copy()
     snaps["team_id"] = pd.to_numeric(snaps["team_id"], errors="coerce")
@@ -2084,6 +2273,67 @@ def run_hoopr_refresh(
       }
     }
 
+    load_mbb_team_box_with_recent_fallback <- function(yr) {
+      normalize_team_box_ids <- function(df) {
+        if (!is.data.frame(df) || nrow(df) == 0) return(df)
+        if ("game_id" %in% names(df)) df$game_id <- as.character(df$game_id)
+        for (nm in c("team_id", "opponent_team_id")) {
+          if (nm %in% names(df)) df[[nm]] <- suppressWarnings(as.numeric(df[[nm]]))
+        }
+        df
+      }
+
+      base <- tryCatch(hoopR::load_mbb_team_box(season=yr), error=function(e) data.frame())
+      if (!is.data.frame(base)) base <- data.frame()
+      base <- normalize_team_box_ids(base)
+      if (as.integer(yr) != as.integer(CURRENT_SEASON)) return(base)
+
+      sched <- tryCatch(hoopR::load_mbb_schedule(season=yr), error=function(e) data.frame())
+      if (!is.data.frame(sched) || nrow(sched) == 0 || !"game_id" %in% names(sched)) return(base)
+
+      completed <- rep(FALSE, nrow(sched))
+      if ("status_type_completed" %in% names(sched)) {
+        completed <- completed | tolower(as.character(sched$status_type_completed)) %in% c("true","1","yes")
+      }
+      if ("status_type_state" %in% names(sched)) {
+        completed <- completed | tolower(as.character(sched$status_type_state)) %in% c("post","postgame","final")
+      }
+      if (all(c("home_score", "away_score") %in% names(sched))) {
+        completed <- completed | (!is.na(sched$home_score) & !is.na(sched$away_score))
+      }
+      if ("game_date_time" %in% names(sched)) {
+        gdt <- suppressWarnings(as.POSIXct(sched$game_date_time, tz="UTC"))
+        completed <- completed & (is.na(gdt) | gdt >= (Sys.time() - 45*24*60*60))
+      }
+
+      missing_ids <- unique(as.character(sched$game_id[completed]))
+      missing_ids <- missing_ids[!is.na(missing_ids) & missing_ids != ""]
+      if ("game_id" %in% names(base)) {
+        missing_ids <- setdiff(missing_ids, unique(as.character(base$game_id)))
+      }
+      if (length(missing_ids) == 0) return(base)
+
+      pull_one <- function(gid) {
+        tryCatch({
+          x <- suppressMessages(suppressWarnings(hoopR::espn_mbb_team_box(as.numeric(gid))))
+          if (!is.data.frame(x) || nrow(x) == 0) return(data.frame())
+          normalize_team_box_ids(x)
+        }, error=function(e) data.frame())
+      }
+
+      extra <- dplyr::bind_rows(lapply(missing_ids, pull_one))
+      if (!is.data.frame(extra) || nrow(extra) == 0) return(base)
+      extra <- normalize_team_box_ids(extra)
+
+      out <- dplyr::bind_rows(base, extra)
+      if (all(c("game_id", "team_id") %in% names(out))) {
+        out <- out %>%
+          dplyr::arrange(game_id, team_id) %>%
+          dplyr::distinct(game_id, team_id, .keep_all = TRUE)
+      }
+      out
+    }
+
     run_task <- function(dataset, season=NULL, season_type=NULL, path, fn) {
       file_exists <- file.exists(path)
 
@@ -2182,7 +2432,7 @@ def run_hoopr_refresh(
 
       if (EXPORT_TEAM_BOX) {
         run_task("team_box", yr, NULL, out_path(sprintf("team_box/mbb_team_box_%s.parquet", yr)),
-                 function() hoopR::load_mbb_team_box(season=yr))
+                 function() load_mbb_team_box_with_recent_fallback(yr))
       }
 
       if (EXPORT_PLAYER_BOX) {
@@ -2711,10 +2961,20 @@ check_and_retrain()
 def make_xgb_matrix(pregame: pd.DataFrame, booster, imp_ref=None) -> xgb.DMatrix:
     """Builds an XGBoost DMatrix matching the booster's feature names."""
     fnames = list(booster.feature_names)
-    base_diff = [c for c in fnames if c.startswith("diff_") and not c.endswith("__na")]
+    base_diff = [c for c in fnames if (c.startswith("diff_") or c == "home_court_A") and not c.endswith("__na")]
     na_cols   = [c for c in fnames if c.endswith("__na")]
 
     X = pregame.copy()
+    if "home_court_A" in fnames and "home_court_A" not in X.columns:
+        neutral = _coerce_bool_series(X.get("neutral_site", False), X.index)
+        if {"teamA_id", "home_id"}.issubset(X.columns):
+            teamA_is_home = (
+                pd.to_numeric(X["teamA_id"], errors="coerce") ==
+                pd.to_numeric(X["home_id"], errors="coerce")
+            )
+            X["home_court_A"] = np.where(neutral, 0.0, np.where(teamA_is_home, 1.0, -1.0))
+        else:
+            X["home_court_A"] = np.where(neutral, 0.0, 0.0)
     for c in base_diff:
         if c not in X.columns:
             X[c] = np.nan
@@ -2750,14 +3010,26 @@ def predict_slate(
     if pregame is None or len(pregame) == 0:
         return pd.DataFrame()
 
-    dcur_spread = make_xgb_matrix(pregame, spread_booster, imp)
-    dcur_winner = make_xgb_matrix(pregame, winner_booster, imp)
+    model_pregame = pregame.copy()
+    if "home_court_A" not in model_pregame.columns:
+        neutral = _coerce_bool_series(model_pregame.get("neutral_site", False), model_pregame.index)
+        if {"teamA_id", "home_id"}.issubset(model_pregame.columns):
+            teamA_is_home = (
+                pd.to_numeric(model_pregame["teamA_id"], errors="coerce") ==
+                pd.to_numeric(model_pregame["home_id"], errors="coerce")
+            )
+            model_pregame["home_court_A"] = np.where(neutral, 0.0, np.where(teamA_is_home, 1.0, -1.0))
+        else:
+            model_pregame["home_court_A"] = np.where(neutral, 0.0, 0.0)
+
+    dcur_spread = make_xgb_matrix(model_pregame, spread_booster, imp)
+    dcur_winner = make_xgb_matrix(model_pregame, winner_booster, imp)
 
     xgb_margin = spread_booster.predict(dcur_spread, iteration_range=(0, spread_booster.best_iteration + 1))
 
     # LGB margin using same feature set
     fnames = list(spread_booster.feature_names)
-    X_lgb = pregame.reindex(columns=fnames, fill_value=0.0)
+    X_lgb = model_pregame.reindex(columns=fnames, fill_value=0.0)
     lgb_margin = lgb_spread.predict(X_lgb.values)
 
     # Ensemble margin: weighted blend
@@ -2767,7 +3039,7 @@ def predict_slate(
     pred_pA = iso.transform(raw_pA) if iso is not None else raw_pA
 
     # Home/Away conversion
-    teamA_is_home = (pregame["teamA_id"].astype(int) == pregame["home_id"].astype(int)).values
+    teamA_is_home = (model_pregame["teamA_id"].astype(int) == model_pregame["home_id"].astype(int)).values
     pred_margin_home = np.where(teamA_is_home, pred_margin_ab, -pred_margin_ab).astype(float)
     p_home_win_raw   = np.where(teamA_is_home, pred_pA, 1 - pred_pA).astype(float)
 
@@ -2778,17 +3050,17 @@ def predict_slate(
     pred_margin_home = np.round(pred_margin_home, 1)
     pred_margin_home[np.abs(pred_margin_home) < 0.05] = 0.0
 
-    winner_pick = np.where(p_home_win_raw >= 0.5, pregame["home_team"].values, pregame["away_team"].values)
+    winner_pick = np.where(p_home_win_raw >= 0.5, model_pregame["home_team"].values, model_pregame["away_team"].values)
     pick_conf   = np.where(p_home_win >= 0.5, p_home_win, 1 - p_home_win)
-    spread_pick = np.where(pred_margin_home >= 0, pregame["home_team"].values, pregame["away_team"].values)
+    spread_pick = np.where(pred_margin_home >= 0, model_pregame["home_team"].values, model_pregame["away_team"].values)
 
     model_line = np.where(
         pred_margin_home >= 0,
-        pregame["home_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
-        pregame["away_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
+        model_pregame["home_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
+        model_pregame["away_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
     )
 
-    return pregame.assign(
+    return model_pregame.assign(
         pred_margin_home=pred_margin_home,
         p_home_win=p_home_win,
         p_home_win_raw=p_home_win_raw,
@@ -2988,6 +3260,8 @@ def attach_actual_scores_from_schedule(board: pd.DataFrame, schedule_df: pd.Data
     for c in ["home_score", "away_score", "home_id", "away_id"]:
         if c in sched.columns:
             sched[c] = pd.to_numeric(sched[c], errors="coerce")
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
     if "home_team" not in sched.columns:
         if "home_short_display_name" in sched.columns:
@@ -3048,7 +3322,39 @@ def attach_actual_scores_from_schedule(board: pd.DataFrame, schedule_df: pd.Data
         out = out.drop(columns=[c for c in out.columns if c.endswith("_gid")], errors="ignore")
 
     # -----------------------------
-    # 2) exact oriented team match
+    # 2) exact oriented ID match
+    # -----------------------------
+    still_missing = out["home_score"].isna() | out["away_score"].isna()
+    if still_missing.any():
+        orient_id_lookup = (
+            sched.dropna(subset=["home_id", "away_id"])
+                 .drop_duplicates(subset=["slate_date_et", "home_id", "away_id"], keep="first")
+                 [["slate_date_et", "home_id", "away_id",
+                   "home_score", "away_score",
+                   "status_type_completed", "status_type_state",
+                   "status_type_name", "status_type_short_detail"]]
+                 .copy()
+        )
+
+        tmp = out.loc[still_missing].merge(
+            orient_id_lookup,
+            on=["slate_date_et", "home_id", "away_id"],
+            how="left",
+            suffixes=("", "_id")
+        )
+
+        for c in ["home_score", "away_score", "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"]:
+            ci = f"{c}_id"
+            if ci in tmp.columns:
+                tmp[c] = tmp[c].where(tmp[c].notna(), tmp[ci])
+
+        out.loc[still_missing, ["home_score", "away_score", "status_type_completed",
+                                "status_type_state", "status_type_name", "status_type_short_detail"]] = \
+            tmp[["home_score", "away_score", "status_type_completed",
+                 "status_type_state", "status_type_name", "status_type_short_detail"]].values
+
+    # -----------------------------
+    # 3) exact oriented team match
     # -----------------------------
     still_missing = out["home_score"].isna() | out["away_score"].isna()
     if still_missing.any():
@@ -3079,7 +3385,7 @@ def attach_actual_scores_from_schedule(board: pd.DataFrame, schedule_df: pd.Data
                  "status_type_state", "status_type_name", "status_type_short_detail"]].values
 
     # -----------------------------
-    # 3) unordered matchup fallback
+    # 4) unordered matchup fallback
     # -----------------------------
     still_missing = out["home_score"].isna() | out["away_score"].isna()
     if still_missing.any():
@@ -3189,6 +3495,58 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
     if len(games) == 0:
         return out
 
+    hs0 = pd.to_numeric(out.get("home_score"), errors="coerce")
+    aw0 = pd.to_numeric(out.get("away_score"), errors="coerce")
+    completed0 = out.get("status_type_completed", pd.Series(False, index=out.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+    state0 = out.get("status_type_state", pd.Series("", index=out.index)).astype(str).str.lower()
+    detail0 = out.get("status_type_short_detail", pd.Series("", index=out.index)).astype(str)
+    final0 = completed0 | state0.isin(["post", "postgame", "final"]) | detail0.str.contains("Final", case=False, na=False)
+    replace_mask = hs0.isna() | aw0.isna() | ((hs0 == 0) & (aw0 == 0) & ~final0)
+
+    if "game_id" in out.columns:
+        out["game_id"] = out["game_id"].astype(str)
+        tmp = out.merge(
+            games[["game_id", "team1_id", "team2_id", "team1_score", "team2_score", "game_date_et"]],
+            on="game_id",
+            how="left",
+            suffixes=("", "_tb_gid")
+        )
+        tmp["home_id"] = pd.to_numeric(tmp.get("home_id"), errors="coerce")
+        tmp["away_id"] = pd.to_numeric(tmp.get("away_id"), errors="coerce")
+        tmp["team1_id"] = pd.to_numeric(tmp.get("team1_id"), errors="coerce")
+        tmp["team2_id"] = pd.to_numeric(tmp.get("team2_id"), errors="coerce")
+        tmp["home_score_gid"] = np.where(
+            tmp["home_id"] == tmp["team1_id"],
+            tmp["team1_score"],
+            np.where(tmp["home_id"] == tmp["team2_id"], tmp["team2_score"], np.nan)
+        )
+        tmp["away_score_gid"] = np.where(
+            tmp["away_id"] == tmp["team1_id"],
+            tmp["team1_score"],
+            np.where(tmp["away_id"] == tmp["team2_id"], tmp["team2_score"], np.nan)
+        )
+        gid_match = (
+            ((tmp["home_id"] == tmp["team1_id"]) & (tmp["away_id"] == tmp["team2_id"])) |
+            ((tmp["home_id"] == tmp["team2_id"]) & (tmp["away_id"] == tmp["team1_id"]))
+        )
+        gid_match = gid_match.fillna(False) if hasattr(gid_match, "fillna") else gid_match
+
+        use_gid = replace_mask & gid_match
+        if use_gid.any():
+            out.loc[use_gid, "home_score"] = tmp.loc[use_gid, "home_score_gid"].values
+            out.loc[use_gid, "away_score"] = tmp.loc[use_gid, "away_score_gid"].values
+
+            if "status_type_completed" not in out.columns:
+                out["status_type_completed"] = False
+            if "status_type_state" not in out.columns:
+                out["status_type_state"] = ""
+            if "status_type_short_detail" not in out.columns:
+                out["status_type_short_detail"] = ""
+
+            out.loc[use_gid, "status_type_completed"] = True
+            out.loc[use_gid, "status_type_state"] = "post"
+            out.loc[use_gid, "status_type_short_detail"] = "Final"
+
     # normalize board ids
     out["home_id"] = pd.to_numeric(out["home_id"], errors="coerce")
     out["away_id"] = pd.to_numeric(out["away_id"], errors="coerce")
@@ -3196,6 +3554,7 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
 
     out["home_id"] = out["home_id"].astype("int64")
     out["away_id"] = out["away_id"].astype("int64")
+    out["game_date_et"] = pd.to_datetime(out["game_dt_et"], errors="coerce").dt.date
     out["id_low"] = np.minimum(out["home_id"], out["away_id"]).astype("int64")
     out["id_high"] = np.maximum(out["home_id"], out["away_id"]).astype("int64")
 
@@ -3205,7 +3564,14 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
     filled_done = []
 
     for _, r in out.iterrows():
-        cand = games[(games["id_low"] == r["id_low"]) & (games["id_high"] == r["id_high"])].copy()
+        cand = games[
+            (games["id_low"] == r["id_low"]) &
+            (games["id_high"] == r["id_high"]) &
+            (games["game_date_et"] == r["game_date_et"])
+        ].copy()
+
+        if len(cand) == 0:
+            cand = games[(games["id_low"] == r["id_low"]) & (games["id_high"] == r["id_high"])].copy()
 
         if len(cand) == 0:
             filled_home.append(np.nan)
@@ -3228,7 +3594,13 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
         filled_away.append(aw)
         filled_done.append(pd.notna(hs) and pd.notna(aw))
 
-    miss = out["home_score"].isna() | out["away_score"].isna()
+    hs1 = pd.to_numeric(out.get("home_score"), errors="coerce")
+    aw1 = pd.to_numeric(out.get("away_score"), errors="coerce")
+    completed1 = out.get("status_type_completed", pd.Series(False, index=out.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+    state1 = out.get("status_type_state", pd.Series("", index=out.index)).astype(str).str.lower()
+    detail1 = out.get("status_type_short_detail", pd.Series("", index=out.index)).astype(str)
+    final1 = completed1 | state1.isin(["post", "postgame", "final"]) | detail1.str.contains("Final", case=False, na=False)
+    miss = hs1.isna() | aw1.isna() | ((hs1 == 0) & (aw1 == 0) & ~final1)
 
     out.loc[miss, "home_score"] = out.loc[miss, "home_score"].where(
         out.loc[miss, "home_score"].notna(), pd.Series(filled_home, index=out.index)[miss]
@@ -3250,7 +3622,7 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
     out.loc[done_mask, "status_type_state"] = "post"
     out.loc[done_mask, "status_type_short_detail"] = "Final"
 
-    out = out.drop(columns=["id_low", "id_high"], errors="ignore")
+    out = out.drop(columns=["id_low", "id_high", "game_date_et"], errors="ignore")
     return out
 
 # ============================================================
@@ -3495,6 +3867,11 @@ def attach_fresh_scores_from_hoopr(board: pd.DataFrame, date_et) -> pd.DataFrame
     for c in ["status_type_completed", "status_type_state", "status_type_short_detail"]:
         if c not in out.columns:
             out[c] = np.nan
+
+    target_date = pd.Timestamp(date_et).date()
+    today_et = pd.Timestamp.now(tz="America/New_York").date()
+    if target_date < today_et:
+        return out
 
     # --------------------------------------------------------
     # pull scoreboard rows for the date
@@ -4665,7 +5042,7 @@ def force_retrain_clicked(_=None):
     with out:
         clear_output(wait=True)
         display(HTML("<div style='color:#FFD700;'>🔁 Forcing full model retrain...</div>"))
-    check_and_retrain(force_data=False, force_model=True)
+    check_and_retrain(force_data=True, force_model=True)
     refresh(force_rebuild=True)
 
 
