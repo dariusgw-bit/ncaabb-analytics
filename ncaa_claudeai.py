@@ -107,7 +107,7 @@ if IN_COLAB:
 else:
     BASE_DIR = os.environ.get("NCAABB_BASE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "NCAABB")
 RAW_DIR         = os.path.join(BASE_DIR, "raw_hoopr_parquets")
-ROTOWIRE_DIR    = os.path.join(BASE_DIR, "roto-odds")
+ROTOWIRE_DIR    = "/content/drive/MyDrive/NCAABB/roto-odds" if IN_COLAB else (os.environ.get("NCAABB_ROTOWIRE_DIR") or r"G:\My Drive\NCAABB\roto-odds")
 INJURY_DIR      = os.path.join(BASE_DIR, "cbb-injuries")
 MODEL_DIR       = os.path.join(BASE_DIR, "models")
 METADATA_PATH   = os.path.join(MODEL_DIR, "retrain_metadata.json")
@@ -3189,6 +3189,19 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     b["k_home"] = b["home_team"].map(canonical_team)
     m["k_away"] = m["away_team"].map(canonical_team)
     m["k_home"] = m["home_team"].map(canonical_team)
+    if "schedule_cur" in globals():
+        name_to_id = _build_team_id_name_map(schedule_cur, globals().get("team_snaps"))
+        m["away_id"] = m["k_away"].map(name_to_id)
+        m["home_id"] = m["k_home"].map(name_to_id)
+        b["away_id"] = pd.to_numeric(b.get("away_id"), errors="coerce")
+        b["home_id"] = pd.to_numeric(b.get("home_id"), errors="coerce")
+        m["away_id"] = pd.to_numeric(m.get("away_id"), errors="coerce")
+        m["home_id"] = pd.to_numeric(m.get("home_id"), errors="coerce")
+    else:
+        b["away_id"] = pd.to_numeric(b.get("away_id"), errors="coerce")
+        b["home_id"] = pd.to_numeric(b.get("home_id"), errors="coerce")
+        m["away_id"] = np.nan
+        m["home_id"] = np.nan
     b["k_game"] = b.apply(lambda r: "||".join(sorted([r["k_away"], r["k_home"]])), axis=1)
     m["k_game"] = m.apply(lambda r: "||".join(sorted([r["k_away"], r["k_home"]])), axis=1)
     m = m.drop_duplicates("k_game", keep="last")
@@ -3197,6 +3210,37 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
         m[["k_game","rw_spread_home","rw_home_ml","rw_away_ml","rw_total","k_home","k_away"]],
         on="k_game", how="left", suffixes=("", "_rw")
     )
+    if {"home_id", "away_id"}.issubset(merged.columns) and {"home_id", "away_id"}.issubset(m.columns):
+        missing_mask = ~merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
+        if missing_mask.any():
+            m_id = m.dropna(subset=["home_id", "away_id"]).copy()
+            if len(m_id):
+                m_id["home_id"] = m_id["home_id"].astype(int)
+                m_id["away_id"] = m_id["away_id"].astype(int)
+                m_id = m_id.drop_duplicates(subset=["home_id", "away_id"], keep="last")
+
+                left = merged.loc[missing_mask].copy()
+                left["home_id"] = pd.to_numeric(left["home_id"], errors="coerce")
+                left["away_id"] = pd.to_numeric(left["away_id"], errors="coerce")
+                left_valid = left["home_id"].notna() & left["away_id"].notna()
+                if left_valid.any():
+                    left_valid_df = left.loc[left_valid].copy()
+                    left_valid_df["_row_ix"] = left_valid_df.index
+                    left_valid_df["home_id"] = left_valid_df["home_id"].astype(int)
+                    left_valid_df["away_id"] = left_valid_df["away_id"].astype(int)
+                    fix = left_valid_df.merge(
+                        m_id[["home_id", "away_id", "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total"]],
+                        on=["home_id", "away_id"],
+                        how="left",
+                        suffixes=("", "_id"),
+                    )
+                    for c in ["rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total"]:
+                        cid = f"{c}_id"
+                        if cid in fix.columns:
+                            merged.loc[fix["_row_ix"], c] = merged.loc[fix["_row_ix"], c].where(
+                                merged.loc[fix["_row_ix"], c].notna(),
+                                fix[cid].values,
+                            )
 
     missing_rw = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
     for _, row in merged.loc[~missing_rw].head(10).iterrows():
@@ -4087,6 +4131,39 @@ def attach_fresh_scores_from_hoopr(board: pd.DataFrame, date_et) -> pd.DataFrame
 # CELL 14: ACCURACY METRICS
 # ============================================================
 
+def _get_home_vegas_spread(board: pd.DataFrame) -> pd.Series:
+    for c in ["rw_spread_home", "vegas_spread_home", "spread_home", "home_spread"]:
+        if c in board.columns:
+            return pd.to_numeric(board[c], errors="coerce")
+
+    if "Vegas Spread" in board.columns:
+        out = pd.Series(np.nan, index=board.index, dtype="float64")
+        for idx, (txt, ht, at) in enumerate(zip(
+            board["Vegas Spread"].astype(str),
+            board.get("home_team", pd.Series("", index=board.index)).astype(str),
+            board.get("away_team", pd.Series("", index=board.index)).astype(str),
+        )):
+            s = txt.strip()
+            if not s:
+                continue
+            if s.upper() == "PK":
+                out.iloc[idx] = 0.0
+                continue
+            m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+            if not m:
+                continue
+            line = abs(float(m.group(1)))
+            if ht and s.startswith(ht):
+                out.iloc[idx] = -line
+            elif at and s.startswith(at):
+                out.iloc[idx] = line
+            else:
+                out.iloc[idx] = float(m.group(1))
+        return out
+
+    return pd.Series(np.nan, index=board.index, dtype="float64")
+
+
 def compute_daily_accuracy(board: pd.DataFrame) -> dict:
     if board is None or len(board) == 0:
         return {}
@@ -4168,21 +4245,22 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
     # ATS vs Vegas
     # -------------------------------------------------
     ats_acc, ats_games = np.nan, 0
-    if "rw_spread_home" in g.columns:
+    vegas_spread_home = _get_home_vegas_spread(g)
+    if vegas_spread_home.notna().any():
         rg = g.copy()
-        rg["rw_spread_home"] = pd.to_numeric(rg["rw_spread_home"], errors="coerce")
+        rg["vegas_spread_home"] = vegas_spread_home
         rg["pred_margin_home"] = pd.to_numeric(rg["pred_margin_home"], errors="coerce")
         rg["home_margin_actual"] = pd.to_numeric(rg["home_margin_actual"], errors="coerce")
 
-        rg = rg.dropna(subset=["rw_spread_home", "pred_margin_home", "home_margin_actual"])
+        rg = rg.dropna(subset=["vegas_spread_home", "pred_margin_home", "home_margin_actual"])
         if len(rg) > 0:
-            rg["edge"] = rg["pred_margin_home"] - rg["rw_spread_home"]
+            rg["edge"] = rg["pred_margin_home"] - rg["vegas_spread_home"]
             rg["pick"] = np.where(rg["edge"] > 0, "HOME",
                            np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
             rg = rg[rg["pick"] != "NO_BET"]
 
             if len(rg) > 0:
-                rg["cover_margin"] = rg["home_margin_actual"] - rg["rw_spread_home"]
+                rg["cover_margin"] = rg["home_margin_actual"] - rg["vegas_spread_home"]
 
                 # HOME pick wins if actual home margin > vegas spread
                 # AWAY pick wins if actual home margin < vegas spread
@@ -4415,20 +4493,21 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
     # ats vs vegas
     ats_correct = 0
     ats_total = 0
-    if "rw_spread_home" in g.columns and "pred_margin_home" in g.columns:
+    vegas_spread_home = _get_home_vegas_spread(g)
+    if vegas_spread_home.notna().any() and "pred_margin_home" in g.columns:
         rg = g.copy()
-        rg["rw_spread_home"] = pd.to_numeric(rg["rw_spread_home"], errors="coerce")
+        rg["vegas_spread_home"] = vegas_spread_home
         rg["pred_margin_home"] = pd.to_numeric(rg["pred_margin_home"], errors="coerce")
         rg["home_margin_actual"] = pd.to_numeric(rg["home_margin_actual"], errors="coerce")
-        rg = rg.dropna(subset=["rw_spread_home", "pred_margin_home", "home_margin_actual"])
+        rg = rg.dropna(subset=["vegas_spread_home", "pred_margin_home", "home_margin_actual"])
 
         if len(rg):
-            rg["edge"] = rg["pred_margin_home"] - rg["rw_spread_home"]
+            rg["edge"] = rg["pred_margin_home"] - rg["vegas_spread_home"]
             rg["pick"] = np.where(rg["edge"] > 0, "HOME", np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
             rg = rg[rg["pick"] != "NO_BET"]
 
             if len(rg):
-                rg["cover_margin"] = rg["home_margin_actual"] - rg["rw_spread_home"]
+                rg["cover_margin"] = rg["home_margin_actual"] - rg["vegas_spread_home"]
                 pushes = rg["cover_margin"] == 0
                 rg = rg[~pushes].copy()
 
@@ -4480,7 +4559,12 @@ def build_or_update_season_accuracy_cache():
     updated = False
 
     for wk, dates_in_week in weeks.items():
-        if wk in cache and int(cache.get(wk, {}).get("games_graded", 0) or 0) > 0:
+        cached_wk = cache.get(wk, {})
+        if (
+            wk in cache
+            and int(cached_wk.get("games_graded", 0) or 0) > 0
+            and int(cached_wk.get("ats_total", 0) or 0) > 0
+        ):
             continue
 
         boards = []
