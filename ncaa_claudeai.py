@@ -5200,6 +5200,143 @@ def refresh(_=None, force_rebuild=False):
         display(HTML(df_to_html_table(_format_board_for_display(b2), int(max_rows.value))))
 
 
+def _matchup_team_options():
+    frames = []
+    if schedule_cur is not None and len(schedule_cur) > 0:
+        s = schedule_cur.copy()
+        for id_col, candidates in [
+            ("home_id", ["home_team", "home_name", "home_display_name"]),
+            ("away_id", ["away_team", "away_name", "away_display_name"]),
+        ]:
+            if id_col in s.columns:
+                x = pd.DataFrame({
+                    "team_id": s[id_col],
+                    "team_label": _safe_team_text_col(s, candidates, default="TBD"),
+                })
+                frames.append(x)
+
+    if not frames:
+        return sorted(
+            [(name, tid) for tid, name in _build_id_team_name_map(schedule_cur, team_snaps).items()],
+            key=lambda x: x[0]
+        )
+
+    out = pd.concat(frames, ignore_index=True)
+    out["team_id"] = pd.to_numeric(out["team_id"], errors="coerce")
+    out["team_label"] = out["team_label"].astype(str).str.strip()
+    out = out.dropna(subset=["team_id"]).copy()
+    out = out[~out["team_label"].map(_bad_team_name)].copy()
+    out["team_id"] = out["team_id"].astype(int)
+    out = out.drop_duplicates(subset=["team_id"], keep="last")
+    return sorted([(row["team_label"], int(row["team_id"])) for _, row in out.iterrows()], key=lambda x: x[0])
+
+
+def _team_snapshot_asof(team_id, date_et):
+    if team_snaps is None or len(team_snaps) == 0:
+        return pd.Series(dtype=object)
+    ts = team_snaps.copy()
+    ts["team_id"] = pd.to_numeric(ts.get("team_id"), errors="coerce")
+    ts["game_dt_et"] = pd.to_datetime(ts.get("game_dt_et"), errors="coerce")
+    ts = ts.dropna(subset=["team_id", "game_dt_et"]).copy()
+    cutoff = pd.Timestamp(date_et) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    ts = ts[(ts["team_id"] == int(team_id)) & (ts["game_dt_et"] <= cutoff)].copy()
+    if len(ts) == 0:
+        return pd.Series(dtype=object)
+    return ts.sort_values("game_dt_et").iloc[-1]
+
+
+matchup_team_a = widgets.Dropdown(description="Team A", options=_matchup_team_options())
+matchup_team_b = widgets.Dropdown(description="Team B", options=_matchup_team_options())
+matchup_date_picker = widgets.DatePicker(description="Slate (ET):")
+matchup_date_picker.value = date_picker.value
+compare_btn = widgets.Button(description="Compare", button_style="primary")
+matchup_out = widgets.Output()
+
+
+def render_matchup(_=None):
+    with matchup_out:
+        clear_output(wait=True)
+
+        if matchup_team_a.value is None or matchup_team_b.value is None:
+            display(HTML("<div style='color:#AAA;'>Select two teams to compare.</div>"))
+            return
+        if matchup_team_a.value == matchup_team_b.value:
+            display(HTML("<div style='color:#ffb4b4;'>Choose two different teams.</div>"))
+            return
+
+        snap_a = _team_snapshot_asof(matchup_team_a.value, matchup_date_picker.value)
+        snap_b = _team_snapshot_asof(matchup_team_b.value, matchup_date_picker.value)
+        if len(snap_a) == 0 or len(snap_b) == 0:
+            display(HTML("<div style='color:#AAA;'>No team profile data available for one or both teams on that date.</div>"))
+            return
+
+        team_a_name = next((label for label, val in matchup_team_a.options if val == matchup_team_a.value), str(matchup_team_a.value))
+        team_b_name = next((label for label, val in matchup_team_b.options if val == matchup_team_b.value), str(matchup_team_b.value))
+        preferred_metrics = [
+            "elo_pre", "elo", "rest_days", "r10_gp", "r10_mean_points_for", "r10_mean_points_against",
+            "r10_mean_possessions", "r10_mean_off_rating", "r10_mean_def_rating", "r10_mean_net_rating"
+        ]
+        num_cols = [
+            c for c in team_snaps.columns
+            if c not in {"team_id", "game_dt_et", "season"} and pd.api.types.is_numeric_dtype(team_snaps[c])
+        ]
+        use_metrics = [c for c in preferred_metrics if c in num_cols] or num_cols[:10]
+        rows = []
+        for c in use_metrics:
+            va = pd.to_numeric(pd.Series([snap_a.get(c)]), errors="coerce").iloc[0]
+            vb = pd.to_numeric(pd.Series([snap_b.get(c)]), errors="coerce").iloc[0]
+            rows.append({
+                "Metric": c,
+                team_a_name: "" if pd.isna(va) else f"{float(va):.2f}",
+                team_b_name: "" if pd.isna(vb) else f"{float(vb):.2f}",
+            })
+
+        display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Team Profile Comparison</div>"))
+        display(HTML(df_to_html_table(pd.DataFrame(rows), max_rows=max(10, len(rows)))))
+
+        try:
+            if LAST_BOARD is not None and LAST_DATE == matchup_date_picker.value:
+                board = LAST_BOARD.copy()
+            else:
+                board = build_board_for_date(
+                    date_et=matchup_date_picker.value,
+                    schedule_df=schedule_cur,
+                    team_snaps=team_snaps,
+                    roll_cols=roll_cols,
+                    spread_booster=spread_booster,
+                    winner_booster=winner_booster,
+                    lgb_spread=lgb_spread,
+                    iso=iso,
+                    imp=imp,
+                    feature_cols=feature_cols,
+                    elo_snap=elo_snap,
+                )
+                if board is not None and len(board) > 0:
+                    board = _attach_rotowire_to_board(board, matchup_date_picker.value)
+        except Exception as e:
+            display(HTML(f"<div style='color:#ffb4b4;'>❌ Matchup prediction error: {e}</div>"))
+            return
+
+        if board is None or len(board) == 0:
+            display(HTML("<div style='color:#AAA; margin-top:8px;'>No board rows found for that slate date.</div>"))
+            return
+
+        a_id = int(matchup_team_a.value)
+        b_id = int(matchup_team_b.value)
+        pair_mask = (
+            (pd.to_numeric(board.get("home_id"), errors="coerce") == a_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == b_id)
+        ) | (
+            (pd.to_numeric(board.get("home_id"), errors="coerce") == b_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == a_id)
+        )
+        snap_board = board.loc[pair_mask].copy()
+
+        if len(snap_board):
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
+            display(HTML(df_to_html_table(_format_board_for_display(snap_board), max_rows=len(snap_board))))
+        else:
+            display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
+
+
 def force_retrain_clicked(_=None):
     with out:
         clear_output(wait=True)
@@ -5211,6 +5348,7 @@ def force_retrain_clicked(_=None):
 refresh_btn.on_click(lambda _: refresh(force_rebuild=True))
 retrain_btn.on_click(force_retrain_clicked)
 date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
+compare_btn.on_click(render_matchup)
 
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
@@ -5220,8 +5358,14 @@ for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
 controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn])
 controls_row2 = widgets.HBox([min_conf, min_abs_margin, side_filter])
 controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, search_box, max_rows])
+matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_picker, compare_btn])
+predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, season_banner_html, daily_banner_html, out])
+matchup_tab = widgets.VBox([matchup_controls, matchup_out])
+dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab])
+dashboard_tabs.set_title(0, "Predictions")
+dashboard_tabs.set_title(1, "Matchup")
 
-display(controls_row1, controls_row2, controls_row3, season_banner_html, daily_banner_html, out)
+display(dashboard_tabs)
 refresh()
 
 """# REPORT"""
