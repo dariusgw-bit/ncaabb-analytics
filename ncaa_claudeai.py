@@ -3105,6 +3105,16 @@ def predict_slate(
     pred_margin_home = np.round(pred_margin_home, 1)
     pred_margin_home[np.abs(pred_margin_home) < 0.05] = 0.0
 
+    neutral = _coerce_bool_series(model_pregame.get("neutral_site", False), model_pregame.index)
+    if neutral.any():
+        neutral_scale = np.where(np.abs(pred_margin_home) < 10, 0.84, 0.88)
+        p_home_win = np.where(
+            neutral,
+            0.5 + (p_home_win - 0.5) * neutral_scale,
+            p_home_win,
+        )
+        p_home_win = np.clip(p_home_win, EPS, 1 - EPS)
+
     winner_pick = np.where(p_home_win_raw >= 0.5, model_pregame["home_team"].values, model_pregame["away_team"].values)
     pick_conf   = np.where(p_home_win >= 0.5, p_home_win, 1 - p_home_win)
     spread_pick = np.where(pred_margin_home >= 0, model_pregame["home_team"].values, model_pregame["away_team"].values)
