@@ -1015,6 +1015,24 @@ def _coerce_bool_series(x, index=None) -> pd.Series:
          .fillna(False)
     )
 
+TOURNAMENT_FLAG_DEBUG = {}
+NCAA_TOURNEY_TEXT_RE = (
+    r"ncaa tournament|march madness|first four|first round|1st round|second round|2nd round|"
+    r"round of 64|round of 32|sweet 16|sweet sixteen|elite 8|elite eight|"
+    r"regional semifinal|regional semifinals|regional final|regional finals|"
+    r"final four|national semifinal|national semifinals|national championship|championship game"
+)
+CONF_NAME_RE = (
+    r"sec|acc|big ten|big 12|big east|pac-12|pac 12|aac|a-10|atlantic 10|"
+    r"conference usa|c-usa|mvc|wcc|maac|mac|ivy|swac|meac|nec|summit|"
+    r"horizon|sun belt|caa|america east|wac|wacc|asun|a-sun|patriot|southern"
+)
+CONF_TOURNEY_TEXT_RE = (
+    r"conference tournament|conference championship|tournament quarterfinal|tournament quarterfinals|"
+    r"tournament semifinal|tournament semifinals|tournament final|tournament finals|"
+    r"quarterfinal|quarterfinals|semifinal|semifinals|semi-final|semi-finals|championship"
+)
+
 
 def _bad_team_name(x) -> bool:
     s = str(x).strip().lower()
@@ -1029,6 +1047,129 @@ def _safe_team_text_col(df: pd.DataFrame, candidates: list, default="TBD") -> pd
                 out = out.iloc[:, 0]
             return out.astype(str).fillna(default)
     return pd.Series([default] * len(df), index=df.index)
+
+
+def _schedule_text_blob(df: pd.DataFrame, cols: list) -> pd.Series:
+    parts = []
+    for c in cols:
+        if c in df.columns:
+            parts.append(df[c].astype(str).fillna(""))
+    if not parts:
+        return pd.Series("", index=df.index, dtype=object)
+    out = parts[0].copy()
+    for p in parts[1:]:
+        out = out + " " + p
+    return out.str.strip().str.lower()
+
+
+def _fallback_ncaa_tourney_flag(df: pd.DataFrame) -> pd.Series:
+    detail_txt = _schedule_text_blob(
+        df,
+        ["status_type_short_detail", "status_type_name", "note", "notes", "game_note", "game_name", "name", "event_name"]
+    )
+    season_txt = _schedule_text_blob(df, ["season_type"])
+    neutral = _coerce_bool_series(df.get("neutral_site", False), df.index)
+    dt = pd.to_datetime(df.get("game_dt_et", df.get("game_date_time", pd.NaT)), errors="coerce")
+    month = dt.dt.month.fillna(0).astype(int) if isinstance(dt, pd.Series) else pd.Series(0, index=df.index)
+    day = dt.dt.day.fillna(0).astype(int) if isinstance(dt, pd.Series) else pd.Series(0, index=df.index)
+
+    explicit = detail_txt.str.contains(
+        NCAA_TOURNEY_TEXT_RE,
+        case=False,
+        na=False,
+    )
+    postseason = season_txt.str.contains(r"post|tournament|championship", case=False, na=False)
+    march_window = ((month == 3) & (day >= 15)) | (month == 4)
+    supporting_round = detail_txt.str.contains(
+        r"first round|1st round|second round|2nd round|round of 64|round of 32|sweet|elite|regional|final four|national semifinal|championship",
+        case=False,
+        na=False,
+    )
+    return (explicit | (postseason & neutral & supporting_round) | (neutral & march_window & supporting_round)).fillna(False)
+
+
+def _fallback_conf_tourney_flag(df: pd.DataFrame) -> pd.Series:
+    detail_txt = _schedule_text_blob(
+        df,
+        ["status_type_short_detail", "status_type_name", "note", "notes", "game_note", "game_name", "name", "event_name"]
+    )
+    season_txt = _schedule_text_blob(df, ["season_type"])
+    neutral = _coerce_bool_series(df.get("neutral_site", False), df.index)
+    dt = pd.to_datetime(df.get("game_dt_et", df.get("game_date_time", pd.NaT)), errors="coerce")
+    month = dt.dt.month.fillna(0).astype(int) if isinstance(dt, pd.Series) else pd.Series(0, index=df.index)
+    roundish = detail_txt.str.contains(CONF_TOURNEY_TEXT_RE, case=False, na=False)
+    explicit = detail_txt.str.contains(
+        rf"{CONF_TOURNEY_TEXT_RE}|(?:{CONF_NAME_RE}).{{0,20}}(?:tournament|championship)",
+        case=False,
+        na=False,
+    )
+    postseason = season_txt.str.contains(r"post|tournament|championship", case=False, na=False)
+    ncaa_fallback = _fallback_ncaa_tourney_flag(df)
+    conservative = postseason & neutral & roundish & month.eq(3)
+    return (explicit | conservative).fillna(False) & ~ncaa_fallback.fillna(False)
+
+
+def _coerce_schedule_tournament_flags(df: pd.DataFrame, debug_key: str = "") -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame() if df is None else df.copy()
+
+    out = df.copy()
+    season_txt = _schedule_text_blob(out, ["season_type"])
+    detail_txt = _schedule_text_blob(
+        out,
+        ["status_type_name", "status_type_short_detail", "note", "notes", "game_note", "game_name", "name", "event_name"]
+    )
+    neutral = _coerce_bool_series(out.get("neutral_site", False), out.index)
+
+    explicit_ncaa = detail_txt.str.contains(
+        NCAA_TOURNEY_TEXT_RE,
+        case=False,
+        na=False,
+    ) | season_txt.str.contains(r"ncaa tournament", case=False, na=False)
+
+    explicit_conf = detail_txt.str.contains(
+        rf"{CONF_TOURNEY_TEXT_RE}|(?:{CONF_NAME_RE}).{{0,20}}(?:tournament|championship)|conference tournament|conference championship",
+        case=False,
+        na=False,
+    ) | season_txt.str.contains(
+        r"conference tournament|conf tournament",
+        case=False,
+        na=False,
+    )
+
+    fallback_ncaa = _fallback_ncaa_tourney_flag(out)
+    fallback_conf = _fallback_conf_tourney_flag(out)
+    existing_ncaa = pd.to_numeric(
+        out.get("is_ncaa_tourney", pd.Series(0, index=out.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+    existing_conf = pd.to_numeric(
+        out.get("is_conf_tourney", pd.Series(0, index=out.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+    existing_tourney = pd.to_numeric(
+        out.get("is_tournament", pd.Series(0, index=out.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+
+    is_ncaa = (explicit_ncaa | fallback_ncaa | existing_ncaa).fillna(False)
+    is_conf = ((explicit_conf | fallback_conf | existing_conf).fillna(False)) & ~is_ncaa
+    is_tournament = (is_ncaa | is_conf | existing_tourney | season_txt.str.contains(r"postseason", case=False, na=False)).fillna(False)
+    is_tournament = is_tournament | (neutral & (is_ncaa | is_conf))
+
+    out["is_tournament"] = is_tournament.astype("int8")
+    out["is_conf_tourney"] = is_conf.astype("int8")
+    out["is_ncaa_tourney"] = is_ncaa.astype("int8")
+
+    if debug_key:
+        TOURNAMENT_FLAG_DEBUG[debug_key] = {
+            "rows": int(len(out)),
+            "is_tournament": int(out["is_tournament"].sum()),
+            "is_conf_tourney": int(out["is_conf_tourney"].sum()),
+            "is_ncaa_tourney": int(out["is_ncaa_tourney"].sum()),
+        }
+
+    return out
 
 
 def _build_team_id_name_map(schedule_df: pd.DataFrame, team_snaps: pd.DataFrame = None) -> dict:
@@ -1217,7 +1358,115 @@ def _extract_valid_schedule_slate(schedule_df: pd.DataFrame, slate_date_et) -> p
         s = s.sort_values(["game_dt_et", "home_id", "away_id"])
         s = s.drop_duplicates(subset=["game_dt_et", "home_id", "away_id"], keep="last")
 
-    return s.reset_index(drop=True)
+    s = s.reset_index(drop=True)
+    return _coerce_schedule_tournament_flags(s, debug_key=f"schedule_slate_{slate_date_et}")
+
+
+def _attach_schedule_tournament_context(
+    df: pd.DataFrame,
+    schedule_df: pd.DataFrame,
+    slate_date_et,
+    debug_key: str = "",
+) -> pd.DataFrame:
+    if df is None or len(df) == 0 or schedule_df is None or len(schedule_df) == 0:
+        return pd.DataFrame() if df is None else df.copy()
+
+    out = df.copy()
+    sched = _extract_valid_schedule_slate(schedule_df, slate_date_et)
+    if sched is None or len(sched) == 0:
+        return out
+
+    meta_cols = [
+        c for c in [
+            "game_id", "home_id", "away_id", "season_type", "neutral_site",
+            "status_type_name", "status_type_short_detail",
+            "note", "notes", "game_note", "game_name", "name", "event_name",
+            "is_tournament", "is_conf_tourney", "is_ncaa_tourney",
+        ]
+        if c in sched.columns
+    ]
+    if not meta_cols:
+        return out
+
+    flag_cols = {"is_tournament", "is_conf_tourney", "is_ncaa_tourney"}
+    text_cols = {"season_type", "status_type_name", "status_type_short_detail", "note", "notes", "game_note", "game_name", "name", "event_name"}
+    match_counts = {"game_id": 0, "team_ids": 0, "canonical_names": 0}
+
+    def _apply_lookup(key_series: pd.Series, lookup_df: pd.DataFrame, key_col: str, count_key: str = "") -> None:
+        if count_key:
+            try:
+                match_counts[count_key] += int(key_series.isin(lookup_df.index).sum())
+            except Exception:
+                pass
+        for col in [c for c in meta_cols if c != key_col]:
+            mapped = key_series.map(lookup_df[col])
+            if col in flag_cols:
+                existing = pd.to_numeric(out.get(col, pd.Series(np.nan, index=out.index)), errors="coerce")
+                out[col] = np.where(mapped.notna(), pd.to_numeric(mapped, errors="coerce"), existing)
+            elif col == "neutral_site":
+                existing = _coerce_bool_series(out.get(col, pd.Series(False, index=out.index)), out.index)
+                mapped_bool = _coerce_bool_series(mapped, out.index)
+                out[col] = np.where(mapped.notna(), mapped_bool, existing)
+            elif col in text_cols:
+                if col not in out.columns:
+                    out[col] = pd.Series("", index=out.index, dtype="object")
+                elif not (pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col])):
+                    out[col] = out[col].astype("object")
+                existing = out[col].fillna("").astype(str)
+                mapped_txt = mapped.fillna("").astype(str)
+                use_map = mapped_txt.str.strip().ne("") & existing.str.strip().eq("")
+                out.loc[use_map, col] = mapped_txt.loc[use_map]
+
+    if "game_id" in out.columns and "game_id" in sched.columns:
+        sched_gid = sched[meta_cols].copy()
+        sched_gid["game_id"] = sched_gid["game_id"].astype(str)
+        sched_gid = sched_gid.drop_duplicates(subset=["game_id"], keep="last").set_index("game_id")
+        _apply_lookup(out["game_id"].astype(str), sched_gid, "game_id", "game_id")
+
+    if {"home_id", "away_id"}.issubset(out.columns) and {"home_id", "away_id"}.issubset(sched.columns):
+        sched_ids = sched[meta_cols].copy()
+        sched_ids["home_id"] = pd.to_numeric(sched_ids["home_id"], errors="coerce")
+        sched_ids["away_id"] = pd.to_numeric(sched_ids["away_id"], errors="coerce")
+        sched_ids = sched_ids.dropna(subset=["home_id", "away_id"]).copy()
+        if len(sched_ids) > 0:
+            sched_ids["k_ids"] = (
+                sched_ids["home_id"].astype(int).astype(str) + "|" +
+                sched_ids["away_id"].astype(int).astype(str)
+            )
+            sched_ids = sched_ids.drop_duplicates(subset=["k_ids"], keep="last").set_index("k_ids")
+            out_home = pd.to_numeric(out["home_id"], errors="coerce")
+            out_away = pd.to_numeric(out["away_id"], errors="coerce")
+            out_keys = (
+                out_home.fillna(-1).astype(int).astype(str) + "|" +
+                out_away.fillna(-1).astype(int).astype(str)
+            )
+            _apply_lookup(out_keys, sched_ids, "k_ids", "team_ids")
+
+    sched_home = _safe_team_text_col(sched, ["home_team", "home_short_display_name", "home_display_name", "home_name"], default="TBD")
+    sched_away = _safe_team_text_col(sched, ["away_team", "away_short_display_name", "away_display_name", "away_name"], default="TBD")
+    out_home_name = _safe_team_text_col(out, ["home_team", "home_short_display_name", "home_display_name", "home_name"], default="TBD")
+    out_away_name = _safe_team_text_col(out, ["away_team", "away_short_display_name", "away_display_name", "away_name"], default="TBD")
+    sched["k_names"] = sched_away.astype(str).map(canonical_team) + "|" + sched_home.astype(str).map(canonical_team)
+    out_name_keys = out_away_name.astype(str).map(canonical_team) + "|" + out_home_name.astype(str).map(canonical_team)
+    sched_names = sched[meta_cols + ["k_names"]].copy()
+    sched_names = sched_names[sched_names["k_names"].str.strip().ne("|")].drop_duplicates(subset=["k_names"], keep="last").set_index("k_names")
+    if len(sched_names) > 0:
+        _apply_lookup(out_name_keys, sched_names, "k_names", "canonical_names")
+
+    for col in flag_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype("int8")
+
+    if debug_key:
+        TOURNAMENT_FLAG_DEBUG[debug_key] = {
+            **TOURNAMENT_FLAG_DEBUG.get(debug_key, {}),
+            "context_match_game_id": int(match_counts["game_id"]),
+            "context_match_team_ids": int(match_counts["team_ids"]),
+            "context_match_canonical_names": int(match_counts["canonical_names"]),
+            "context_flagged_rows": int(pd.to_numeric(out.get("is_tournament", pd.Series(0, index=out.index)), errors="coerce").fillna(0).astype(int).sum()),
+        }
+
+    return out
 
 
 def _build_rotowire_fallback_slate(
@@ -1283,6 +1532,11 @@ def _build_rotowire_fallback_slate(
     out["status_type_state"] = "pre"
     out["status_type_name"] = "STATUS_SCHEDULED"
     out["status_type_short_detail"] = ""
+    out = _attach_schedule_tournament_context(
+        out, schedule_df, slate_date_et,
+        debug_key=f"rotowire_fallback_context_{pd.Timestamp(slate_date_et).date()}",
+    )
+    out = _coerce_schedule_tournament_flags(out, debug_key=f"rotowire_fallback_{pd.Timestamp(slate_date_et).date()}")
 
     keep = [
         "game_id", "game_dt_et", "neutral_site",
@@ -1656,6 +1910,11 @@ def build_pregame_dataset_for_slate(
         return pd.DataFrame()
 
     slate = ensure_board_team_columns(slate)
+    slate = _attach_schedule_tournament_context(
+        slate, schedule_df, slate_date_et,
+        debug_key=f"pregame_context_{slate_date_et}",
+    )
+    slate = _coerce_schedule_tournament_flags(slate, debug_key=f"pregame_{slate_date_et}")
     if slate_date_et < today_et:
         keep_mask = ~(slate["home_team"].map(_bad_team_name) | slate["away_team"].map(_bad_team_name))
         slate = slate[keep_mask].copy()
@@ -1729,6 +1988,7 @@ def build_pregame_dataset_for_slate(
 
     base_cols = [
         "game_id", "game_dt_et", "neutral_site",
+        "is_tournament", "is_conf_tourney", "is_ncaa_tourney",
         "home_id", "away_id",
         "home_team", "away_team",
         "home_short_display_name", "away_short_display_name",
@@ -1944,10 +2204,15 @@ def build_game_dataset_from_team_box(
     sched["home_id"] = pd.to_numeric(sched.get("home_id"), errors="coerce")
     sched["away_id"] = pd.to_numeric(sched.get("away_id"), errors="coerce")
 
-    keep_sched = [c for c in ["game_id", "home_id", "away_id", "neutral_site"] if c in sched.columns]
+    keep_sched = [c for c in [
+        "game_id", "home_id", "away_id", "neutral_site", "season_type",
+        "status_type_name", "status_type_short_detail", "note", "notes",
+        "game_note", "game_name", "name", "event_name", "game_dt_et", "game_date_time"
+    ] if c in sched.columns]
     sched = sched[keep_sched].copy()
 
     merged = merged.merge(sched, on="game_id", how="left")
+    merged = _coerce_schedule_tournament_flags(merged, debug_key="training_dataset")
 
     neutral = merged.get("neutral_site", pd.Series(False, index=merged.index))
     if neutral.dtype == object:
@@ -1962,7 +2227,7 @@ def build_game_dataset_from_team_box(
     keep = [
         "game_id", "season", "game_dt_et", "teamA_id", "teamB_id",
         "y_margin", "y_win"
-    ] + diff_cols
+    ] + diff_cols + [c for c in ["is_tournament", "is_conf_tourney", "is_ncaa_tourney"] if c in merged.columns]
 
     return merged[[c for c in keep if c in merged.columns]].copy()
 
@@ -3106,10 +3371,15 @@ def predict_slate(
     pred_margin_home[np.abs(pred_margin_home) < 0.05] = 0.0
 
     neutral = _coerce_bool_series(model_pregame.get("neutral_site", False), model_pregame.index)
-    if neutral.any():
+    is_tournament = pd.to_numeric(
+        model_pregame.get("is_tournament", pd.Series(0, index=model_pregame.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+    tournament_neutral = neutral & is_tournament
+    if tournament_neutral.any():
         neutral_scale = np.where(np.abs(pred_margin_home) < 10, 0.84, 0.88)
         p_home_win = np.where(
-            neutral,
+            tournament_neutral,
             0.5 + (p_home_win - 0.5) * neutral_scale,
             p_home_win,
         )
@@ -3170,6 +3440,11 @@ def build_board_for_date(
     )
 
     board = normalize_board_for_downstream(board)
+    board = _attach_schedule_tournament_context(
+        board, schedule_df, date_et,
+        debug_key=f"board_context_{pd.Timestamp(date_et).date()}",
+    )
+    board = _coerce_schedule_tournament_flags(board, debug_key=f"board_{pd.Timestamp(date_et).date()}")
 
     # first try schedule backfill
     board = attach_actual_scores_from_schedule(board, schedule_df, date_et)
@@ -3211,6 +3486,11 @@ def build_board_for_date(
     # Attach injury features
     board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
     board = normalize_board_for_downstream(board)
+    board = _attach_schedule_tournament_context(
+        board, schedule_df, date_et,
+        debug_key=f"board_final_context_{pd.Timestamp(date_et).date()}",
+    )
+    board = _coerce_schedule_tournament_flags(board, debug_key=f"board_final_{pd.Timestamp(date_et).date()}")
 
     # dedupe
     board = _dedupe_game_rows(board)
@@ -4699,12 +4979,14 @@ side_filter     = widgets.Dropdown(description="Side", options=[("All","all"),("
 neutral_only    = widgets.Checkbox(description="Neutral only", value=False)
 show_inj        = widgets.Checkbox(description="Show injuries", value=True)
 show_rw_missing = widgets.Checkbox(description="Show RW missing", value=False)
+tournament_mode = widgets.Checkbox(description="🏆 Tournament Mode", value=False)
 search_box      = widgets.Text(description="Search", placeholder="team name...")
 max_rows        = widgets.IntSlider(description="Rows", min=10, max=300, step=10, value=80)
 
 out         = widgets.Output()
 season_banner_html = widgets.HTML()
 daily_banner_html = widgets.HTML()
+tournament_banner_html = widgets.HTML()
 
 date_picker.value = pd.Timestamp.now(tz="America/New_York").date()
 
@@ -5077,6 +5359,53 @@ def render_two_level_banner(season_acc: dict = None, season_label: str = "", dai
     return season_html, daily_html
 
 
+def render_tournament_status_banner(board: pd.DataFrame = None, manual_override: bool = False) -> str:
+    if board is None or len(board) == 0:
+        return ""
+
+    is_tournament = pd.to_numeric(
+        board.get("is_tournament", pd.Series(0, index=board.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+    is_ncaa = pd.to_numeric(
+        board.get("is_ncaa_tourney", pd.Series(0, index=board.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+    is_conf = pd.to_numeric(
+        board.get("is_conf_tourney", pd.Series(0, index=board.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+
+    if not manual_override and not is_tournament.any() and not is_ncaa.any():
+        return ""
+
+    if manual_override and is_ncaa.any():
+        detail = "NCAA Tournament"
+    elif manual_override:
+        detail = "Manual Override"
+    elif is_ncaa.any():
+        detail = "NCAA Tournament context"
+    elif is_conf.any():
+        detail = "Conference Tournament context"
+    else:
+        detail = "Tournament context"
+
+    TOURNAMENT_FLAG_DEBUG["manual_override"] = {
+        "enabled": bool(manual_override),
+        "detected_tournament_rows": int(is_tournament.sum()),
+        "detected_ncaa_rows": int(is_ncaa.sum()),
+        "detected_conf_rows": int(is_conf.sum()),
+    }
+
+    return f"""
+    <div style="background:#2a1b05; border:1px solid #7a5a12; border-radius:10px;
+                padding:10px 14px; margin:0 0 10px 0; color:#F4E3B2; font-size:13px;
+                font-weight:700;">
+      <span style="color:#FFD166;">🏆 Tournament Mode Detected</span>
+      <span style="color:#D8C79A; font-weight:500; margin-left:10px;">{detail}</span>
+    </div>"""
+
+
 
 # Helpers go above this line
 def refresh(_=None, force_rebuild=False):
@@ -5103,6 +5432,7 @@ def refresh(_=None, force_rebuild=False):
     )
     season_banner_html.value = season_html
     daily_banner_html.value = daily_html
+    tournament_banner_html.value = ""
 
     # fast path
     if (LAST_DATE == date_picker.value) and (LAST_BOARD is not None) and not force_rebuild:
@@ -5129,6 +5459,10 @@ def refresh(_=None, force_rebuild=False):
 
             season_banner_html.value = season_html
             daily_banner_html.value = daily_html
+            tournament_banner_html.value = render_tournament_status_banner(
+                LAST_BOARD,
+                manual_override=bool(tournament_mode.value),
+            )
 
             display(HTML(df_to_html_table(_format_board_for_display(b2), int(max_rows.value))))
         return
@@ -5189,6 +5523,10 @@ def refresh(_=None, force_rebuild=False):
 
     season_banner_html.value = season_html
     daily_banner_html.value = daily_html
+    tournament_banner_html.value = render_tournament_status_banner(
+        board,
+        manual_override=bool(tournament_mode.value),
+    )
 
     with out:
         clear_output(wait=True)
@@ -5470,15 +5808,17 @@ for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
 # Layout
 controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn])
 controls_row2 = widgets.HBox([min_conf, min_abs_margin, side_filter])
-controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, search_box, max_rows])
+controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, tournament_mode, search_box, max_rows])
 matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_picker, compare_btn])
-predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, season_banner_html, daily_banner_html, out])
 matchup_tab = widgets.VBox([matchup_controls, matchup_out])
+predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, tournament_banner_html, out])
 dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab])
 dashboard_tabs.set_title(0, "Predictions")
 dashboard_tabs.set_title(1, "Matchup")
 
-display(dashboard_tabs)
+dashboard_layout = widgets.VBox([season_banner_html, daily_banner_html, dashboard_tabs])
+
+display(dashboard_layout)
 refresh()
 
 """# REPORT"""
