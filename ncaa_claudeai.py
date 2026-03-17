@@ -5245,6 +5245,57 @@ def _team_snapshot_asof(team_id, date_et):
     return ts.sort_values("game_dt_et").iloc[-1]
 
 
+def _matchup_num(v):
+    return pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+
+
+def _season_metric_normalize(metric_name, value, invert=False):
+    value = _matchup_num(value)
+    if pd.isna(value) or team_snaps is None or len(team_snaps) == 0:
+        return np.nan
+
+    if metric_name == "rest_days":
+        capped = float(np.clip(value, 0.0, 7.0))
+        norm = 100.0 * (capped / 7.0)
+        if invert:
+            norm = 100.0 - norm
+        return float(np.clip(norm, 0.0, 100.0))
+
+    pop = team_snaps.copy()
+    if "team_id" not in pop.columns:
+        return np.nan
+    pop["team_id"] = pd.to_numeric(pop.get("team_id"), errors="coerce")
+    if "game_dt_et" in pop.columns:
+        pop["game_dt_et"] = pd.to_datetime(pop.get("game_dt_et"), errors="coerce")
+        pop = pop.sort_values("game_dt_et")
+    pop = pop.dropna(subset=["team_id"]).copy()
+    pop["team_id"] = pop["team_id"].astype(int)
+    pop = pop.drop_duplicates(subset=["team_id"], keep="last")
+
+    if metric_name == "r10_mean_point_diff":
+        pf = pd.to_numeric(pop.get("r10_mean_points_for"), errors="coerce")
+        pa = pd.to_numeric(pop.get("r10_mean_points_against"), errors="coerce")
+        series = pf - pa
+    else:
+        if metric_name not in pop.columns:
+            return np.nan
+        series = pd.to_numeric(pop.get(metric_name), errors="coerce")
+
+    series = series.dropna()
+    if len(series) < 2:
+        return np.nan
+
+    lo = float(series.min())
+    hi = float(series.max())
+    if hi <= lo:
+        return 50.0
+
+    norm = 100.0 * ((float(value) - lo) / (hi - lo))
+    if invert:
+        norm = 100.0 - norm
+    return float(np.clip(norm, 0.0, 100.0))
+
+
 matchup_team_a = widgets.Dropdown(description="Team A", options=_matchup_team_options())
 matchup_team_b = widgets.Dropdown(description="Team B", options=_matchup_team_options())
 matchup_date_picker = widgets.DatePicker(description="Slate (ET):")
@@ -5272,27 +5323,89 @@ def render_matchup(_=None):
 
         team_a_name = next((label for label, val in matchup_team_a.options if val == matchup_team_a.value), str(matchup_team_a.value))
         team_b_name = next((label for label, val in matchup_team_b.options if val == matchup_team_b.value), str(matchup_team_b.value))
-        preferred_metrics = [
-            "elo_pre", "elo", "rest_days", "r10_gp", "r10_mean_points_for", "r10_mean_points_against",
-            "r10_mean_possessions", "r10_mean_off_rating", "r10_mean_def_rating", "r10_mean_net_rating"
+        metric_specs = [
+            ("r10_mean_points_for", "Points For (Last 10)", False),
+            ("r10_mean_points_against", "Points Against (Last 10)", True),
+            ("r10_mean_point_diff", "Point Diff (Last 10)", False),
+            ("r10_mean_field_goal_pct", "FG%", False),
+            ("r10_mean_three_point_field_goal_pct", "3PT%", False),
+            ("r10_mean_free_throw_pct", "FT%", False),
+            ("r10_mean_total_rebounds", "Total Rebounds", False),
+            ("r10_mean_offensive_rebounds", "Offensive Rebounds", False),
+            ("r10_mean_steals", "Steals", False),
+            ("r10_mean_blocks", "Blocks", False),
+            ("r10_mean_turnovers", "Turnovers", True),
+            ("rest_days", "Rest Days", False),
+            ("r10_gp", "Games In Window", False),
         ]
-        num_cols = [
-            c for c in team_snaps.columns
-            if c not in {"team_id", "game_dt_et", "season"} and pd.api.types.is_numeric_dtype(team_snaps[c])
-        ]
-        use_metrics = [c for c in preferred_metrics if c in num_cols] or num_cols[:10]
         rows = []
-        for c in use_metrics:
-            va = pd.to_numeric(pd.Series([snap_a.get(c)]), errors="coerce").iloc[0]
-            vb = pd.to_numeric(pd.Series([snap_b.get(c)]), errors="coerce").iloc[0]
+        radar_theta = []
+        radar_a = []
+        radar_b = []
+        for c, label, invert in metric_specs:
+            va = _matchup_num(snap_a.get(c))
+            vb = _matchup_num(snap_b.get(c))
+            if c == "r10_mean_point_diff" and (pd.isna(va) or pd.isna(vb)):
+                va_pf = _matchup_num(snap_a.get("r10_mean_points_for"))
+                vb_pf = _matchup_num(snap_b.get("r10_mean_points_for"))
+                va_pa = _matchup_num(snap_a.get("r10_mean_points_against"))
+                vb_pa = _matchup_num(snap_b.get("r10_mean_points_against"))
+                va = va_pf - va_pa if pd.notna(va_pf) and pd.notna(va_pa) else np.nan
+                vb = vb_pf - vb_pa if pd.notna(vb_pf) and pd.notna(vb_pa) else np.nan
+            if pd.isna(va) and pd.isna(vb):
+                continue
             rows.append({
-                "Metric": c,
+                "Metric": label,
                 team_a_name: "" if pd.isna(va) else f"{float(va):.2f}",
                 team_b_name: "" if pd.isna(vb) else f"{float(vb):.2f}",
             })
+            na = _season_metric_normalize(c, va, invert=invert)
+            nb = _season_metric_normalize(c, vb, invert=invert)
+            if pd.notna(na) and pd.notna(nb):
+                radar_theta.append(label)
+                radar_a.append(float(na))
+                radar_b.append(float(nb))
 
         display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Team Profile Comparison</div>"))
         display(HTML(df_to_html_table(pd.DataFrame(rows), max_rows=max(10, len(rows)))))
+
+        if radar_theta:
+            try:
+                import plotly.graph_objects as go
+                import plotly.io as pio
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatterpolar(
+                    r=radar_a + [radar_a[0]],
+                    theta=radar_theta + [radar_theta[0]],
+                    fill="toself",
+                    name=team_a_name,
+                ))
+                fig.add_trace(go.Scatterpolar(
+                    r=radar_b + [radar_b[0]],
+                    theta=radar_theta + [radar_theta[0]],
+                    fill="toself",
+                    name=team_b_name,
+                ))
+                fig.update_layout(
+                    title="Head-to-Head Radar",
+                    polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                    showlegend=True,
+                    margin=dict(l=40, r=40, t=60, b=40),
+                    height=520,
+                )
+                pio.renderers.default = "notebook_connected"
+                try:
+                    fig_widget = go.FigureWidget(fig)
+                    display(fig_widget)
+                except Exception:
+                    display(HTML(pio.to_html(fig, full_html=False, include_plotlyjs=False)))
+            except ImportError:
+                display(HTML("<div style='color:#AAA; margin:8px 0;'>Plotly is not available, so the radar chart could not be rendered.</div>"))
+            except Exception as e:
+                display(HTML(f"<div style='color:#AAA; margin:8px 0;'>Radar chart rendering failed: {e}</div>"))
+        else:
+            display(HTML("<div style='color:#AAA; margin:8px 0;'>Not enough matchup metrics are available to draw a radar chart.</div>"))
 
         try:
             if LAST_BOARD is not None and LAST_DATE == matchup_date_picker.value:
