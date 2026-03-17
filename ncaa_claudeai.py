@@ -5740,6 +5740,14 @@ matchup_date_picker.value = date_picker.value
 compare_btn = widgets.Button(description="Compare", button_style="primary")
 matchup_out = widgets.Output()
 
+bracket_sim_n = widgets.IntText(description="Sims", value=1000)
+bracket_asof_date = widgets.DatePicker(description="As-of (ET):")
+bracket_asof_date.value = date_picker.value
+run_bracket_btn = widgets.Button(description="Run Simulation", button_style="primary")
+bracket_status_html = widgets.HTML()
+bracket_summary_html = widgets.HTML()
+bracket_out = widgets.Output()
+
 
 def render_matchup(_=None):
     with matchup_out:
@@ -5887,6 +5895,916 @@ def render_matchup(_=None):
             display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
 
 
+# ============================================================
+# BRACKET SIMULATOR: PATCH 1
+# ============================================================
+BRACKET_WORKBOOK_PATH = r"G:\My Drive\NCAABB\bracket\2026Bracket_rebuilt_sim_ready.xlsx"
+BRACKET_OUTPUT_DIR = os.path.dirname(BRACKET_WORKBOOK_PATH)
+BRACKET_CACHE_PATH = os.path.join(BRACKET_OUTPUT_DIR, "2026_bracket_sim_cache.pkl")
+BRACKET_SUMMARY_CSV = os.path.join(BRACKET_OUTPUT_DIR, "2026_bracket_sim_summary.csv")
+
+_BRACKET_MATCHUP_CACHE = {}
+_BRACKET_TEAM_SNAPSHOT_CACHE = {}
+
+BRACKET_TEAM_ALIASES = {
+    "ohio st": "ohio state",
+    "michigan st": "michigan state",
+    "iowa st": "iowa state",
+    "north dakota st": "north dakota state",
+    "wright st": "wright state",
+    "utah st": "utah state",
+    "kennesaw st": "kennesaw state",
+    "uconn": "connecticut",
+    "ucf": "central florida",
+    "umbc": "maryland-baltimore county",
+    "long island": "liu brooklyn",
+    "saint mary's": "saint marys",
+    "saint marys": "saint marys",
+    "st mary's": "saint marys",
+    "st marys": "saint marys",
+    "cal baptist": "california baptist",
+    "penn": "pennsylvania",
+    "mcneese": "mcneese state",
+    "byu": "brigham young",
+    "miami ohio": "miami oh",
+    "miami (ohio)": "miami oh",
+    "miami fl": "miami",
+    "miami (fl)": "miami",
+    "miami florida": "miami",
+    "prairie view a&m": "prairie view",
+    "prairie view a and m": "prairie view",
+    "prairie view am": "prairie view",
+    "queens (n.c.)": "queens",
+    "queens (nc)": "queens",
+    "queens nc": "queens",
+}
+
+BRACKET_REQUIRED_SHEETS = ("First_Round", "First_Four", "Structure")
+BRACKET_SHEET_SCHEMA = {
+    "First_Round": {
+        "required": {
+            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
+            "team1_raw": ("Team A", "Team1", "Away_Team"),
+            "team2_raw": ("Team B", "Team2", "Home_Team"),
+        },
+        "optional": {
+            "game_number": ("Game Number",),
+            "seed1": ("Seed A", "Seed1", "Away_Seed"),
+            "seed2": ("Seed B", "Seed2", "Home_Seed"),
+            "region": ("Bracket Region", "Region"),
+            "region_code": ("Region Code",),
+            "round_name": ("Round",),
+        },
+    },
+    "First_Four": {
+        "required": {
+            "game_key": ("Play-In Slot", "Game", "Game_ID", "Slot"),
+            "team1_raw": ("Team A", "Team1", "Away_Team"),
+            "team2_raw": ("Team B", "Team2", "Home_Team"),
+        },
+        "optional": {
+            "description": ("Description",),
+            "seed1": ("Seed A", "Seed1", "Away_Seed"),
+            "seed2": ("Seed B", "Seed2", "Home_Seed"),
+            "region": ("Bracket Region", "Region"),
+            "round_name": ("Round",),
+            "feeds_into_slot": ("Feeds Into Round 1 Slot",),
+        },
+    },
+    "Structure": {
+        "required": {
+            "source_game": ("From Slot", "Source_Game", "Winner_Of"),
+            "dest_game": ("To Slot", "Dest_Game", "Next_Game"),
+            "carry": ("Carry", "Dest_Slot", "Winner_Slot"),
+        },
+        "optional": {
+            "region": ("Bracket Region", "Region"),
+            "from_round": ("From Round",),
+            "dest_round": ("To Round", "Dest_Round", "Round"),
+        },
+    },
+}
+
+
+def _get_bracket_workbook_path() -> str:
+    return os.environ.get("NCAABB_BRACKET_PATH", BRACKET_WORKBOOK_PATH)
+
+
+def _bracket_file_signature(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    st = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "size": int(st.st_size),
+        "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
+    }
+
+
+def _normalize_bracket_key(x) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
+
+
+def _bracket_team_canon(name: str) -> str:
+    raw = str(name or "").strip()
+    canon = canonical_team(raw)
+    alias = BRACKET_TEAM_ALIASES.get(canon, canon)
+    return canonical_team(alias)
+
+
+def _bracket_team_norm_key(name: str) -> str:
+    return _normalize_bracket_key(str(name or "").strip())
+
+
+def _is_bracket_composite_placeholder(raw_name: str) -> bool:
+    txt = str(raw_name or "").strip()
+    return "/" in txt and len([p for p in re.split(r"\s*/\s*", txt) if p.strip()]) >= 2
+
+
+def _valid_first_four_placeholder_slots(bracket_data: dict) -> set:
+    ff = bracket_data.get("First_Four", pd.DataFrame())
+    if ff is None or len(ff) == 0 or "feeds_into_slot_norm" not in ff.columns:
+        return set()
+    return set(ff["feeds_into_slot_norm"].dropna().astype(str))
+
+
+def _split_bracket_composite_placeholder(raw_name: str) -> list:
+    return [p.strip() for p in re.split(r"\s*/\s*", str(raw_name or "").strip()) if p.strip()]
+
+
+def _valid_first_four_placeholder_pairs(bracket_data: dict) -> dict:
+    ff = bracket_data.get("First_Four", pd.DataFrame())
+    if ff is None or len(ff) == 0:
+        return {}
+    out = {}
+    for _, row in ff.iterrows():
+        dest = str(row.get("feeds_into_slot_norm", "")).strip()
+        if not dest:
+            continue
+        pair = tuple(sorted([
+            _bracket_team_canon(row.get("team1_raw", "")),
+            _bracket_team_canon(row.get("team2_raw", "")),
+        ]))
+        out[dest] = pair
+    return out
+
+
+def _normalize_round_name(name: str) -> str:
+    txt = str(name or "").strip().lower()
+    if "first four" in txt or "play-in" in txt:
+        return "First_Four"
+    if "first round" in txt or "round of 64" in txt:
+        return "First_Round"
+    if "second round" in txt or "round of 32" in txt:
+        return "Second_Round"
+    if "sweet 16" in txt or "sweet sixteen" in txt or "regional semifinal" in txt:
+        return "Sweet_16"
+    if "elite 8" in txt or "elite eight" in txt or "regional final" in txt:
+        return "Elite_8"
+    if "final four" in txt or "national semifinal" in txt:
+        return "Final_Four"
+    if "championship" in txt or "title game" in txt:
+        return "Championship"
+    return str(name).strip() if str(name).strip() else ""
+
+
+def _normalize_bracket_slot_position(value):
+    txt = str(value or "").strip().lower()
+    if txt in {"1", "a", "team a", "top", "left", "away"}:
+        return 1
+    if txt in {"2", "b", "team b", "bottom", "right", "home"}:
+        return 2
+    return np.nan
+
+
+def _normalize_bracket_carry(value: str) -> str:
+    txt = str(value or "").strip().lower()
+    if txt == "winner":
+        return "winner"
+    return ""
+
+
+def _bracket_pick_column(df: pd.DataFrame, aliases: tuple, required: bool = True):
+    for col in aliases:
+        if col in df.columns:
+            return col, None
+    if required:
+        return None, f"Missing required column. Expected one of: {', '.join(aliases)}"
+    return None, None
+
+
+def _normalize_bracket_sheet(df: pd.DataFrame, sheet_name: str) -> tuple:
+    if df is None or len(df) == 0:
+        return pd.DataFrame(), [], [f"{sheet_name} sheet is empty."]
+
+    schema = BRACKET_SHEET_SCHEMA[sheet_name]
+    out = pd.DataFrame(index=df.index)
+    info = []
+    errors = []
+
+    for target, aliases in schema["required"].items():
+        col, err = _bracket_pick_column(df, aliases, required=True)
+        if err:
+            errors.append(f"{sheet_name}: {err}")
+            continue
+        out[target] = df[col]
+        if col != aliases[0]:
+            info.append(f"{sheet_name}: mapped {target} from '{col}'")
+
+    for target, aliases in schema.get("optional", {}).items():
+        col, _ = _bracket_pick_column(df, aliases, required=False)
+        if col is not None:
+            out[target] = df[col]
+            if col != aliases[0]:
+                info.append(f"{sheet_name}: mapped {target} from '{col}'")
+        else:
+            out[target] = np.nan
+
+    if errors:
+        return pd.DataFrame(), info, errors
+
+    if sheet_name in {"First_Round", "First_Four"}:
+        out["game_key"] = out["game_key"].astype(str).str.strip()
+        out["team1_raw"] = out["team1_raw"].astype(str).str.strip()
+        out["team2_raw"] = out["team2_raw"].astype(str).str.strip()
+        out = out.replace({"": np.nan}).dropna(subset=["game_key", "team1_raw", "team2_raw"]).copy()
+        if "round_name" in out.columns:
+            out["round_name"] = out["round_name"].map(_normalize_round_name)
+        else:
+            out["round_name"] = sheet_name
+        out["round_name"] = out["round_name"].replace("", sheet_name).fillna(sheet_name)
+        out["game_key_norm"] = out["game_key"].map(_normalize_bracket_key)
+        out["team1_canon"] = out["team1_raw"].map(_bracket_team_canon)
+        out["team2_canon"] = out["team2_raw"].map(_bracket_team_canon)
+        if "feeds_into_slot" in out.columns:
+            out["feeds_into_slot"] = out["feeds_into_slot"].astype(str).str.strip()
+            out["feeds_into_slot_norm"] = out["feeds_into_slot"].map(_normalize_bracket_key)
+    else:
+        out["source_game"] = out["source_game"].astype(str).str.strip()
+        out["dest_game"] = out["dest_game"].astype(str).str.strip()
+        out["carry"] = out["carry"].astype(str).str.strip()
+        out = out.replace({"": np.nan}).dropna(subset=["source_game", "dest_game", "carry"]).copy()
+        out["source_game_norm"] = out["source_game"].map(_normalize_bracket_key)
+        out["dest_game_norm"] = out["dest_game"].map(_normalize_bracket_key)
+        out["dest_round"] = out["dest_round"].map(_normalize_round_name)
+        if "from_round" in out.columns:
+            out["from_round"] = out["from_round"].map(_normalize_round_name)
+        out["carry_norm"] = out["carry"].map(_normalize_bracket_carry)
+        bad_carry = out["carry_norm"].eq("")
+        if bad_carry.any():
+            return pd.DataFrame(), info, [f"{sheet_name}: Carry contains unsupported values: {', '.join(sorted(out.loc[bad_carry, 'carry'].astype(str).unique())[:10])}"]
+
+    return out.reset_index(drop=True), info, errors
+
+
+def _validate_bracket_workbook(sheets_dict: dict) -> tuple:
+    missing = [s for s in BRACKET_REQUIRED_SHEETS if s not in sheets_dict]
+    if missing:
+        return None, [], [f"Missing required workbook sheet(s): {', '.join(missing)}"]
+
+    normalized = {}
+    info = []
+    errors = []
+    for sheet_name in BRACKET_REQUIRED_SHEETS:
+        norm_df, sheet_info, sheet_errors = _normalize_bracket_sheet(sheets_dict[sheet_name], sheet_name)
+        info.extend(sheet_info)
+        errors.extend(sheet_errors)
+        if len(sheet_errors) == 0:
+            normalized[sheet_name] = norm_df
+
+    if errors:
+        return None, info, errors
+    return normalized, info, []
+
+
+def _load_bracket_workbook(path: str = None) -> tuple:
+    path = path or _get_bracket_workbook_path()
+    if not path or not os.path.exists(path):
+        return None, [], [f"Bracket workbook not found: {path}"]
+    try:
+        sheets = pd.read_excel(path, sheet_name=None)
+    except Exception as e:
+        return None, [], [f"Could not load bracket workbook: {e}"]
+    return _validate_bracket_workbook(sheets)
+
+
+def _build_bracket_team_lookup(schedule_df: pd.DataFrame, team_snaps_df: pd.DataFrame) -> dict:
+    frames = []
+    if schedule_df is not None and len(schedule_df) > 0:
+        s = schedule_df.copy()
+        for id_col, candidates in [
+            ("home_id", ["home_team", "home_name", "home_display_name", "home_short_display_name"]),
+            ("away_id", ["away_team", "away_name", "away_display_name", "away_short_display_name"]),
+        ]:
+            if id_col in s.columns:
+                frames.append(pd.DataFrame({
+                    "team_id": pd.to_numeric(s[id_col], errors="coerce"),
+                    "team_name": _safe_team_text_col(s, candidates, default=""),
+                }))
+                for c in candidates:
+                    if c in s.columns:
+                        frames.append(pd.DataFrame({
+                            "team_id": pd.to_numeric(s[id_col], errors="coerce"),
+                            "team_name": s[c].astype(str).str.strip(),
+                        }))
+    if team_snaps_df is not None and len(team_snaps_df) > 0 and "team_id" in team_snaps_df.columns:
+        ts = team_snaps_df.copy()
+        for col in ["team_display_name", "display_name", "team_name", "short_display_name", "team"]:
+            if col in ts.columns:
+                frames.append(pd.DataFrame({
+                    "team_id": pd.to_numeric(ts["team_id"], errors="coerce"),
+                    "team_name": ts[col].astype(str).str.strip(),
+                }))
+    if not frames:
+        return {}
+    out = pd.concat(frames, ignore_index=True)
+    out = out.dropna(subset=["team_id"]).copy()
+    out["team_id"] = out["team_id"].astype(int)
+    out["team_name"] = out["team_name"].astype(str).str.strip()
+    out = out[~out["team_name"].map(_bad_team_name)].copy()
+    out["team_canon"] = out["team_name"].map(_bracket_team_canon)
+    out["team_norm"] = out["team_name"].map(_bracket_team_norm_key)
+
+    lookup = {}
+    conflicts = []
+
+    def _register(key: str, row) -> None:
+        if not key:
+            return
+        payload = {"team_id": int(row["team_id"]), "team_name": row["team_name"]}
+        existing = lookup.get(key)
+        if existing is None:
+            lookup[key] = payload
+        elif int(existing["team_id"]) != int(row["team_id"]):
+            conflicts.append({"key": key, "existing": existing["team_name"], "incoming": row["team_name"]})
+
+    out = out.sort_values(["team_id", "team_name"]).drop_duplicates(subset=["team_id", "team_name"], keep="first")
+    for _, row in out.iterrows():
+        raw_name = str(row["team_name"]).strip()
+        _register(raw_name, row)
+        _register(_bracket_team_norm_key(raw_name), row)
+        _register(str(row["team_canon"]).strip(), row)
+
+    TOURNAMENT_FLAG_DEBUG["bracket_team_lookup"] = {
+        "rows": int(len(out)),
+        "unique_team_ids": int(out["team_id"].nunique()) if len(out) else 0,
+        "keys": int(len(lookup)),
+        "conflicts": int(len(conflicts)),
+        "key_samples": list(lookup.keys())[:12],
+        "conflict_samples": conflicts[:10],
+    }
+    return lookup
+
+
+def _resolve_bracket_team_lookup_entry(raw_name: str, team_lookup: dict):
+    raw = str(raw_name or "").strip()
+    for key in [raw, _bracket_team_norm_key(raw), _bracket_team_canon(raw)]:
+        if key in team_lookup:
+            return team_lookup[key]
+    return None
+
+
+def _canonicalize_bracket_teams(bracket_data: dict, team_lookup: dict) -> tuple:
+    games = pd.concat([bracket_data["First_Four"], bracket_data["First_Round"]], ignore_index=True, sort=False)
+    play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
+    play_in_pairs = _valid_first_four_placeholder_pairs(bracket_data)
+    unresolved = []
+    resolved_count = 0
+    targeted_debug = {
+        "single_checks": [],
+        "composite_checks": [],
+    }
+    for _, row in games.iterrows():
+        round_name = str(row.get("round_name", "")).strip()
+        slot_norm = str(row.get("game_key_norm", "")).strip()
+
+        exempt_pair_placeholder = False
+        if round_name == "First_Round" and slot_norm in play_in_slots:
+            raw1 = str(row.get("team1_raw", "")).strip()
+            raw2 = str(row.get("team2_raw", "")).strip()
+            composite_raws = [raw for raw in [raw1, raw2] if _is_bracket_composite_placeholder(raw)]
+            if composite_raws:
+                ff_pair = play_in_pairs.get(slot_norm)
+                composite_parts = tuple(sorted(set([
+                    _bracket_team_canon(p)
+                    for raw in composite_raws
+                    for p in _split_bracket_composite_placeholder(raw)
+                ])))
+                if ff_pair:
+                    exempt_pair_placeholder = True
+                if len(targeted_debug["composite_checks"]) < 10:
+                    targeted_debug["composite_checks"].append({
+                        "game_key": row.get("game_key", ""),
+                        "slot_norm": slot_norm,
+                        "raw_values": composite_raws,
+                        "expected_pair": ff_pair,
+                        "composite_parts": composite_parts,
+                        "slot_is_feeder": slot_norm in play_in_slots,
+                        "exempted": bool(exempt_pair_placeholder),
+                    })
+
+        for col_raw in ["team1_raw", "team2_raw"]:
+            raw = str(row.get(col_raw, "")).strip()
+            canon = _bracket_team_canon(raw)
+            if exempt_pair_placeholder and _is_bracket_composite_placeholder(raw):
+                continue
+            resolved = _resolve_bracket_team_lookup_entry(raw, team_lookup)
+            if canon in {"prairie view", "miami", "queens"} and len(targeted_debug["single_checks"]) < 10:
+                targeted_debug["single_checks"].append({
+                    "raw": raw,
+                    "canon": canon,
+                    "raw_exists": raw in team_lookup,
+                    "norm_key": _bracket_team_norm_key(raw),
+                    "norm_exists": _bracket_team_norm_key(raw) in team_lookup,
+                    "canon_exists": canon in team_lookup,
+                    "resolved": resolved is not None,
+                })
+            if resolved is not None:
+                resolved_count += 1
+                continue
+            if canon not in team_lookup:
+                unresolved.append({
+                    "sheet_round": round_name,
+                    "game_key": row.get("game_key", ""),
+                    "team_raw": raw,
+                    "team_canon": canon,
+                })
+    TOURNAMENT_FLAG_DEBUG["bracket_resolution"] = {
+        "lookup_keys": int(len(team_lookup)),
+        "resolved_team_entries": int(resolved_count),
+        "unresolved_team_entries": int(len(unresolved)),
+        "unresolved_samples": unresolved[:10],
+        **targeted_debug,
+    }
+    return games.reset_index(drop=True), pd.DataFrame(unresolved).drop_duplicates().reset_index(drop=True)
+
+
+def _latest_bracket_snapshot(team_id, asof_date):
+    key = (int(team_id), str(pd.Timestamp(asof_date).date()))
+    if key not in _BRACKET_TEAM_SNAPSHOT_CACHE:
+        _BRACKET_TEAM_SNAPSHOT_CACHE[key] = _team_snapshot_asof(team_id, asof_date)
+    return _BRACKET_TEAM_SNAPSHOT_CACHE[key]
+
+
+def _build_hypothetical_neutral_game(team_a: dict, team_b: dict, asof_date) -> pd.DataFrame:
+    snap_a = _latest_bracket_snapshot(team_a["team_id"], asof_date)
+    snap_b = _latest_bracket_snapshot(team_b["team_id"], asof_date)
+    if len(snap_a) == 0 or len(snap_b) == 0:
+        raise ValueError(
+            f"Missing team snapshot as of {pd.Timestamp(asof_date).date()} for "
+            f"{team_a['team_name']} or {team_b['team_name']}."
+        )
+
+    game_dt = pd.Timestamp(asof_date).normalize() + pd.Timedelta(hours=12)
+    joined = pd.DataFrame([{
+        "game_id": f"BRACKET_{pd.Timestamp(asof_date).strftime('%Y%m%d')}_{team_a['team_id']}_{team_b['team_id']}",
+        "game_dt_et": game_dt,
+        "neutral_site": True,
+        "is_tournament": 1,
+        "is_conf_tourney": 0,
+        "is_ncaa_tourney": 1,
+        "home_id": int(team_a["team_id"]),
+        "away_id": int(team_b["team_id"]),
+        "home_team": team_a["team_name"],
+        "away_team": team_b["team_name"],
+        "home_short_display_name": team_a["team_name"],
+        "away_short_display_name": team_b["team_name"],
+        "home_score": np.nan,
+        "away_score": np.nan,
+        "status_type_completed": False,
+        "status_type_state": "pre",
+        "status_type_name": "STATUS_SCHEDULED",
+        "status_type_short_detail": "",
+    }])
+
+    use_roll_cols = [c for c in roll_cols if (c in snap_a.index) or (c in snap_b.index)]
+    for c in use_roll_cols:
+        joined[f"{c}_HOME"] = _matchup_num(snap_a.get(c))
+        joined[f"{c}_AWAY"] = _matchup_num(snap_b.get(c))
+
+    joined["teamA_id"] = np.minimum(joined["home_id"], joined["away_id"]).astype(int)
+    joined["teamB_id"] = np.maximum(joined["home_id"], joined["away_id"]).astype(int)
+    teamA_is_home = joined["teamA_id"].values == joined["home_id"].values
+
+    ta_cols, tb_cols, diff_cols_local = {}, {}, {}
+    for c in use_roll_cols:
+        h = joined[f"{c}_HOME"]
+        a = joined[f"{c}_AWAY"]
+        ta = np.where(teamA_is_home, h, a)
+        tb = np.where(teamA_is_home, a, h)
+        ta_cols[f"{c}_TA"] = ta
+        tb_cols[f"{c}_TB"] = tb
+        diff_cols_local[f"diff_{c}"] = ta - tb
+
+    if diff_cols_local:
+        joined = pd.concat(
+            [
+                joined,
+                pd.DataFrame(ta_cols, index=joined.index),
+                pd.DataFrame(tb_cols, index=joined.index),
+                pd.DataFrame(diff_cols_local, index=joined.index),
+            ],
+            axis=1
+        )
+        use_diff = [c for c in joined.columns if c.startswith("diff_")]
+        joined[use_diff] = joined[use_diff].apply(pd.to_numeric, errors="coerce")
+
+    if elo_snap is not None and len(elo_snap) > 0:
+        joined = add_elo_asof_features(joined, elo_snap)
+
+    joined["home_court_A"] = 0.0
+    return normalize_board_for_downstream(joined)
+
+
+def _predict_neutral_matchup(team_a: dict, team_b: dict, asof_date) -> dict:
+    key = (
+        min(int(team_a["team_id"]), int(team_b["team_id"])),
+        max(int(team_a["team_id"]), int(team_b["team_id"])),
+        str(pd.Timestamp(asof_date).date()),
+    )
+    if key in _BRACKET_MATCHUP_CACHE:
+        return dict(_BRACKET_MATCHUP_CACHE[key])
+
+    pregame = _build_hypothetical_neutral_game(team_a, team_b, asof_date)
+    scored = predict_slate(
+        pregame,
+        spread_booster, winner_booster, lgb_spread,
+        iso, imp, feature_cols,
+    )
+    row = scored.iloc[0]
+    result = {
+        "team_a_id": int(team_a["team_id"]),
+        "team_b_id": int(team_b["team_id"]),
+        "team_a_name": team_a["team_name"],
+        "team_b_name": team_b["team_name"],
+        "p_team_a_win": float(row["p_home_win"]),
+        "p_team_b_win": float(1.0 - row["p_home_win"]),
+        "pred_margin_team_a": float(row["pred_margin_home"]),
+        "winner_pick": str(row["winner_pick"]),
+    }
+    _BRACKET_MATCHUP_CACHE[key] = dict(result)
+    return result
+
+
+def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tuple:
+    ff = bracket_data["First_Four"].copy()
+    fr = bracket_data["First_Round"].copy()
+    structure = bracket_data["Structure"].copy()
+
+    first_four_results = []
+    for _, row in ff.iterrows():
+        team_a = _resolve_bracket_team_lookup_entry(row.get("team1_raw", ""), team_lookup)
+        team_b = _resolve_bracket_team_lookup_entry(row.get("team2_raw", ""), team_lookup)
+        if team_a is None or team_b is None:
+            raise ValueError(
+                f"Could not resolve First Four teams for {row.get('game_key', '')}: "
+                f"{row.get('team1_raw', '')} vs {row.get('team2_raw', '')}"
+            )
+
+        pred = _predict_neutral_matchup(team_a, team_b, asof_date)
+        winner = team_a if np.random.random() < pred["p_team_a_win"] else team_b
+        first_four_results.append({
+            "game_key": row.get("game_key", ""),
+            "winner_team": winner["team_name"],
+            "winner_canon": canonical_team(winner["team_name"]),
+            "win_prob": pred["p_team_a_win"] if winner["team_id"] == team_a["team_id"] else pred["p_team_b_win"],
+            "pred_margin": pred["pred_margin_team_a"] if winner["team_id"] == team_a["team_id"] else -pred["pred_margin_team_a"],
+        })
+
+        dest_key = row.get("feeds_into_slot_norm", "")
+        if dest_key:
+            mask = fr["game_key_norm"] == dest_key
+            if mask.any():
+                bad1 = fr.loc[mask, "team1_raw"].astype(str).str.strip().eq("")
+                bad2 = fr.loc[mask, "team2_raw"].astype(str).str.strip().eq("")
+                if bad1.any():
+                    fr.loc[mask & bad1, "team1_raw"] = winner["team_name"]
+                    fr.loc[mask & bad1, "team1_canon"] = canonical_team(winner["team_name"])
+                elif bad2.any():
+                    fr.loc[mask & bad2, "team2_raw"] = winner["team_name"]
+                    fr.loc[mask & bad2, "team2_canon"] = canonical_team(winner["team_name"])
+                else:
+                    dest_rows = structure[structure["source_game_norm"] == row.get("game_key_norm", _normalize_bracket_key(row.get("game_key", "")))].copy()
+                    for _, edge in dest_rows.iterrows():
+                        slot = int(pd.to_numeric(edge["dest_slot"], errors="coerce"))
+                        fr.loc[mask, f"team{slot}_raw"] = winner["team_name"]
+                        fr.loc[mask, f"team{slot}_canon"] = canonical_team(winner["team_name"])
+
+    updated = dict(bracket_data)
+    updated["First_Round"] = fr.reset_index(drop=True)
+    return updated, pd.DataFrame(first_four_results)
+
+
+def _initial_bracket_games(bracket_data: dict, team_lookup: dict) -> dict:
+    games = {}
+    for sheet_name in ["First_Round"]:
+        df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
+        if len(df) == 0:
+            continue
+        for _, row in df.iterrows():
+            team1 = _resolve_bracket_team_lookup_entry(row.get("team1_raw", ""), team_lookup)
+            team2 = _resolve_bracket_team_lookup_entry(row.get("team2_raw", ""), team_lookup)
+            if team1 is None or team2 is None:
+                raise ValueError(
+                    f"Could not resolve bracket teams for {row.get('game_key', '')}: "
+                    f"{row.get('team1_raw', '')} vs {row.get('team2_raw', '')}"
+                )
+            games[row["game_key_norm"]] = {
+                "game_key": row["game_key"],
+                "round_name": row.get("round_name", sheet_name),
+                "region": str(row.get("region", "") or ""),
+                "team1": dict(team1),
+                "team2": dict(team2),
+            }
+            if "seed1" in row and pd.notna(row.get("seed1")):
+                games[row["game_key_norm"]]["team1"]["seed"] = str(row.get("seed1")).strip()
+            if "seed2" in row and pd.notna(row.get("seed2")):
+                games[row["game_key_norm"]]["team2"]["seed"] = str(row.get("seed2")).strip()
+            games[row["game_key_norm"]]["team1"]["region"] = games[row["game_key_norm"]]["region"]
+            games[row["game_key_norm"]]["team2"]["region"] = games[row["game_key_norm"]]["region"]
+    return games
+
+
+def _structure_destinations(structure_df: pd.DataFrame) -> tuple:
+    edges = {}
+    all_games = set()
+    for _, row in structure_df.iterrows():
+        src = row["source_game_norm"]
+        dst = row["dest_game_norm"]
+        carry = str(row.get("carry_norm", row.get("carry", ""))).strip().lower()
+        edges.setdefault(src, []).append({"dest_game": dst, "carry": carry})
+        all_games.add(src)
+        all_games.add(dst)
+    return edges, all_games
+
+
+def _single_bracket_advancement_template(team_lookup: dict) -> dict:
+    return {}
+
+
+def _record_advancement_slot(store: dict, team: dict, round_name: str) -> None:
+    tid = int(team["team_id"])
+    if tid not in store:
+        store[tid] = {
+            "team_id": tid,
+            "team": team["team_name"],
+            "seed": str(team.get("seed", "") or ""),
+            "region": str(team.get("region", "") or ""),
+            "First_Round": 0,
+            "Second_Round": 0,
+            "Sweet_16": 0,
+            "Elite_8": 0,
+            "Final_Four": 0,
+            "Championship": 0,
+            "Champion": 0,
+        }
+    if round_name in store[tid]:
+        store[tid][round_name] += 1
+
+
+def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> tuple:
+    bracket_ff, first_four_df = _resolve_first_four(bracket_data, team_lookup, asof_date)
+    structure_df = bracket_ff["Structure"].copy()
+    games = _initial_bracket_games(bracket_ff, team_lookup)
+    edges, all_game_keys = _structure_destinations(structure_df)
+
+    for gk in all_game_keys:
+        games.setdefault(gk, {"game_key": gk, "round_name": "", "region": "", "team1": None, "team2": None})
+
+    incoming_counts = structure_df.groupby("dest_game_norm").size().to_dict()
+    for gk, game in games.items():
+        if not game.get("round_name"):
+            preds = structure_df.loc[structure_df["dest_game_norm"] == gk, "source_game_norm"].tolist()
+            src_rounds = [games.get(src, {}).get("round_name", "") for src in preds if src in games]
+            src_rounds = [r for r in src_rounds if r]
+            if src_rounds:
+                game["round_name"] = _next_bracket_round(src_rounds[0])
+
+    advancement = _single_bracket_advancement_template(team_lookup)
+    for game in games.values():
+        if game.get("round_name") == "First_Round":
+            if game.get("team1") is not None:
+                _record_advancement_slot(advancement, game["team1"], "First_Round")
+            if game.get("team2") is not None:
+                _record_advancement_slot(advancement, game["team2"], "First_Round")
+
+    pending = set(games.keys())
+    game_rows = []
+    while pending:
+        progressed = False
+        for key in list(pending):
+            game = games[key]
+            if game.get("team1") is None or game.get("team2") is None:
+                continue
+            pred = _predict_neutral_matchup(game["team1"], game["team2"], asof_date)
+            winner = game["team1"] if np.random.random() < pred["p_team_a_win"] else game["team2"]
+            loser = game["team2"] if winner["team_id"] == game["team1"]["team_id"] else game["team1"]
+            next_round = _next_bracket_round(game.get("round_name", ""))
+            if next_round:
+                _record_advancement_slot(advancement, winner, next_round)
+            game_rows.append({
+                "game_key": game.get("game_key", key),
+                "round_name": game.get("round_name", ""),
+                "team1": game["team1"]["team_name"],
+                "team2": game["team2"]["team_name"],
+                "winner": winner["team_name"],
+                "loser": loser["team_name"],
+                "win_prob": pred["p_team_a_win"] if winner["team_id"] == game["team1"]["team_id"] else pred["p_team_b_win"],
+                "proj_margin": pred["pred_margin_team_a"] if winner["team_id"] == game["team1"]["team_id"] else -pred["pred_margin_team_a"],
+            })
+            for edge in edges.get(key, []):
+                dest = games[edge["dest_game"]]
+                if dest.get("team1") is None:
+                    dest["team1"] = dict(winner)
+                elif dest.get("team2") is None:
+                    dest["team2"] = dict(winner)
+                else:
+                    raise ValueError(f"Destination slot {dest.get('game_key', edge['dest_game'])} already has two teams assigned.")
+            pending.remove(key)
+            progressed = True
+        if not progressed:
+            unresolved = [games[k]["game_key"] for k in pending]
+            raise ValueError(f"Bracket structure could not resolve all games. Pending: {', '.join(map(str, unresolved[:10]))}")
+
+    latest_run = pd.concat([first_four_df.assign(round_name="First_Four")] if len(first_four_df) else [], ignore_index=True) if len(first_four_df) else pd.DataFrame()
+    latest_games = pd.DataFrame(game_rows)
+    if len(latest_run) and len(latest_games):
+        latest_run = pd.concat([latest_run, latest_games], ignore_index=True, sort=False)
+    elif len(latest_games):
+        latest_run = latest_games
+    return pd.DataFrame(list(advancement.values())), latest_run
+
+
+def _simulate_bracket_many(bracket_data: dict, team_lookup: dict, asof_date, sim_n: int) -> tuple:
+    all_adv = []
+    latest_run = pd.DataFrame()
+    for _ in range(int(sim_n)):
+        adv_df, latest_run = _simulate_bracket_once(bracket_data, team_lookup, asof_date)
+        all_adv.append(adv_df)
+    if not all_adv:
+        return pd.DataFrame(), latest_run
+    return pd.concat(all_adv, ignore_index=True, sort=False), latest_run
+
+
+def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int) -> pd.DataFrame:
+    if adv_df is None or len(adv_df) == 0:
+        return pd.DataFrame()
+    value_cols = ["First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
+    summary = adv_df.groupby(["team_id", "team", "seed", "region"], as_index=False)[value_cols].sum()
+    for col in value_cols:
+        summary[f"{col}_Pct"] = (100.0 * summary[col] / float(sim_n)).round(1)
+    summary["Finalist_Pct"] = summary["Championship_Pct"]
+    summary["Champion_Pct"] = summary["Champion_Pct"] if "Champion_Pct" in summary.columns else (100.0 * summary["Champion"] / float(sim_n)).round(1)
+    return summary.sort_values(
+        ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct", "Elite_8_Pct"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+def _bracket_cache_signature(sim_n: int, asof_date) -> dict:
+    meta = _load_metadata()
+    return {
+        "workbook": _bracket_file_signature(_get_bracket_workbook_path()),
+        "sim_n": int(sim_n),
+        "asof_date": str(pd.Timestamp(asof_date).date()),
+        "last_model_fit": meta.get("last_model_fit", ""),
+        "feature_cols_n": len(meta.get("feature_cols", feature_cols if "feature_cols" in globals() else [])),
+    }
+
+
+def _load_cached_bracket_sim(expected_sig: dict):
+    if not os.path.exists(BRACKET_CACHE_PATH):
+        return None
+    try:
+        payload = pd.read_pickle(BRACKET_CACHE_PATH)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("signature") != expected_sig:
+        return None
+    return payload
+
+
+def _save_cached_bracket_sim(signature: dict, summary_df: pd.DataFrame, latest_run_df: pd.DataFrame):
+    os.makedirs(BRACKET_OUTPUT_DIR, exist_ok=True)
+    payload = {
+        "signature": signature,
+        "summary_df": summary_df,
+        "latest_run_df": latest_run_df,
+    }
+    pd.to_pickle(payload, BRACKET_CACHE_PATH)
+    summary_df.to_csv(BRACKET_SUMMARY_CSV, index=False)
+
+
+def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame):
+    if summary_df is None or len(summary_df) == 0:
+        bracket_summary_html.value = ""
+        with bracket_out:
+            clear_output(wait=True)
+            display(HTML("<div style='color:#AAA;'>No bracket simulation results available.</div>"))
+        return
+
+    champ_cols = [c for c in ["team", "seed", "region", "Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in summary_df.columns]
+    champs = summary_df[champ_cols].head(12).copy()
+    bracket_summary_html.value = (
+        "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Champion Probability Summary</div>"
+        + df_to_html_table(champs, max_rows=len(champs))
+    )
+
+    show_cols = [
+        "team", "seed", "region",
+        "First_Round_Pct", "Second_Round_Pct", "Sweet_16_Pct",
+        "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct",
+    ]
+    show_cols = [c for c in show_cols if c in summary_df.columns]
+    with bracket_out:
+        clear_output(wait=True)
+        display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Round Advancement Probabilities</div>"))
+        display(HTML(df_to_html_table(summary_df[show_cols], max_rows=min(len(summary_df), 80))))
+        if latest_run_df is not None and len(latest_run_df) > 0:
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:14px 0 8px 0;'>Latest Simulated Bracket Run</div>"))
+            display(HTML(df_to_html_table(latest_run_df, max_rows=len(latest_run_df))))
+
+
+def run_bracket_simulation(_=None, force_run: bool = True):
+    bracket_status_html.value = ""
+    bracket_summary_html.value = ""
+    with bracket_out:
+        clear_output(wait=True)
+        display(HTML("<div style='color:#AAA; padding:8px;'>Loading bracket workbook...</div>"))
+
+    sim_n = int(bracket_sim_n.value)
+    asof_date = bracket_asof_date.value or date_picker.value
+    team_lookup = _build_bracket_team_lookup(schedule_cur, team_snaps)
+
+    bracket_data, info_msgs, errors = _load_bracket_workbook(_get_bracket_workbook_path())
+    if errors:
+        bracket_status_html.value = (
+            "<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>"
+            + "<br>".join(errors) + "</div>"
+        )
+        with bracket_out:
+            clear_output(wait=True)
+        return
+
+    bracket_games, unresolved_df = _canonicalize_bracket_teams(bracket_data, team_lookup)
+    if unresolved_df is not None and len(unresolved_df) > 0:
+        bracket_status_html.value = (
+            "<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;font-weight:700;'>"
+            "Unresolved workbook teams found. Fix these names before simulating."
+            "</div>"
+        )
+        with bracket_out:
+            clear_output(wait=True)
+            display(HTML(df_to_html_table(unresolved_df, max_rows=len(unresolved_df))))
+        return
+
+    normalized_data = dict(bracket_data)
+    normalized_data["Bracket_Games"] = bracket_games
+    signature = _bracket_cache_signature(sim_n, asof_date)
+
+    payload = None
+    if not force_run:
+        try:
+            payload = _load_cached_bracket_sim(signature)
+        except Exception as e:
+            bracket_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Bracket cache load failed: {e}</div>"
+            with bracket_out:
+                clear_output(wait=True)
+            return
+        if payload is not None:
+            extra = ""
+            if info_msgs:
+                extra = "<br>" + "<br>".join(info_msgs)
+            bracket_status_html.value = (
+                f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#bbb;'>"
+                f"Loaded cached bracket simulation for {signature['asof_date']} ({sim_n} sims).{extra}</div>"
+            )
+            _render_bracket_results(payload.get("summary_df"), payload.get("latest_run_df"))
+            return
+
+    try:
+        adv_df, latest_run_df = _simulate_bracket_many(normalized_data, team_lookup, asof_date, sim_n)
+        summary_df = _summarize_bracket_simulations(adv_df, sim_n)
+        _save_cached_bracket_sim(signature, summary_df, latest_run_df)
+    except Exception as e:
+        bracket_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Bracket simulation failed: {e}</div>"
+        with bracket_out:
+            clear_output(wait=True)
+        return
+
+    extra = ""
+    if info_msgs:
+        extra = "<br>" + "<br>".join(info_msgs)
+    bracket_status_html.value = (
+        f"<div style='background:#111;border-left:4px solid #2ECC71;padding:10px;color:#bbb;'>"
+        f"Completed bracket simulation for {pd.Timestamp(asof_date).date()} with {sim_n} runs.<br>"
+        f"Saved to: {BRACKET_OUTPUT_DIR}{extra}</div>"
+    )
+    _render_bracket_results(summary_df, latest_run_df)
+
+
 def force_retrain_clicked(_=None):
     with out:
         clear_output(wait=True)
@@ -5900,6 +6818,7 @@ retrain_btn.on_click(force_retrain_clicked)
 open_dashboard_btn.on_click(open_dashboard_clicked)
 date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
 compare_btn.on_click(render_matchup)
+run_bracket_btn.on_click(lambda _: run_bracket_simulation(force_run=True))
 
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
@@ -5910,11 +6829,23 @@ controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn, open_dashbo
 controls_row2 = widgets.HBox([min_conf, min_abs_margin, side_filter])
 controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, tournament_mode, search_box, max_rows])
 matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_picker, compare_btn])
+bracket_controls = widgets.HBox([bracket_sim_n, bracket_asof_date, run_bracket_btn])
 matchup_tab = widgets.VBox([matchup_controls, matchup_out])
+bracket_tab = widgets.VBox([bracket_controls, bracket_status_html, bracket_summary_html, bracket_out])
 predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, tournament_banner_html, out])
-dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab])
+dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab, bracket_tab])
 dashboard_tabs.set_title(0, "Predictions")
 dashboard_tabs.set_title(1, "Matchup")
+dashboard_tabs.set_title(2, "Bracket Sim")
+
+
+def _maybe_load_bracket_cache(change):
+    if change.get("name") != "selected_index" or change.get("new") != 2:
+        return
+    run_bracket_simulation(force_run=False)
+
+
+dashboard_tabs.observe(_maybe_load_bracket_cache, names="selected_index")
 
 dashboard_layout = widgets.VBox([season_banner_html, daily_banner_html, dashboard_tabs])
 

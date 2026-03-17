@@ -113,13 +113,19 @@ All changes must be minimal and reversible.
 
 Agents must NOT modify:
 
-- dashboard widget layout
+- existing Predictions tab behavior unless explicitly instructed
+- existing Matchup tab behavior unless explicitly instructed
 - prediction column names
 - model training logic
-- feature engineering logic
+- existing training feature engineering logic
 - prediction output schema
 
-Breaking these can invalidate historical exports.
+Agents MAY add:
+- new isolated dashboard tabs
+- new widget controls for new tabs
+- new helper functions for separate features such as bracket simulation
+
+Any such additions must not alter the existing daily prediction pipeline.
 
 ---
 
@@ -236,6 +242,26 @@ Avoid:
 - recalculating cached accuracy weeks
 
 Caching should be used whenever possible.
+
+---
+
+## Bracket Simulator Rules
+
+A bracket simulator may be added as a separate feature, but it must remain isolated from the daily prediction pipeline.
+
+Agents may:
+- add a new standalone dashboard tab for bracket simulation
+- load a separate bracket workbook
+- build hypothetical neutral-site matchup helpers for simulation
+- save bracket simulation cache/results in the bracket folder
+
+Agents must NOT:
+- route bracket simulation through the normal daily board refresh flow
+- retrain models for bracket simulation unless explicitly instructed
+- alter existing Predictions or Matchup tab behavior
+- change the existing prediction output schema for daily slate views
+
+Bracket simulation should reuse existing canonical team mapping and existing model inference paths whenever possible.
 
 ---
 
