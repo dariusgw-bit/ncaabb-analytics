@@ -3933,7 +3933,7 @@ def attach_fresh_scores_from_hoopr(board: pd.DataFrame, date_et) -> pd.DataFrame
 
     target_date = pd.Timestamp(date_et).date()
     today_et = pd.Timestamp.now(tz="America/New_York").date()
-    if target_date < today_et:
+    if (not IN_COLAB) or target_date < today_et:
         return out
 
     # --------------------------------------------------------
@@ -4536,6 +4536,15 @@ def build_or_update_season_accuracy_cache():
     Updates weekly cached season accuracy.
     Only computes weeks not already saved.
     """
+    required_keys = {
+        "games_graded",
+        "winner_correct", "winner_total",
+        "spread_correct", "spread_total",
+        "margin_mae_sum", "margin_mae_n",
+        "within5_correct", "within5_total",
+        "ats_correct", "ats_total",
+    }
+
     cache = _load_season_acc_cache()
 
     s = schedule_cur.copy()
@@ -4560,11 +4569,7 @@ def build_or_update_season_accuracy_cache():
 
     for wk, dates_in_week in weeks.items():
         cached_wk = cache.get(wk, {})
-        if (
-            wk in cache
-            and int(cached_wk.get("games_graded", 0) or 0) > 0
-            and int(cached_wk.get("ats_total", 0) or 0) > 0
-        ):
+        if wk in cache and required_keys.issubset(set(cached_wk.keys())):
             continue
 
         boards = []
