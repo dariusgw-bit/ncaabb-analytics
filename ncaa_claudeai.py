@@ -88,7 +88,7 @@ import xgboost as xgb
 import lightgbm as lgb
 import ipywidgets as widgets
 
-from IPython.display import display, HTML, clear_output
+from IPython.display import display, HTML, clear_output, Javascript
 from sklearn.impute import SimpleImputer
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import Ridge
@@ -4973,6 +4973,7 @@ SEASON_ACC_DATE = None
 date_picker     = widgets.DatePicker(description="Slate (ET):")
 refresh_btn     = widgets.Button(description="🔄 Refresh", button_style="primary")
 retrain_btn     = widgets.Button(description="🔁 Force Retrain", button_style="warning")
+open_dashboard_btn = widgets.Button(description="Open Dashboard")
 min_conf        = widgets.FloatSlider(description="Min Conf", min=0.50, max=0.95, step=0.01, value=0.60, readout_format=".2f")
 min_abs_margin  = widgets.FloatSlider(description="Min |Margin|", min=0.0, max=20.0, step=0.5, value=0.0)
 side_filter     = widgets.Dropdown(description="Side", options=[("All","all"),("Favorites","fav"),("Dogs","dog")], value="all")
@@ -5406,6 +5407,104 @@ def render_tournament_status_banner(board: pd.DataFrame = None, manual_override:
     </div>"""
 
 
+def _current_dashboard_snapshot_html() -> str:
+    table_html = "<div style='color:#AAA; padding:12px;'>No current board is available yet.</div>"
+    rw_html = ""
+
+    if LAST_BOARD is not None and len(LAST_BOARD) > 0:
+        b2 = _apply_filters(LAST_BOARD)
+        table_html = df_to_html_table(_format_board_for_display(b2), int(max_rows.value))
+        if show_rw_missing.value:
+            miss = LAST_BOARD[LAST_BOARD.get("rw_missing_reason", pd.Series("", index=LAST_BOARD.index)).ne("")]
+            if len(miss):
+                rw_html = (
+                    f"<div style='color:#AAA; margin:0 0 8px 0;'>⚠️ RW missing: {len(miss)} games</div>"
+                    + df_to_html_table(miss[["away_team", "home_team", "rw_missing_reason"]].head(20), max_rows=20)
+                )
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NCAA AI Dashboard</title>
+  <style>
+    html, body {{
+      margin: 0;
+      padding: 0;
+      background: #0b0b0b;
+      color: #eeeeee;
+      font-family: Arial, Helvetica, sans-serif;
+    }}
+    body {{
+      padding: 24px;
+    }}
+    .app-wrap {{
+      width: 100%;
+      max-width: 1800px;
+      margin: 0 auto;
+    }}
+    .app-title {{
+      font-size: 28px;
+      font-weight: 700;
+      margin: 0 0 18px 0;
+      color: #f5f5f5;
+    }}
+    table {{
+      border-collapse: collapse;
+      width: max-content;
+      min-width: 100%;
+      background: #111111;
+    }}
+    th, td {{
+      border: 1px solid #2a2a2a;
+      padding: 8px 10px;
+      vertical-align: top;
+      text-align: left;
+      white-space: nowrap;
+    }}
+    th {{
+      background: #1a1a1a;
+      color: #f0f0f0;
+      position: relative;
+    }}
+    .pred-table-wrap {{
+      overflow-x: auto;
+      margin-top: 10px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="app-wrap">
+    <div class="app-title">NCAA AI Dashboard</div>
+    {season_banner_html.value}
+    {daily_banner_html.value}
+    {tournament_banner_html.value}
+    {rw_html}
+    {table_html}
+  </div>
+</body>
+</html>"""
+
+
+def open_dashboard_clicked(_=None):
+    html = _current_dashboard_snapshot_html()
+    js = f"""
+    (function() {{
+      var win = window.open("", "_blank");
+      if (!win) {{
+        alert("Popup blocked. Please allow popups for this notebook.");
+        return;
+      }}
+      win.document.open();
+      win.document.write({json.dumps(html)});
+      win.document.close();
+      win.focus();
+    }})();
+    """
+    display(Javascript(js))
+
+
 
 # Helpers go above this line
 def refresh(_=None, force_rebuild=False):
@@ -5798,6 +5897,7 @@ def force_retrain_clicked(_=None):
 
 refresh_btn.on_click(lambda _: refresh(force_rebuild=True))
 retrain_btn.on_click(force_retrain_clicked)
+open_dashboard_btn.on_click(open_dashboard_clicked)
 date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
 compare_btn.on_click(render_matchup)
 
@@ -5806,7 +5906,7 @@ for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
     widget.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
 
 # Layout
-controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn])
+controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn, open_dashboard_btn])
 controls_row2 = widgets.HBox([min_conf, min_abs_margin, side_filter])
 controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, tournament_mode, search_box, max_rows])
 matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_picker, compare_btn])
