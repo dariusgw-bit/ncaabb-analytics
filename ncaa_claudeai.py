@@ -891,6 +891,28 @@ def _parse_rotowire_csv(path: str) -> pd.DataFrame:
 
         return True
 
+    def _row_game_dt_et(v):
+        if not date_col:
+            return pd.NaT
+        try:
+            ts = pd.to_datetime(v, errors="coerce")
+        except Exception:
+            return pd.NaT
+        if pd.isna(ts):
+            return pd.NaT
+        try:
+            if getattr(ts, "tzinfo", None) is not None:
+                return ts.tz_convert("America/New_York").tz_localize(None)
+        except Exception:
+            pass
+        try:
+            return ts.tz_localize("America/New_York").tz_localize(None)
+        except Exception:
+            try:
+                return pd.Timestamp(ts).tz_localize("America/New_York").tz_localize(None)
+            except Exception:
+                return pd.NaT
+
     data = data[~data[team_col].map(_bad)].reset_index(drop=True)
 
     rows = []
@@ -912,10 +934,14 @@ def _parse_rotowire_csv(path: str) -> pd.DataFrame:
         total       = _to_float(r_home[total_col])   if total_col  else np.nan
         if pd.isna(total) and total_col:
             total = _to_float(r_away[total_col])
+        game_dt_et = _row_game_dt_et(r_home.get(date_col) if date_col else None)
+        if pd.isna(game_dt_et):
+            game_dt_et = _row_game_dt_et(r_away.get(date_col) if date_col else None)
 
         rows.append({
             "away_team":      away_name,
             "home_team":      home_name,
+            "rw_game_dt_et":  game_dt_et,
             "rw_away_ml":     away_ml,
             "rw_home_ml":     home_ml,
             "rw_spread_home": spread_home,
@@ -1203,6 +1229,16 @@ def _build_rotowire_fallback_slate(
     rw = load_rotowire_all_for_date(slate_date_et, rotowire_dir)
     if rw is None or len(rw) == 0:
         return pd.DataFrame()
+
+    if "rw_game_dt_et" in rw.columns:
+        rw = rw.copy()
+        rw["rw_game_dt_et"] = pd.to_datetime(rw["rw_game_dt_et"], errors="coerce")
+        if rw["rw_game_dt_et"].notna().any():
+            rw = rw[rw["rw_game_dt_et"].dt.date == pd.Timestamp(slate_date_et).date()].copy()
+        else:
+            rw = pd.DataFrame()
+        if len(rw) == 0:
+            return pd.DataFrame()
 
     name_to_id = _build_team_id_name_map(schedule_df, team_snaps)
 
@@ -4791,13 +4827,15 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 80) -> str:
     df = df.head(max_rows)
     style = """
     <style>
-    .pred-table { border-collapse: collapse; width:100%; font-size:12px; color:#EEE; }
+    .pred-table-wrap { width:100%; overflow-x:auto; overflow-y:hidden; }
+    .pred-table { border-collapse: collapse; width:max-content; min-width:100%; font-size:12px; color:#EEE; table-layout:auto; }
     .pred-table th { background:#1a1a1a; color:#FFD700; padding:6px 8px;
-                     border-bottom:2px solid #333; white-space:nowrap; }
-    .pred-table td { padding:5px 8px; border-bottom:1px solid #222; white-space:nowrap; }
+                     border-bottom:2px solid #333; white-space:nowrap; position:relative; }
+    .pred-table td { padding:6px 10px; border-bottom:1px solid #222; white-space:nowrap; }
     .pred-table tr:hover td { background:#1f1f1f; }
     </style>"""
-    return style + df.to_html(escape=False, index=False, classes="pred-table", border=0)
+    table_html = df.to_html(escape=False, index=False, classes="pred-table", border=0)
+    return style + f"<div class='pred-table-wrap'>{table_html}</div>"
 
 
 def _apply_filters(board: pd.DataFrame) -> pd.DataFrame:
