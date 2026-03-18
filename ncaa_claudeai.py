@@ -6701,11 +6701,13 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> 
                 "team2_seed": str(game["team2"].get("seed", "") or ""),
                 "winner": winner["team_name"],
                 "winner_team": winner["team_name"],
+                "winner_canon": canonical_team(winner["team_name"]),
                 "winner_id": int(winner["team_id"]),
                 "winner_seed": str(winner.get("seed", "") or ""),
                 "winner_region": str(winner.get("region", "") or ""),
                 "loser": loser["team_name"],
                 "loser_team": loser["team_name"],
+                "loser_canon": canonical_team(loser["team_name"]),
                 "loser_id": int(loser["team_id"]),
                 "loser_seed": str(loser.get("seed", "") or ""),
                 "loser_region": str(loser.get("region", "") or ""),
@@ -6736,6 +6738,20 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> 
         latest_run = pd.concat([latest_run, latest_games], ignore_index=True, sort=False)
     elif len(latest_games):
         latest_run = latest_games
+    if len(latest_run):
+        if "winner_team" not in latest_run.columns:
+            latest_run["winner_team"] = ""
+        if "winner" not in latest_run.columns:
+            latest_run["winner"] = ""
+        latest_run["winner_team"] = latest_run["winner_team"].fillna("")
+        latest_run["winner"] = latest_run["winner"].fillna("")
+        fill_winner = latest_run["winner_team"].astype(str).str.strip().eq("") & latest_run["winner"].astype(str).str.strip().ne("")
+        latest_run.loc[fill_winner, "winner_team"] = latest_run.loc[fill_winner, "winner"]
+        if "winner_canon" not in latest_run.columns:
+            latest_run["winner_canon"] = ""
+        latest_run["winner_canon"] = latest_run["winner_canon"].fillna("")
+        fill_wcanon = latest_run["winner_canon"].astype(str).str.strip().eq("") & latest_run["winner_team"].astype(str).str.strip().ne("")
+        latest_run.loc[fill_wcanon, "winner_canon"] = latest_run.loc[fill_wcanon, "winner_team"].map(canonical_team)
     return pd.DataFrame(list(advancement.values())), latest_run
 
 
@@ -6759,7 +6775,18 @@ def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int) -> pd.DataF
         if col not in work.columns:
             work[col] = ""
         work[col] = work[col].fillna("").astype(str)
-    summary = work.groupby(["team_id", "team", "seed", "region"], as_index=False, dropna=False)[value_cols].sum()
+    meta = (
+        work.assign(
+            _team_len=work["team"].astype(str).str.len(),
+            _seed_len=work["seed"].astype(str).str.len(),
+            _region_len=work["region"].astype(str).str.len(),
+        )
+        .sort_values(["_region_len", "_seed_len", "_team_len"], ascending=False)
+        .drop_duplicates(subset=["team_id"])
+        [["team_id", "team", "seed", "region"]]
+    )
+    summary = work.groupby(["team_id"], as_index=False, dropna=False)[value_cols].sum().merge(meta, on="team_id", how="left")
+    summary = summary[["team_id", "team", "seed", "region"] + value_cols]
     for col in value_cols:
         summary[f"{col}_Pct"] = (100.0 * summary[col] / float(sim_n)).round(1)
     summary["Finalist_Pct"] = summary["Championship_Pct"]
