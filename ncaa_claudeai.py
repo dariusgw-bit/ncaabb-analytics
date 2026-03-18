@@ -133,6 +133,19 @@ for d in [RAW_DIR, ROTOWIRE_DIR, INJURY_DIR, MODEL_DIR, TEAM_BOX_DIR, SCHEDULE_D
 
 print("✅ Paths configured")
 
+# Safe startup defaults for globals populated later by refresh/retrain flows.
+schedule_cur = pd.DataFrame()
+team_snaps = pd.DataFrame()
+elo_snap = pd.DataFrame()
+team_box_hist = pd.DataFrame()
+roll_cols = []
+feature_cols = []
+spread_booster = None
+winner_booster = None
+lgb_spread = None
+iso = None
+imp = None
+
 # ============================================================
 # CELL 3: UTILITIES
 # ============================================================
@@ -738,7 +751,8 @@ def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: st
 
     if len(inj) == 0:
         for col in ["home_injury_impact", "away_injury_impact", "diff_injury_impact",
-                    "home_inj_out", "away_inj_out"]:
+                    "home_inj_out", "away_inj_out", "injury_impact_A", "injury_impact_B",
+                    "inj_out_A", "inj_out_B", "diff_inj_out"]:
             board[col] = np.nan
         return board
 
@@ -763,10 +777,60 @@ def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: st
 
     b["home_injury_impact"] = b["k_home"].map(inj_dict).fillna(0.0)
     b["away_injury_impact"] = b["k_away"].map(inj_dict).fillna(0.0)
-    b["diff_injury_impact"] = b["home_injury_impact"] - b["away_injury_impact"]
     b["home_inj_out"]       = b["k_home"].map(out_dict).fillna(0.0)
     b["away_inj_out"]       = b["k_away"].map(out_dict).fillna(0.0)
+
+    if {"teamA_id", "home_id"}.issubset(b.columns):
+        teamA_is_home = (
+            pd.to_numeric(b["teamA_id"], errors="coerce") ==
+            pd.to_numeric(b["home_id"], errors="coerce")
+        )
+        b["injury_impact_A"] = np.where(teamA_is_home, b["home_injury_impact"], b["away_injury_impact"]).astype(float)
+        b["injury_impact_B"] = np.where(teamA_is_home, b["away_injury_impact"], b["home_injury_impact"]).astype(float)
+        b["inj_out_A"] = np.where(teamA_is_home, b["home_inj_out"], b["away_inj_out"]).astype(float)
+        b["inj_out_B"] = np.where(teamA_is_home, b["away_inj_out"], b["home_inj_out"]).astype(float)
+        b["diff_injury_impact"] = b["injury_impact_A"] - b["injury_impact_B"]
+        b["diff_inj_out"] = b["inj_out_A"] - b["inj_out_B"]
+    else:
+        b["injury_impact_A"] = np.nan
+        b["injury_impact_B"] = np.nan
+        b["inj_out_A"] = np.nan
+        b["inj_out_B"] = np.nan
+        b["diff_injury_impact"] = b["home_injury_impact"] - b["away_injury_impact"]
+        b["diff_inj_out"] = b["home_inj_out"] - b["away_inj_out"]
     return b.drop(columns=["k_home", "k_away"], errors="ignore")
+
+
+def attach_injury_features_by_row_date(board: pd.DataFrame, injury_dir: str, date_col: str = "game_dt_et") -> pd.DataFrame:
+    """
+    Attach injury features to a mixed-date matchup frame by grouping rows on date
+    and reusing the existing single-date board injury merge.
+    """
+    if board is None or len(board) == 0:
+        return board
+
+    out = board.copy()
+    row_dates = pd.to_datetime(out.get(date_col), errors="coerce").dt.date
+    out["_inj_row_date"] = row_dates
+
+    default_cols = [
+        "home_injury_impact", "away_injury_impact", "diff_injury_impact",
+        "home_inj_out", "away_inj_out", "injury_impact_A", "injury_impact_B",
+        "inj_out_A", "inj_out_B", "diff_inj_out",
+    ]
+    for col in default_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+
+    valid_mask = out["_inj_row_date"].notna()
+    if valid_mask.any():
+        for d, idx in out.loc[valid_mask].groupby("_inj_row_date").groups.items():
+            patched = attach_injury_features_to_board(out.loc[idx].copy(), d, injury_dir)
+            for col in default_cols:
+                if col in patched.columns:
+                    out.loc[idx, col] = patched[col].values
+
+    return out.drop(columns=["_inj_row_date"], errors="ignore")
 
 
 # ============================================================
@@ -2209,8 +2273,11 @@ def build_game_dataset_from_team_box(
     sched["home_id"] = pd.to_numeric(sched.get("home_id"), errors="coerce")
     sched["away_id"] = pd.to_numeric(sched.get("away_id"), errors="coerce")
 
+    sched = ensure_board_team_columns(sched)
+
     keep_sched = [c for c in [
         "game_id", "home_id", "away_id", "neutral_site", "season_type",
+        "home_team", "away_team", "home_short_display_name", "away_short_display_name",
         "status_type_name", "status_type_short_detail", "note", "notes",
         "game_note", "game_name", "name", "event_name", "game_dt_et", "game_date_time"
     ] if c in sched.columns]
@@ -2226,6 +2293,11 @@ def build_game_dataset_from_team_box(
     teamA_is_home = merged["teamA_id"] == pd.to_numeric(merged["home_id"], errors="coerce")
     merged["home_court_A"] = np.where(neutral, 0, np.where(teamA_is_home, 1, -1)).astype(float)
     diff_cols.append("home_court_A")
+
+    merged = attach_injury_features_by_row_date(merged, INJURY_DIR, date_col="game_dt_et")
+    for c in ["diff_injury_impact", "diff_inj_out"]:
+        if c in merged.columns:
+            diff_cols.append(c)
 
     merged[diff_cols] = merged[diff_cols].fillna(0.0)
 
@@ -3175,18 +3247,20 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
     meta = _load_metadata()
     now_str = datetime.utcnow().isoformat()
+    print(f"Starting retrain check: force_data={bool(force_data)}, force_model={bool(force_model)}")
+    _dashboard_log("retrain_check", status="start", force_data=bool(force_data), force_model=bool(force_model))
 
     need_data = force_data or _hours_since(meta.get("last_data_refresh")) >= RETRAIN_DATA_HOURS
     need_model = force_model or _days_since(meta.get("last_model_fit")) >= RETRAIN_MODEL_DAYS
 
     if need_data:
-        print(f"⏳ Data refresh triggered (last: {meta.get('last_data_refresh', 'never')})")
+        print(f"Data refresh triggered (last: {meta.get('last_data_refresh', 'never')})")
 
         run_hoopr_refresh(
             raw_dir=RAW_DIR,
             current_season=CURRENT_SEASON,
             seasons=HIST_SEASONS,
-            force=False,
+            force=bool(force_data),
             check_changes_for_current=True,
             export={
                 "schedule": True,
@@ -3205,9 +3279,10 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         meta["last_data_refresh_action"] = "executed"
         _save_metadata(meta)
     else:
+        print(f"Data refresh skipped (last: {meta.get('last_data_refresh', 'never')})")
         meta["last_data_refresh_action"] = "skipped"
 
-    print("📂 Loading team box history...")
+    print("Loading team box history...")
     team_box_hist = load_team_box_history(TEAM_BOX_DIR, HIST_SEASONS)
     tb_hist = team_box_hist.copy()
     schedule_cur = load_schedule(SCHEDULE_DIR, CURRENT_SEASON)
@@ -3218,10 +3293,8 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     current_training_sig = _training_input_signature(TEAM_BOX_DIR, SCHEDULE_DIR)
     print(f"  team_box rows: {len(tb_hist):,}  |  schedule rows: {len(schedule_cur):,}")
 
-    print("📊 Building rolling snapshots + Elo...")
+    print("Building rolling snapshots + Elo...")
     team_snaps, roll_cols = build_team_rolling_snapshots(tb_hist, window=ROLL_WINDOW)
-
-    # full Elo history for as-of merges
     elo_snap = compute_elo_ratings(tb_hist)
 
     if not force_model and need_model:
@@ -3237,8 +3310,8 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             need_model = False
 
     if need_model:
-        print(f"🔁 Full model retrain triggered (last: {meta.get('last_model_fit', 'never')})")
-        print("📐 Building training dataset...")
+        print(f"Full model retrain triggered (last: {meta.get('last_model_fit', 'never')})")
+        print("Building training dataset...")
 
         dataset_all = build_game_dataset_from_team_box(
             team_box=tb_hist,
@@ -3249,8 +3322,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
         print(f"  Training rows: {len(dataset_all):,}")
 
-        spread_booster, winner_booster, lgb_spread, iso, imp, diff_cols2, feature_cols = \
-            train_models(dataset_all, CURRENT_SEASON)
+        spread_booster, winner_booster, lgb_spread, iso, imp, diff_cols2, feature_cols =             train_models(dataset_all, CURRENT_SEASON)
 
         diff_cols = [c for c in diff_cols2 if not c.endswith("__na")]
 
@@ -3260,10 +3332,9 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         meta["training_input_signature"] = current_training_sig
         meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
-        print("✅ Model retrain complete")
-
+        print("Model retrain complete")
     else:
-        print(f"⏭️  Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
+        print(f"Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
         meta["last_model_refresh_action"] = "skipped"
         try:
             spread_booster, winner_booster, lgb_spread, iso, imp = load_models(MODEL_DIR)
@@ -3273,17 +3344,26 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             feature_cols = meta_cols
             _save_metadata(meta)
         except Exception as e:
-            print(f"⚠️ Could not load saved models ({e}). Triggering fresh model train...")
+            print(f"Could not load saved models ({e}). Triggering fresh model train...")
+            _dashboard_log("retrain_check", status="load_failed", error=str(e))
             return check_and_retrain(force_data=False, force_model=True)
 
     cur2 = None
-    print("✅ Scheduler complete. All globals ready.")
-
-
-print("🚀 Running startup retrain check...")
-check_and_retrain()
-#check_and_retrain(force_data=True, force_model=False)
-
+    _dashboard_log(
+        "retrain_check",
+        status="completed",
+        force_data=bool(force_data),
+        force_model=bool(force_model),
+        data_refresh=meta.get("last_data_refresh_action", "unknown"),
+        model_refresh=meta.get("last_model_refresh_action", "unknown"),
+    )
+    print("Scheduler complete. All globals ready.")
+    return {
+        "data_refresh_action": meta.get("last_data_refresh_action", "unknown"),
+        "model_refresh_action": meta.get("last_model_refresh_action", "unknown"),
+        "last_data_refresh": meta.get("last_data_refresh", ""),
+        "last_model_fit": meta.get("last_model_fit", ""),
+    }
 
 # ============================================================
 # CELL 12: PREDICTION ENGINE
@@ -3443,6 +3523,8 @@ def build_board_for_date(
     if pregame is None or len(pregame) == 0:
         return pd.DataFrame()
 
+    pregame = normalize_board_for_downstream(pregame)
+    pregame = attach_injury_features_to_board(pregame, date_et, INJURY_DIR)
     pregame = normalize_board_for_downstream(pregame)
 
     board = predict_slate(
@@ -5274,11 +5356,19 @@ def _safe_execute(section: str, fn):
         return None, e
 
 
+def _models_ready() -> bool:
+    return all(globals().get(name) is not None for name in [
+        "spread_booster", "winner_booster", "lgb_spread", "imp"
+    ])
+
+
 def _board_cache_key(date_et) -> tuple:
     return (str(pd.Timestamp(date_et).date()), _dashboard_runtime_signature())
 
 
 def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
+    if not _models_ready():
+        raise RuntimeError("Models are not loaded yet. Run retrain/startup initialization first.")
     key = _board_cache_key(date_et)
     if not force_rebuild and key in BOARD_CACHE:
         return BOARD_CACHE[key].copy(), True
@@ -5997,6 +6087,12 @@ def refresh(_=None, force_rebuild=False):
     daily_banner_html.value = daily_html
     tournament_banner_html.value = ""
 
+    if not _models_ready():
+        with out:
+            clear_output(wait=True)
+            display(HTML("<div style='color:#AAA; padding:8px;'>Models are not loaded yet. Run retrain/startup initialization first.</div>"))
+        return
+
     # fast path
     if (LAST_DATE == date_picker.value) and (LAST_BOARD is not None) and not force_rebuild:
         with out:
@@ -6114,9 +6210,11 @@ def refresh(_=None, force_rebuild=False):
 
 
 def _matchup_team_options():
+    schedule_df = globals().get("schedule_cur", pd.DataFrame())
+    snaps_df = globals().get("team_snaps", pd.DataFrame())
     frames = []
-    if schedule_cur is not None and len(schedule_cur) > 0:
-        s = schedule_cur.copy()
+    if schedule_df is not None and len(schedule_df) > 0:
+        s = schedule_df.copy()
         for id_col, candidates in [
             ("home_id", ["home_team", "home_name", "home_display_name"]),
             ("away_id", ["away_team", "away_name", "away_display_name"]),
@@ -6130,7 +6228,7 @@ def _matchup_team_options():
 
     if not frames:
         return sorted(
-            [(name, tid) for tid, name in _build_id_team_name_map(schedule_cur, team_snaps).items()],
+            [(name, tid) for tid, name in _build_id_team_name_map(schedule_df, snaps_df).items()],
             key=lambda x: x[0]
         )
 
@@ -8419,12 +8517,47 @@ def run_bracket_simulation(_=None, force_run: bool = True):
 
 
 def force_retrain_clicked(_=None):
+    import html
+    import traceback
+
+    _dashboard_log("force_retrain", status="start", selected_date=str(date_picker.value))
     with out:
         clear_output(wait=True)
-        display(HTML("<div style='color:#FFD700;'>🔁 Forcing full model retrain...</div>"))
-    check_and_retrain(force_data=True, force_model=True)
-    refresh(force_rebuild=True)
+        display(HTML("<div style='color:#FFD700;'>Starting force retrain...</div>"))
+        try:
+            result = check_and_retrain(force_data=True, force_model=True)
+            display(HTML(
+                "<div style='color:#9FD89F; padding:6px 0;'>"
+                f"Force retrain completed. Data refresh: <b>{html.escape(str((result or {}).get('data_refresh_action', 'unknown')))}</b>"
+                f" | Model refresh: <b>{html.escape(str((result or {}).get('model_refresh_action', 'unknown')))}</b>"
+                "</div>"
+            ))
+        except Exception as e:
+            tb = traceback.format_exc()
+            _dashboard_log("force_retrain", status="error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
+            display(HTML(
+                "<div style='color:#ffb4b4; padding:6px 0;'>"
+                f"Force retrain failed: {html.escape(str(e))}</div>"
+                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
+            ))
+            return
 
+    try:
+        refresh(force_rebuild=True)
+    except Exception as e:
+        tb = traceback.format_exc()
+        _dashboard_log("force_retrain", status="refresh_error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
+        with out:
+            display(HTML(
+                "<div style='color:#ffb4b4; padding:6px 0;'>"
+                f"Retrain succeeded, but dashboard refresh failed: {html.escape(str(e))}</div>"
+                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
+            ))
+        return
+
+    with out:
+        display(HTML("<div style='color:#9FD89F; padding:6px 0;'>Force retrain flow finished.</div>"))
+    _dashboard_log("force_retrain", status="completed", selected_date=str(date_picker.value))
 
 refresh_btn.on_click(lambda _: refresh(force_rebuild=True))
 retrain_btn.on_click(force_retrain_clicked)
@@ -8470,9 +8603,28 @@ dashboard_tabs.observe(_maybe_load_bracket_cache, names="selected_index")
 
 dashboard_layout = widgets.VBox([season_banner_html, daily_banner_html, dashboard_tabs])
 
+_startup_init_error = None
+try:
+    check_and_retrain(force_data=False, force_model=False)
+except Exception as e:
+    import html
+    import traceback
+    _startup_init_error = (str(e), traceback.format_exc())
+    _dashboard_log("startup_model_init", status="error", error=str(e), traceback=_startup_init_error[1])
+
 _emit_startup_diagnostics()
 display(dashboard_layout)
-refresh()
+if _startup_init_error is not None:
+    import html
+    with out:
+        clear_output(wait=True)
+        display(HTML(
+            "<div style='color:#ffb4b4; padding:8px;'>"
+            f"Startup model initialization failed: {html.escape(_startup_init_error[0])}</div>"
+            f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(_startup_init_error[1])}</pre>"
+        ))
+else:
+    refresh()
 
 """# REPORT"""
 
