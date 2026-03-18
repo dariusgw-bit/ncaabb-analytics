@@ -5969,6 +5969,7 @@ BRACKET_SHEET_SCHEMA = {
             "region": ("Bracket Region", "Region"),
             "round_name": ("Round",),
             "feeds_into_slot": ("Feeds Into Round 1 Slot",),
+            "winner_raw": ("Winner",),
         },
     },
     "Structure": {
@@ -6003,6 +6004,12 @@ def _bracket_file_signature(path: str) -> dict:
 
 def _normalize_bracket_key(x) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
+
+
+def _clean_bracket_text(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
 
 
 def _bracket_team_canon(name: str) -> str:
@@ -6154,6 +6161,8 @@ def _normalize_bracket_sheet(df: pd.DataFrame, sheet_name: str) -> tuple:
         out["game_key"] = out["game_key"].astype(str).str.strip()
         out["team1_raw"] = out["team1_raw"].astype(str).str.strip()
         out["team2_raw"] = out["team2_raw"].astype(str).str.strip()
+        if "winner_raw" in out.columns:
+            out["winner_raw"] = out["winner_raw"].map(_clean_bracket_text)
         out = out.replace({"": np.nan}).dropna(subset=["game_key", "team1_raw", "team2_raw"]).copy()
         if "round_name" in out.columns:
             out["round_name"] = out["round_name"].map(_normalize_round_name)
@@ -6480,8 +6489,23 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tup
                 f"{row.get('team1_raw', '')} vs {row.get('team2_raw', '')}"
             )
 
-        pred = _predict_neutral_matchup(team_a, team_b, asof_date)
-        winner = team_a if np.random.random() < pred["p_team_a_win"] else team_b
+        winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
+        winner = None
+        pred = None
+        if winner_raw:
+            winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
+            if winner is None:
+                raise ValueError(
+                    f"Could not resolve First Four workbook winner for {row.get('game_key', '')}: {winner_raw}"
+                )
+            if int(winner["team_id"]) not in {int(team_a["team_id"]), int(team_b["team_id"])}:
+                raise ValueError(
+                    f"First Four workbook winner does not match participants for {row.get('game_key', '')}: "
+                    f"{winner_raw} vs {row.get('team1_raw', '')} / {row.get('team2_raw', '')}"
+                )
+        else:
+            pred = _predict_neutral_matchup(team_a, team_b, asof_date)
+            winner = team_a if np.random.random() < pred["p_team_a_win"] else team_b
         loser = team_b if winner["team_id"] == team_a["team_id"] else team_a
         first_four_results.append({
             "game_key": row.get("game_key", ""),
@@ -6496,12 +6520,18 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tup
             "winner_team": winner["team_name"],
             "winner_canon": canonical_team(winner["team_name"]),
             "winner_seed": str(row.get("seed1", "") or "") if winner["team_id"] == team_a["team_id"] else str(row.get("seed2", "") or ""),
+            "winner_region": str(row.get("region", "") or ""),
             "loser": loser["team_name"],
             "loser_team": loser["team_name"],
             "loser_canon": canonical_team(loser["team_name"]),
             "loser_seed": str(row.get("seed2", "") or "") if winner["team_id"] == team_a["team_id"] else str(row.get("seed1", "") or ""),
-            "win_prob": pred["p_team_a_win"] if winner["team_id"] == team_a["team_id"] else pred["p_team_b_win"],
-            "pred_margin": pred["pred_margin_team_a"] if winner["team_id"] == team_a["team_id"] else -pred["pred_margin_team_a"],
+            "loser_region": str(row.get("region", "") or ""),
+            "win_prob": (
+                pred["p_team_a_win"] if winner["team_id"] == team_a["team_id"] else pred["p_team_b_win"]
+            ) if pred is not None else np.nan,
+            "pred_margin": (
+                pred["pred_margin_team_a"] if winner["team_id"] == team_a["team_id"] else -pred["pred_margin_team_a"]
+            ) if pred is not None else np.nan,
         })
 
         dest_key = row.get("feeds_into_slot_norm", "")
