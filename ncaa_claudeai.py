@@ -6053,19 +6053,46 @@ def _normalize_round_name(name: str) -> str:
     txt = str(name or "").strip().lower()
     if "first four" in txt or "play-in" in txt:
         return "First_Four"
+    if txt in {"ff", "firstfour"}:
+        return "First_Four"
     if "first round" in txt or "round of 64" in txt:
+        return "First_Round"
+    if txt in {"r64", "rd64"}:
         return "First_Round"
     if "second round" in txt or "round of 32" in txt:
         return "Second_Round"
+    if txt in {"r32", "rd32"}:
+        return "Second_Round"
     if "sweet 16" in txt or "sweet sixteen" in txt or "regional semifinal" in txt:
+        return "Sweet_16"
+    if txt in {"s16", "sw16"}:
         return "Sweet_16"
     if "elite 8" in txt or "elite eight" in txt or "regional final" in txt:
         return "Elite_8"
+    if txt in {"e8", "el8"}:
+        return "Elite_8"
     if "final four" in txt or "national semifinal" in txt:
+        return "Final_Four"
+    if txt in {"f4", "ffour"}:
         return "Final_Four"
     if "championship" in txt or "title game" in txt:
         return "Championship"
+    if txt in {"title", "final"}:
+        return "Championship"
     return str(name).strip() if str(name).strip() else ""
+
+
+def _next_advancement_bucket(round_name: str) -> str:
+    order = {
+        "First_Four": "First_Round",
+        "First_Round": "Second_Round",
+        "Second_Round": "Sweet_16",
+        "Sweet_16": "Elite_8",
+        "Elite_8": "Final_Four",
+        "Final_Four": "Championship",
+        "Championship": "Champion",
+    }
+    return order.get(str(round_name).strip(), "")
 
 
 def _normalize_bracket_slot_position(value):
@@ -6267,7 +6294,6 @@ def _resolve_bracket_team_lookup_entry(raw_name: str, team_lookup: dict):
 def _canonicalize_bracket_teams(bracket_data: dict, team_lookup: dict) -> tuple:
     games = pd.concat([bracket_data["First_Four"], bracket_data["First_Round"]], ignore_index=True, sort=False)
     play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
-    play_in_pairs = _valid_first_four_placeholder_pairs(bracket_data)
     unresolved = []
     resolved_count = 0
     targeted_debug = {
@@ -6276,29 +6302,22 @@ def _canonicalize_bracket_teams(bracket_data: dict, team_lookup: dict) -> tuple:
     }
     for _, row in games.iterrows():
         round_name = str(row.get("round_name", "")).strip()
+        round_key = _normalize_bracket_key(round_name)
         slot_norm = str(row.get("game_key_norm", "")).strip()
 
         exempt_pair_placeholder = False
-        if round_name == "First_Round" and slot_norm in play_in_slots:
+        is_round_of_64 = round_key in {"firstround", "r64", "roundof64"}
+        if is_round_of_64 and slot_norm in play_in_slots:
             raw1 = str(row.get("team1_raw", "")).strip()
             raw2 = str(row.get("team2_raw", "")).strip()
             composite_raws = [raw for raw in [raw1, raw2] if _is_bracket_composite_placeholder(raw)]
             if composite_raws:
-                ff_pair = play_in_pairs.get(slot_norm)
-                composite_parts = tuple(sorted(set([
-                    _bracket_team_canon(p)
-                    for raw in composite_raws
-                    for p in _split_bracket_composite_placeholder(raw)
-                ])))
-                if ff_pair:
-                    exempt_pair_placeholder = True
+                exempt_pair_placeholder = True
                 if len(targeted_debug["composite_checks"]) < 10:
                     targeted_debug["composite_checks"].append({
                         "game_key": row.get("game_key", ""),
                         "slot_norm": slot_norm,
                         "raw_values": composite_raws,
-                        "expected_pair": ff_pair,
-                        "composite_parts": composite_parts,
                         "slot_is_feeder": slot_norm in play_in_slots,
                         "exempted": bool(exempt_pair_placeholder),
                     })
@@ -6475,14 +6494,14 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tup
         if dest_key:
             mask = fr["game_key_norm"] == dest_key
             if mask.any():
-                bad1 = fr.loc[mask, "team1_raw"].astype(str).str.strip().eq("")
-                bad2 = fr.loc[mask, "team2_raw"].astype(str).str.strip().eq("")
-                if bad1.any():
-                    fr.loc[mask & bad1, "team1_raw"] = winner["team_name"]
-                    fr.loc[mask & bad1, "team1_canon"] = canonical_team(winner["team_name"])
-                elif bad2.any():
-                    fr.loc[mask & bad2, "team2_raw"] = winner["team_name"]
-                    fr.loc[mask & bad2, "team2_canon"] = canonical_team(winner["team_name"])
+                replace1 = fr.loc[mask, "team1_raw"].astype(str).str.strip().eq("") | fr.loc[mask, "team1_raw"].astype(str).map(_is_bracket_composite_placeholder)
+                replace2 = fr.loc[mask, "team2_raw"].astype(str).str.strip().eq("") | fr.loc[mask, "team2_raw"].astype(str).map(_is_bracket_composite_placeholder)
+                if replace1.any():
+                    fr.loc[mask & replace1, "team1_raw"] = winner["team_name"]
+                    fr.loc[mask & replace1, "team1_canon"] = canonical_team(winner["team_name"])
+                elif replace2.any():
+                    fr.loc[mask & replace2, "team2_raw"] = winner["team_name"]
+                    fr.loc[mask & replace2, "team2_canon"] = canonical_team(winner["team_name"])
                 else:
                     dest_rows = structure[structure["source_game_norm"] == row.get("game_key_norm", _normalize_bracket_key(row.get("game_key", "")))].copy()
                     for _, edge in dest_rows.iterrows():
@@ -6497,49 +6516,101 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tup
 
 def _initial_bracket_games(bracket_data: dict, team_lookup: dict) -> dict:
     games = {}
+    play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
     for sheet_name in ["First_Round"]:
         df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
         if len(df) == 0:
             continue
         for _, row in df.iterrows():
-            team1 = _resolve_bracket_team_lookup_entry(row.get("team1_raw", ""), team_lookup)
-            team2 = _resolve_bracket_team_lookup_entry(row.get("team2_raw", ""), team_lookup)
-            if team1 is None or team2 is None:
+            round_name = str(row.get("round_name", sheet_name)).strip()
+            round_key = _normalize_bracket_key(round_name)
+            slot_norm = str(row.get("game_key_norm", "")).strip()
+            is_round_of_64 = round_key in {"firstround", "r64", "roundof64"}
+
+            raw1 = str(row.get("team1_raw", "")).strip()
+            raw2 = str(row.get("team2_raw", "")).strip()
+
+            team1_pending = is_round_of_64 and slot_norm in play_in_slots and _is_bracket_composite_placeholder(raw1)
+            team2_pending = is_round_of_64 and slot_norm in play_in_slots and _is_bracket_composite_placeholder(raw2)
+
+            team1 = None if team1_pending else _resolve_bracket_team_lookup_entry(raw1, team_lookup)
+            team2 = None if team2_pending else _resolve_bracket_team_lookup_entry(raw2, team_lookup)
+            if (not team1_pending and team1 is None) or (not team2_pending and team2 is None):
                 raise ValueError(
                     f"Could not resolve bracket teams for {row.get('game_key', '')}: "
                     f"{row.get('team1_raw', '')} vs {row.get('team2_raw', '')}"
                 )
-            games[row["game_key_norm"]] = {
+            game_key_norm = str(row.get("game_key_norm", "")).strip()
+            games[game_key_norm] = {
                 "game_key": row["game_key"],
+                "game_key_norm": game_key_norm,
                 "round_name": row.get("round_name", sheet_name),
                 "region": str(row.get("region", "") or ""),
-                "team1": dict(team1),
-                "team2": dict(team2),
+                "team1": dict(team1) if team1 is not None else None,
+                "team2": dict(team2) if team2 is not None else None,
             }
-            if "seed1" in row and pd.notna(row.get("seed1")):
-                games[row["game_key_norm"]]["team1"]["seed"] = str(row.get("seed1")).strip()
-            if "seed2" in row and pd.notna(row.get("seed2")):
-                games[row["game_key_norm"]]["team2"]["seed"] = str(row.get("seed2")).strip()
-            games[row["game_key_norm"]]["team1"]["region"] = games[row["game_key_norm"]]["region"]
-            games[row["game_key_norm"]]["team2"]["region"] = games[row["game_key_norm"]]["region"]
+            if team1 is not None and "seed1" in row and pd.notna(row.get("seed1")):
+                games[game_key_norm]["team1"]["seed"] = str(row.get("seed1")).strip()
+            if team2 is not None and "seed2" in row and pd.notna(row.get("seed2")):
+                games[game_key_norm]["team2"]["seed"] = str(row.get("seed2")).strip()
+            if team1 is not None:
+                games[game_key_norm]["team1"]["region"] = games[game_key_norm]["region"]
+            if team2 is not None:
+                games[game_key_norm]["team2"]["region"] = games[game_key_norm]["region"]
     return games
 
 
 def _structure_destinations(structure_df: pd.DataFrame) -> tuple:
     edges = {}
-    all_games = set()
+    node_meta = {}
     for _, row in structure_df.iterrows():
-        src = row["source_game_norm"]
-        dst = row["dest_game_norm"]
+        src = str(row.get("source_game_norm", "")).strip()
+        dst = str(row.get("dest_game_norm", "")).strip()
+        if not src or not dst:
+            continue
         carry = str(row.get("carry_norm", row.get("carry", ""))).strip().lower()
         edges.setdefault(src, []).append({"dest_game": dst, "carry": carry})
-        all_games.add(src)
-        all_games.add(dst)
-    return edges, all_games
+        node_meta.setdefault(src, {
+            "game_key": row.get("source_game", src),
+            "game_key_norm": src,
+            "round_name": str(row.get("from_round", "") or ""),
+            "region": str(row.get("region", "") or ""),
+        })
+        dst_meta = node_meta.setdefault(dst, {
+            "game_key": row.get("dest_game", dst),
+            "game_key_norm": dst,
+            "round_name": str(row.get("dest_round", "") or ""),
+            "region": str(row.get("region", "") or ""),
+        })
+        if not dst_meta.get("round_name") and str(row.get("dest_round", "") or "").strip():
+            dst_meta["round_name"] = str(row.get("dest_round", "") or "")
+        if not dst_meta.get("game_key") and str(row.get("dest_game", "") or "").strip():
+            dst_meta["game_key"] = str(row.get("dest_game", "") or "")
+    return edges, node_meta
 
 
-def _single_bracket_advancement_template(team_lookup: dict) -> dict:
-    return {}
+def _single_bracket_advancement_template(bracket_data: dict, team_lookup: dict) -> dict:
+    store = {}
+    for sheet_name in ["First_Four", "First_Round"]:
+        df = bracket_data.get(sheet_name, pd.DataFrame())
+        if df is None or len(df) == 0:
+            continue
+        round_bucket = "First_Four" if sheet_name == "First_Four" else "First_Round"
+        for _, row in df.iterrows():
+            for team_col, seed_col in [("team1_raw", "seed1"), ("team2_raw", "seed2")]:
+                raw = str(row.get(team_col, "") or "").strip()
+                if not raw or _is_bracket_composite_placeholder(raw):
+                    continue
+                team = _resolve_bracket_team_lookup_entry(raw, team_lookup)
+                if team is None:
+                    continue
+                team = dict(team)
+                if seed_col in row and pd.notna(row.get(seed_col)):
+                    team["seed"] = str(row.get(seed_col)).strip()
+                if pd.notna(row.get("region")):
+                    team["region"] = str(row.get("region") or "").strip()
+                _record_advancement_slot(store, team, round_bucket)
+    return store
 
 
 def _record_advancement_slot(store: dict, team: dict, round_name: str) -> None:
@@ -6550,6 +6621,7 @@ def _record_advancement_slot(store: dict, team: dict, round_name: str) -> None:
             "team": team["team_name"],
             "seed": str(team.get("seed", "") or ""),
             "region": str(team.get("region", "") or ""),
+            "First_Four": 0,
             "First_Round": 0,
             "Second_Round": 0,
             "Sweet_16": 0,
@@ -6558,6 +6630,13 @@ def _record_advancement_slot(store: dict, team: dict, round_name: str) -> None:
             "Championship": 0,
             "Champion": 0,
         }
+    else:
+        if (not str(store[tid].get("team", "") or "").strip()) and str(team.get("team_name", "") or "").strip():
+            store[tid]["team"] = team["team_name"]
+        if (not str(store[tid].get("seed", "") or "").strip()) and str(team.get("seed", "") or "").strip():
+            store[tid]["seed"] = str(team.get("seed", "") or "")
+        if (not str(store[tid].get("region", "") or "").strip()) and str(team.get("region", "") or "").strip():
+            store[tid]["region"] = str(team.get("region", "") or "")
     if round_name in store[tid]:
         store[tid][round_name] += 1
 
@@ -6566,27 +6645,36 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> 
     bracket_ff, first_four_df = _resolve_first_four(bracket_data, team_lookup, asof_date)
     structure_df = bracket_ff["Structure"].copy()
     games = _initial_bracket_games(bracket_ff, team_lookup)
-    edges, all_game_keys = _structure_destinations(structure_df)
+    edges, node_meta = _structure_destinations(structure_df)
 
-    for gk in all_game_keys:
-        games.setdefault(gk, {"game_key": gk, "round_name": "", "region": "", "team1": None, "team2": None})
+    for gk, meta in node_meta.items():
+        games.setdefault(gk, {
+            "game_key": meta.get("game_key", gk),
+            "game_key_norm": gk,
+            "round_name": meta.get("round_name", ""),
+            "region": meta.get("region", ""),
+            "team1": None,
+            "team2": None,
+        })
 
     incoming_counts = structure_df.groupby("dest_game_norm").size().to_dict()
     for gk, game in games.items():
         if not game.get("round_name"):
-            preds = structure_df.loc[structure_df["dest_game_norm"] == gk, "source_game_norm"].tolist()
-            src_rounds = [games.get(src, {}).get("round_name", "") for src in preds if src in games]
-            src_rounds = [r for r in src_rounds if r]
-            if src_rounds:
-                game["round_name"] = _next_bracket_round(src_rounds[0])
+            meta_round = str(node_meta.get(gk, {}).get("round_name", "") or "").strip()
+            if meta_round:
+                game["round_name"] = meta_round
+            else:
+                preds = structure_df.loc[structure_df["dest_game_norm"] == gk, "source_game_norm"].tolist()
+                src_rounds = [games.get(src, {}).get("round_name", "") for src in preds if src in games]
+                src_rounds = [r for r in src_rounds if r]
+                if src_rounds:
+                    game["round_name"] = _next_advancement_bucket(src_rounds[0])
+        if not game.get("game_key"):
+            game["game_key"] = node_meta.get(gk, {}).get("game_key", gk)
+        if not game.get("game_key_norm"):
+            game["game_key_norm"] = gk
 
-    advancement = _single_bracket_advancement_template(team_lookup)
-    for game in games.values():
-        if game.get("round_name") == "First_Round":
-            if game.get("team1") is not None:
-                _record_advancement_slot(advancement, game["team1"], "First_Round")
-            if game.get("team2") is not None:
-                _record_advancement_slot(advancement, game["team2"], "First_Round")
+    advancement = _single_bracket_advancement_template(bracket_ff, team_lookup)
 
     pending = set(games.keys())
     game_rows = []
@@ -6599,16 +6687,28 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> 
             pred = _predict_neutral_matchup(game["team1"], game["team2"], asof_date)
             winner = game["team1"] if np.random.random() < pred["p_team_a_win"] else game["team2"]
             loser = game["team2"] if winner["team_id"] == game["team1"]["team_id"] else game["team1"]
-            next_round = _next_bracket_round(game.get("round_name", ""))
+            next_round = _next_advancement_bucket(game.get("round_name", ""))
             if next_round:
                 _record_advancement_slot(advancement, winner, next_round)
             game_rows.append({
                 "game_key": game.get("game_key", key),
+                "game_key_norm": key,
                 "round_name": game.get("round_name", ""),
+                "region": str(game.get("region", "") or ""),
                 "team1": game["team1"]["team_name"],
                 "team2": game["team2"]["team_name"],
+                "team1_seed": str(game["team1"].get("seed", "") or ""),
+                "team2_seed": str(game["team2"].get("seed", "") or ""),
                 "winner": winner["team_name"],
+                "winner_team": winner["team_name"],
+                "winner_id": int(winner["team_id"]),
+                "winner_seed": str(winner.get("seed", "") or ""),
+                "winner_region": str(winner.get("region", "") or ""),
                 "loser": loser["team_name"],
+                "loser_team": loser["team_name"],
+                "loser_id": int(loser["team_id"]),
+                "loser_seed": str(loser.get("seed", "") or ""),
+                "loser_region": str(loser.get("region", "") or ""),
                 "win_prob": pred["p_team_a_win"] if winner["team_id"] == game["team1"]["team_id"] else pred["p_team_b_win"],
                 "proj_margin": pred["pred_margin_team_a"] if winner["team_id"] == game["team1"]["team_id"] else -pred["pred_margin_team_a"],
             })
@@ -6623,7 +6723,11 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> 
             pending.remove(key)
             progressed = True
         if not progressed:
-            unresolved = [games[k]["game_key"] for k in pending]
+            unresolved = [
+                games[k].get("game_key", k) if games[k].get("game_key", k) == k
+                else f"{games[k].get('game_key', k)} [{k}]"
+                for k in pending
+            ]
             raise ValueError(f"Bracket structure could not resolve all games. Pending: {', '.join(map(str, unresolved[:10]))}")
 
     latest_run = pd.concat([first_four_df.assign(round_name="First_Four")] if len(first_four_df) else [], ignore_index=True) if len(first_four_df) else pd.DataFrame()
@@ -6649,12 +6753,16 @@ def _simulate_bracket_many(bracket_data: dict, team_lookup: dict, asof_date, sim
 def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int) -> pd.DataFrame:
     if adv_df is None or len(adv_df) == 0:
         return pd.DataFrame()
-    value_cols = ["First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
-    summary = adv_df.groupby(["team_id", "team", "seed", "region"], as_index=False)[value_cols].sum()
+    value_cols = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
+    work = adv_df.copy()
+    for col in ["team", "seed", "region"]:
+        if col not in work.columns:
+            work[col] = ""
+        work[col] = work[col].fillna("").astype(str)
+    summary = work.groupby(["team_id", "team", "seed", "region"], as_index=False, dropna=False)[value_cols].sum()
     for col in value_cols:
         summary[f"{col}_Pct"] = (100.0 * summary[col] / float(sim_n)).round(1)
     summary["Finalist_Pct"] = summary["Championship_Pct"]
-    summary["Champion_Pct"] = summary["Champion_Pct"] if "Champion_Pct" in summary.columns else (100.0 * summary["Champion"] / float(sim_n)).round(1)
     return summary.sort_values(
         ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct", "Elite_8_Pct"],
         ascending=False,
