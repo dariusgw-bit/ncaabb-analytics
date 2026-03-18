@@ -6110,6 +6110,9 @@ run_bracket_btn = widgets.Button(description="Run Simulation", button_style="pri
 bracket_status_html = widgets.HTML()
 bracket_summary_html = widgets.HTML()
 bracket_out = widgets.Output()
+refresh_bracket_acc_btn = widgets.Button(description="Refresh Accuracy")
+bracket_acc_status_html = widgets.HTML()
+bracket_acc_out = widgets.Output()
 
 
 def render_matchup(_=None):
@@ -6861,33 +6864,67 @@ def _build_hypothetical_neutral_game(team_a: dict, team_b: dict, asof_date) -> p
 
 
 def _predict_neutral_matchup(team_a: dict, team_b: dict, asof_date) -> dict:
+    def _orient_neutral_matchup_result(cached: dict, req_a: dict, req_b: dict) -> dict:
+        req_a_id = int(req_a["team_id"])
+        req_b_id = int(req_b["team_id"])
+        low_id = int(cached["team_low_id"])
+        high_id = int(cached["team_high_id"])
+
+        if req_a_id == low_id and req_b_id == high_id:
+            p_a = float(cached["p_team_low_win"])
+            margin_a = float(cached["pred_margin_team_low"])
+            winner_pick = str(cached["winner_pick"])
+        elif req_a_id == high_id and req_b_id == low_id:
+            p_a = float(1.0 - cached["p_team_low_win"])
+            margin_a = float(-cached["pred_margin_team_low"])
+            winner_pick = str(req_a["team_name"]) if p_a >= 0.5 else str(req_b["team_name"])
+        else:
+            raise ValueError("Cached neutral-matchup orientation does not match requested team IDs.")
+
+        return {
+            "team_a_id": req_a_id,
+            "team_b_id": req_b_id,
+            "team_a_name": str(req_a["team_name"]),
+            "team_b_name": str(req_b["team_name"]),
+            "p_team_a_win": float(p_a),
+            "p_team_b_win": float(1.0 - p_a),
+            "pred_margin_team_a": float(margin_a),
+            "winner_pick": winner_pick,
+        }
+
+    team_a_id = int(team_a["team_id"])
+    team_b_id = int(team_b["team_id"])
     key = (
-        min(int(team_a["team_id"]), int(team_b["team_id"])),
-        max(int(team_a["team_id"]), int(team_b["team_id"])),
+        min(team_a_id, team_b_id),
+        max(team_a_id, team_b_id),
         str(pd.Timestamp(asof_date).date()),
     )
-    if key in _BRACKET_MATCHUP_CACHE:
-        return dict(_BRACKET_MATCHUP_CACHE[key])
 
-    pregame = _build_hypothetical_neutral_game(team_a, team_b, asof_date)
-    scored = predict_slate(
-        pregame,
-        spread_booster, winner_booster, lgb_spread,
-        iso, imp, feature_cols,
-    )
-    row = scored.iloc[0]
-    result = {
-        "team_a_id": int(team_a["team_id"]),
-        "team_b_id": int(team_b["team_id"]),
-        "team_a_name": team_a["team_name"],
-        "team_b_name": team_b["team_name"],
-        "p_team_a_win": float(row["p_home_win"]),
-        "p_team_b_win": float(1.0 - row["p_home_win"]),
-        "pred_margin_team_a": float(row["pred_margin_home"]),
-        "winner_pick": str(row["winner_pick"]),
-    }
-    _BRACKET_MATCHUP_CACHE[key] = dict(result)
-    return result
+    if key not in _BRACKET_MATCHUP_CACHE:
+        low_team, high_team = (
+            (team_a, team_b) if team_a_id <= team_b_id else (team_b, team_a)
+        )
+        pregame = _build_hypothetical_neutral_game(low_team, high_team, asof_date)
+        scored = predict_slate(
+            pregame,
+            spread_booster, winner_booster, lgb_spread,
+            iso, imp, feature_cols,
+        )
+        row = scored.iloc[0]
+        p_low = float(row["p_home_win"])
+        margin_low = float(row["pred_margin_home"])
+        _BRACKET_MATCHUP_CACHE[key] = {
+            "team_low_id": int(low_team["team_id"]),
+            "team_high_id": int(high_team["team_id"]),
+            "team_low_name": str(low_team["team_name"]),
+            "team_high_name": str(high_team["team_name"]),
+            "p_team_low_win": p_low,
+            "p_team_high_win": float(1.0 - p_low),
+            "pred_margin_team_low": margin_low,
+            "winner_pick": str(low_team["team_name"]) if p_low >= 0.5 else str(high_team["team_name"]),
+        }
+
+    return _orient_neutral_matchup_result(_BRACKET_MATCHUP_CACHE[key], team_a, team_b)
 
 
 def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tuple:
@@ -7343,6 +7380,340 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
             display(HTML(df_to_html_table(run_view, max_rows=len(run_view))))
 
 
+BRACKET_BUCKETS = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
+
+
+def _completed_tournament_games_for_accuracy() -> pd.DataFrame:
+    if "schedule_cur" not in globals() or schedule_cur is None or len(schedule_cur) == 0:
+        return pd.DataFrame()
+
+    s = normalize_board_for_downstream(schedule_cur.copy())
+    s = _coerce_schedule_tournament_flags(s, debug_key="bracket_accuracy_schedule")
+    if "season" in s.columns:
+        s["season"] = pd.to_numeric(s["season"], errors="coerce")
+        s = s[s["season"].fillna(CURRENT_SEASON).eq(CURRENT_SEASON)].copy()
+
+    completed = pd.Series(False, index=s.index)
+    completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+    completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
+    completed |= (
+        pd.to_numeric(s.get("home_score"), errors="coerce").notna() &
+        pd.to_numeric(s.get("away_score"), errors="coerce").notna()
+    )
+
+    text_blob = (
+        s.get("status_type_short_detail", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("status_type_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("notes", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("game_note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("game_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+        s.get("event_name", pd.Series("", index=s.index)).astype(str).fillna("")
+    )
+    s["round_bucket"] = text_blob.map(_normalize_round_name)
+
+    tourney = s.get("is_ncaa_tourney", pd.Series(0, index=s.index))
+    tourney = pd.to_numeric(tourney, errors="coerce").fillna(0).astype(int).eq(1)
+    s = s[tourney & completed].copy()
+    if len(s) == 0:
+        return pd.DataFrame()
+
+    s["home_id"] = pd.to_numeric(s.get("home_id"), errors="coerce")
+    s["away_id"] = pd.to_numeric(s.get("away_id"), errors="coerce")
+    s["home_score"] = pd.to_numeric(s.get("home_score"), errors="coerce")
+    s["away_score"] = pd.to_numeric(s.get("away_score"), errors="coerce")
+    s = s.dropna(subset=["home_id", "away_id", "home_score", "away_score"]).copy()
+    s["home_id"] = s["home_id"].astype(int)
+    s["away_id"] = s["away_id"].astype(int)
+    s["winner_id"] = np.where(s["home_score"] >= s["away_score"], s["home_id"], s["away_id"]).astype(int)
+    s["loser_id"] = np.where(s["home_score"] >= s["away_score"], s["away_id"], s["home_id"]).astype(int)
+    s["winner_team"] = np.where(s["home_score"] >= s["away_score"], s["home_team"], s["away_team"])
+    s["loser_team"] = np.where(s["home_score"] >= s["away_score"], s["away_team"], s["home_team"])
+    s["game_dt_et"] = pd.to_datetime(s.get("game_dt_et"), errors="coerce")
+    s = s.sort_values(["game_dt_et", "winner_team", "loser_team"]).drop_duplicates(
+        subset=["winner_id", "loser_id", "round_bucket"], keep="last"
+    )
+    return s.reset_index(drop=True)
+
+
+def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame) -> dict:
+    completed_games = _completed_tournament_games_for_accuracy()
+    report = {
+        "completed_games": int(len(completed_games)),
+        "locked_winners": 0,
+        "integrity_counts": {},
+        "integrity_tables": {},
+        "calibration": {},
+        "status_note": "",
+    }
+
+    try:
+        bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
+        if not errors and "First_Four" in bracket_data and "winner_raw" in bracket_data["First_Four"].columns:
+            report["locked_winners"] = int(
+                bracket_data["First_Four"]["winner_raw"].astype(str).str.strip().ne("").sum()
+            )
+    except Exception:
+        pass
+
+    if completed_games is None or len(completed_games) == 0:
+        report["status_note"] = "No completed NCAA tournament games detected yet."
+        return report
+
+    # -----------------------
+    # Calibration section
+    # -----------------------
+    calib_rows = []
+    for _, row in completed_games.iterrows():
+        try:
+            pred = _predict_neutral_matchup(
+                {"team_id": int(row["home_id"]), "team_name": str(row["home_team"])},
+                {"team_id": int(row["away_id"]), "team_name": str(row["away_team"])},
+                row["game_dt_et"].date() if pd.notna(row["game_dt_et"]) else date_picker.value,
+            )
+        except Exception:
+            continue
+
+        p_home = float(pred.get("p_team_a_win", np.nan))
+        if pd.isna(p_home):
+            continue
+        actual_home = 1.0 if int(row["winner_id"]) == int(row["home_id"]) else 0.0
+        p_actual = p_home if actual_home == 1.0 else (1.0 - p_home)
+        favorite_team = str(row["home_team"]) if p_home >= 0.5 else str(row["away_team"])
+        favorite_won = 1.0 if str(row["winner_team"]) == favorite_team else 0.0
+        calib_rows.append({
+            "round_bucket": str(row.get("round_bucket", "") or ""),
+            "away_team": str(row["away_team"]),
+            "home_team": str(row["home_team"]),
+            "winner_team": str(row["winner_team"]),
+            "winner_id": int(row["winner_id"]),
+            "p_home_win": p_home,
+            "p_actual_winner": p_actual,
+            "predicted_win_prob": max(p_home, 1.0 - p_home),
+            "predicted_team": favorite_team,
+            "predicted_team_won": favorite_won,
+            "actual_home_win": actual_home,
+            "brier": (p_home - actual_home) ** 2,
+            "log_loss": -(actual_home * np.log(np.clip(p_home, 1e-6, 1 - 1e-6)) + (1 - actual_home) * np.log(np.clip(1 - p_home, 1e-6, 1 - 1e-6))),
+        })
+
+    calib_df = pd.DataFrame(calib_rows)
+    if len(calib_df):
+        report["calibration"]["brier"] = float(calib_df["brier"].mean())
+        report["calibration"]["log_loss"] = float(calib_df["log_loss"].mean())
+
+        bucket_edges = np.linspace(0.0, 1.0, 6)
+        calib_df["bucket"] = pd.cut(calib_df["predicted_win_prob"], bins=bucket_edges, include_lowest=True)
+        bucket_table = (
+            calib_df.groupby("bucket", dropna=False)
+            .agg(
+                Games=("predicted_win_prob", "size"),
+                AvgPred=("predicted_win_prob", "mean"),
+                WinRate=("predicted_team_won", "mean"),
+            )
+            .reset_index()
+        )
+        bucket_table["AvgPred"] = (100.0 * bucket_table["AvgPred"]).round(1)
+        bucket_table["WinRate"] = (100.0 * bucket_table["WinRate"]).round(1)
+        report["calibration"]["buckets"] = bucket_table
+
+        misses = calib_df.sort_values("p_actual_winner", ascending=True).head(12).copy()
+        misses["Pred Win%"] = (100.0 * misses["p_actual_winner"]).round(1)
+        report["calibration"]["biggest_misses"] = misses[[
+            "round_bucket", "away_team", "home_team", "winner_team", "Pred Win%"
+        ]].rename(columns={"round_bucket": "Round"})
+        actual_vs_sim = calib_df.copy()
+        actual_vs_sim["Pred Home Win%"] = (100.0 * actual_vs_sim["p_home_win"]).round(1)
+        actual_vs_sim["Pred Winner Win%"] = (100.0 * actual_vs_sim["p_actual_winner"]).round(1)
+        actual_vs_sim["Upset"] = np.where(actual_vs_sim["p_actual_winner"] < 0.5, "Yes", "")
+        report["calibration"]["actual_vs_sim"] = actual_vs_sim[[
+            "round_bucket", "away_team", "home_team", "winner_team", "Pred Home Win%", "Pred Winner Win%", "Upset"
+        ]].rename(columns={"round_bucket": "Round"})
+
+    # -----------------------
+    # Integrity section
+    # -----------------------
+    if summary_df is None or len(summary_df) == 0:
+        report["status_note"] = (report["status_note"] + " " if report["status_note"] else "") + "Run the bracket sim to populate integrity checks."
+        return report
+
+    s = summary_df.copy()
+    pct_cols = [c for c in s.columns if c.endswith("_Pct")]
+    for c in pct_cols:
+        s[c] = pd.to_numeric(s[c], errors="coerce").fillna(0.0)
+    s["team_id"] = pd.to_numeric(s["team_id"], errors="coerce")
+    s = s.dropna(subset=["team_id"]).copy()
+    s["team_id"] = s["team_id"].astype(int)
+
+    actual = {}
+    for _, row in completed_games.iterrows():
+        cur_round = str(row.get("round_bucket", "") or "")
+        nxt_round = _next_advancement_bucket(cur_round)
+        for tid in [int(row["home_id"]), int(row["away_id"])]:
+            actual.setdefault(tid, {"reached": set(), "lost": False, "team": "", "winner_team": ""})
+            actual[tid]["reached"].add(cur_round)
+        actual[int(row["winner_id"])]["reached"].add(nxt_round)
+        actual[int(row["winner_id"])]["team"] = str(row["winner_team"])
+        actual[int(row["loser_id"])]["team"] = str(row["loser_team"])
+        actual[int(row["loser_id"])]["lost"] = True
+
+    future_cols = {
+        "First_Four": ["First_Round_Pct", "Second_Round_Pct", "Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
+        "First_Round": ["Second_Round_Pct", "Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
+        "Second_Round": ["Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
+        "Sweet_16": ["Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
+        "Elite_8": ["Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
+        "Final_Four": ["Finalist_Pct", "Champion_Pct"],
+        "Championship": ["Champion_Pct"],
+        "Champion": [],
+    }
+
+    eliminated_rows = []
+    alive_zero_rows = []
+    for _, row in s.iterrows():
+        tid = int(row["team_id"])
+        if tid not in actual:
+            continue
+        reached = [r for r in BRACKET_BUCKETS if r in actual[tid]["reached"]]
+        last_reached = reached[-1] if reached else ""
+
+        if actual[tid]["lost"] and last_reached:
+            future_prob = float(sum(pd.to_numeric(row.get(c, 0.0), errors="coerce") for c in future_cols.get(last_reached, [])))
+            if future_prob > 0.01:
+                eliminated_rows.append({
+                    "team": row.get("team", actual[tid].get("team", "")),
+                    "seed": row.get("seed", ""),
+                    "region": row.get("region", ""),
+                    "Last Reached": last_reached,
+                    "Future Prob Sum": round(future_prob, 2),
+                })
+
+        if not actual[tid]["lost"]:
+            for bucket in reached:
+                col = f"{bucket}_Pct"
+                if col in row and float(pd.to_numeric(row.get(col), errors="coerce")) <= 0.0:
+                    alive_zero_rows.append({
+                        "team": row.get("team", actual[tid].get("team", "")),
+                        "seed": row.get("seed", ""),
+                        "region": row.get("region", ""),
+                        "Reached": bucket,
+                        "Prob": float(pd.to_numeric(row.get(col), errors="coerce")),
+                    })
+                    break
+
+    monotonic_violations = []
+    monotonic_cols = ["First_Round_Pct", "Second_Round_Pct", "Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"]
+    for _, row in s.iterrows():
+        vals = [float(pd.to_numeric(row.get(c), errors="coerce")) for c in monotonic_cols if c in s.columns]
+        if any(vals[i] < vals[i + 1] - 1e-9 for i in range(len(vals) - 1)):
+            monotonic_violations.append({
+                "team": row.get("team", ""),
+                "seed": row.get("seed", ""),
+                "region": row.get("region", ""),
+            })
+
+    report["integrity_counts"] = {
+        "completed_games": int(len(completed_games)),
+        "locked_winners": int(report["locked_winners"]),
+        "eliminated_with_future_prob": int(len(eliminated_rows)),
+        "alive_with_zero_reached_prob": int(len(alive_zero_rows)),
+        "round_probability_violations": int(len(monotonic_violations)),
+    }
+    report["integrity_tables"] = {
+        "eliminated": pd.DataFrame(eliminated_rows).head(20),
+        "alive_zero": pd.DataFrame(alive_zero_rows).head(20),
+        "monotonic": pd.DataFrame(monotonic_violations).head(20),
+    }
+    return report
+
+
+def _render_bracket_accuracy():
+    bracket_acc_status_html.value = ""
+    with bracket_acc_out:
+        clear_output(wait=True)
+        display(HTML("<div style='color:#AAA; padding:8px;'>Loading bracket accuracy...</div>"))
+
+    sim_n = int(bracket_sim_n.value)
+    asof_date = bracket_asof_date.value or date_picker.value
+    signature = _bracket_cache_signature(sim_n, asof_date)
+
+    payload = None
+    try:
+        payload = _load_cached_bracket_sim(signature)
+    except Exception as e:
+        bracket_acc_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Could not load bracket sim cache: {e}</div>"
+
+    summary_df = payload.get("summary_df") if isinstance(payload, dict) else pd.DataFrame()
+    latest_run_df = payload.get("latest_run_df") if isinstance(payload, dict) else pd.DataFrame()
+    report = _build_bracket_accuracy_report(summary_df, latest_run_df)
+    if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
+        base_note = report.get("status_note", "")
+        extra_note = "Run the Bracket Sim tab for this as-of date and sim count to populate accuracy checks."
+        report["status_note"] = f"{base_note} {extra_note}".strip()
+
+    note = report.get("status_note", "")
+    if note:
+        bracket_acc_status_html.value = f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#CCC;'>{note}</div>"
+    else:
+        bracket_acc_status_html.value = ""
+
+    integrity = report.get("integrity_counts", {})
+    calib = report.get("calibration", {})
+    brier_txt = ""
+    log_loss_txt = ""
+    if "brier" in calib and pd.notna(calib.get("brier")):
+        brier_txt = f"{float(calib['brier']):.4f}"
+    if "log_loss" in calib and pd.notna(calib.get("log_loss")):
+        log_loss_txt = f"{float(calib['log_loss']):.4f}"
+    with bracket_acc_out:
+        clear_output(wait=True)
+
+        display(HTML(
+            "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Simulation Integrity</div>"
+            f"<div style='color:#CFCFCF; margin-bottom:10px;'>"
+            f"Completed tournament games detected: <b>{integrity.get('completed_games', report.get('completed_games', 0))}</b>"
+            f" &nbsp;|&nbsp; Locked winners applied: <b>{integrity.get('locked_winners', report.get('locked_winners', 0))}</b>"
+            f" &nbsp;|&nbsp; Eliminated teams with future probability: <b>{integrity.get('eliminated_with_future_prob', 0)}</b>"
+            f" &nbsp;|&nbsp; Alive teams with impossible zero reached-round probability: <b>{integrity.get('alive_with_zero_reached_prob', 0)}</b>"
+            f" &nbsp;|&nbsp; Round probability consistency violations: <b>{integrity.get('round_probability_violations', 0)}</b>"
+            f"</div>"
+        ))
+
+        for title, key in [
+            ("Eliminated But Still Showing Future Advancement", "eliminated"),
+            ("Alive But Zero In Already-Reached Rounds", "alive_zero"),
+            ("Round Probability Consistency Checks", "monotonic"),
+        ]:
+            df = report.get("integrity_tables", {}).get(key, pd.DataFrame())
+            if df is not None and len(df) > 0:
+                display(HTML(f"<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>{title}</div>"))
+                display(HTML(df_to_html_table(df, max_rows=min(len(df), 20))))
+
+        display(HTML("<div style='color:#EEE; font-weight:700; margin:16px 0 8px 0;'>Simulation Accuracy / Calibration</div>"))
+        display(HTML(
+            f"<div style='color:#CFCFCF; margin-bottom:10px;'>"
+            f"Brier score: <b>{brier_txt}</b>"
+            f" &nbsp;|&nbsp; Log loss: <b>{log_loss_txt}</b>"
+            f"</div>"
+        ))
+
+        buckets = calib.get("buckets", pd.DataFrame())
+        if buckets is not None and len(buckets) > 0:
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Calibration Buckets</div>"))
+            display(HTML(df_to_html_table(buckets, max_rows=len(buckets))))
+
+        misses = calib.get("biggest_misses", pd.DataFrame())
+        if misses is not None and len(misses) > 0:
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Biggest Misses / Upsets</div>"))
+            display(HTML(df_to_html_table(misses, max_rows=min(len(misses), 20))))
+
+        actual_vs_sim = calib.get("actual_vs_sim", pd.DataFrame())
+        if actual_vs_sim is not None and len(actual_vs_sim) > 0:
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Actual Winners vs Simulated Win Probabilities</div>"))
+            display(HTML(df_to_html_table(actual_vs_sim, max_rows=min(len(actual_vs_sim), 30))))
+
+
 def run_bracket_simulation(_=None, force_run: bool = True):
     bracket_status_html.value = ""
     bracket_summary_html.value = ""
@@ -7419,6 +7790,8 @@ def run_bracket_simulation(_=None, force_run: bool = True):
         f"Saved to: {BRACKET_OUTPUT_DIR}{extra}</div>"
     )
     _render_bracket_results(summary_df, latest_run_df)
+    if "dashboard_tabs" in globals() and getattr(dashboard_tabs, "selected_index", None) == 3:
+        _render_bracket_accuracy()
 
 
 def force_retrain_clicked(_=None):
@@ -7435,6 +7808,7 @@ open_dashboard_btn.on_click(open_dashboard_clicked)
 date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
 compare_btn.on_click(render_matchup)
 run_bracket_btn.on_click(lambda _: run_bracket_simulation(force_run=True))
+refresh_bracket_acc_btn.on_click(_render_bracket_accuracy)
 
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
@@ -7448,17 +7822,22 @@ matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_pi
 bracket_controls = widgets.HBox([bracket_sim_n, bracket_asof_date, run_bracket_btn])
 matchup_tab = widgets.VBox([matchup_controls, matchup_out])
 bracket_tab = widgets.VBox([bracket_controls, bracket_status_html, bracket_summary_html, bracket_out])
+bracket_acc_tab = widgets.VBox([refresh_bracket_acc_btn, bracket_acc_status_html, bracket_acc_out])
 predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, tournament_banner_html, out])
-dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab, bracket_tab])
+dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab, bracket_tab, bracket_acc_tab])
 dashboard_tabs.set_title(0, "Predictions")
 dashboard_tabs.set_title(1, "Matchup")
 dashboard_tabs.set_title(2, "Bracket Sim")
+dashboard_tabs.set_title(3, "Bracket Accuracy")
 
 
 def _maybe_load_bracket_cache(change):
-    if change.get("name") != "selected_index" or change.get("new") != 2:
+    if change.get("name") != "selected_index":
         return
-    run_bracket_simulation(force_run=False)
+    if change.get("new") == 2:
+        run_bracket_simulation(force_run=False)
+    elif change.get("new") == 3:
+        _render_bracket_accuracy()
 
 
 dashboard_tabs.observe(_maybe_load_bracket_cache, names="selected_index")
