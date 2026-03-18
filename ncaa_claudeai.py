@@ -7383,58 +7383,145 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
 BRACKET_BUCKETS = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
 
 
+def _completed_first_four_from_workbook() -> pd.DataFrame:
+    try:
+        bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
+    except Exception:
+        return pd.DataFrame()
+
+    if errors or "First_Four" not in bracket_data:
+        return pd.DataFrame()
+
+    ff = bracket_data["First_Four"].copy()
+    if ff is None or len(ff) == 0 or "winner_raw" not in ff.columns:
+        return pd.DataFrame()
+
+    ff["winner_raw"] = ff["winner_raw"].map(_clean_bracket_text)
+    ff = ff[ff["winner_raw"].astype(str).str.strip().ne("")].copy()
+    if len(ff) == 0:
+        return pd.DataFrame()
+
+    team_lookup = _build_bracket_team_lookup(
+        schedule_cur if "schedule_cur" in globals() else pd.DataFrame(),
+        team_snaps if "team_snaps" in globals() else pd.DataFrame(),
+    )
+
+    rows = []
+    for _, row in ff.iterrows():
+        team1_raw = str(row.get("team1_raw", "")).strip()
+        team2_raw = str(row.get("team2_raw", "")).strip()
+        winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
+        team1_key = _bracket_team_canon(team1_raw)
+        team2_key = _bracket_team_canon(team2_raw)
+        winner_key = _bracket_team_canon(winner_raw)
+        if not winner_key or winner_key not in {team1_key, team2_key}:
+            continue
+
+        team1 = _resolve_bracket_team_lookup_entry(team1_raw, team_lookup)
+        team2 = _resolve_bracket_team_lookup_entry(team2_raw, team_lookup)
+        winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
+
+        if winner_key == team1_key:
+            winner_team_name = str(winner["team_name"]) if winner is not None else team1_raw
+            loser_team_name = str(team2["team_name"]) if team2 is not None else team2_raw
+            winner_id = int(winner["team_id"]) if winner is not None else (int(team1["team_id"]) if team1 is not None else np.nan)
+            loser_id = int(team2["team_id"]) if team2 is not None else np.nan
+        else:
+            winner_team_name = str(winner["team_name"]) if winner is not None else team2_raw
+            loser_team_name = str(team1["team_name"]) if team1 is not None else team1_raw
+            winner_id = int(winner["team_id"]) if winner is not None else (int(team2["team_id"]) if team2 is not None else np.nan)
+            loser_id = int(team1["team_id"]) if team1 is not None else np.nan
+
+        rows.append({
+            "game_id": str(row.get("game_key", "")),
+            "home_id": int(team1["team_id"]) if team1 is not None else np.nan,
+            "away_id": int(team2["team_id"]) if team2 is not None else np.nan,
+            "home_team": str(team1["team_name"]) if team1 is not None else team1_raw,
+            "away_team": str(team2["team_name"]) if team2 is not None else team2_raw,
+            "winner_id": winner_id,
+            "loser_id": loser_id,
+            "winner_team": winner_team_name,
+            "loser_team": loser_team_name,
+            "round_bucket": "First_Four",
+            "status_type_completed": True,
+            "status_type_state": "post",
+            "status_type_name": "WORKBOOK_LOCKED_WINNER",
+            "status_type_short_detail": "Workbook Winner",
+            "game_dt_et": pd.NaT,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def _completed_tournament_games_for_accuracy() -> pd.DataFrame:
-    if "schedule_cur" not in globals() or schedule_cur is None or len(schedule_cur) == 0:
+    frames = []
+
+    if "schedule_cur" in globals() and schedule_cur is not None and len(schedule_cur) > 0:
+        s = normalize_board_for_downstream(schedule_cur.copy())
+        s = _coerce_schedule_tournament_flags(s, debug_key="bracket_accuracy_schedule")
+        if "season" in s.columns:
+            s["season"] = pd.to_numeric(s["season"], errors="coerce")
+            s = s[s["season"].fillna(CURRENT_SEASON).eq(CURRENT_SEASON)].copy()
+
+        completed = pd.Series(False, index=s.index)
+        completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+        completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
+        home_score = pd.to_numeric(s.get("home_score"), errors="coerce")
+        away_score = pd.to_numeric(s.get("away_score"), errors="coerce")
+        completed |= home_score.notna() & away_score.notna() & ~(home_score.eq(0) & away_score.eq(0))
+
+        text_blob = (
+            s.get("status_type_short_detail", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("status_type_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("notes", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("game_note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("game_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("event_name", pd.Series("", index=s.index)).astype(str).fillna("")
+        )
+        s["round_bucket"] = text_blob.map(_normalize_round_name)
+
+        tourney = s.get("is_ncaa_tourney", pd.Series(0, index=s.index))
+        tourney = pd.to_numeric(tourney, errors="coerce").fillna(0).astype(int).eq(1)
+        s = s[tourney & completed].copy()
+        if len(s):
+            s["home_id"] = pd.to_numeric(s.get("home_id"), errors="coerce")
+            s["away_id"] = pd.to_numeric(s.get("away_id"), errors="coerce")
+            s["home_score"] = pd.to_numeric(s.get("home_score"), errors="coerce")
+            s["away_score"] = pd.to_numeric(s.get("away_score"), errors="coerce")
+            s = s.dropna(subset=["home_id", "away_id", "home_score", "away_score"]).copy()
+            if len(s):
+                s["home_id"] = s["home_id"].astype(int)
+                s["away_id"] = s["away_id"].astype(int)
+                s["winner_id"] = np.where(s["home_score"] >= s["away_score"], s["home_id"], s["away_id"]).astype(int)
+                s["loser_id"] = np.where(s["home_score"] >= s["away_score"], s["away_id"], s["home_id"]).astype(int)
+                s["winner_team"] = np.where(s["home_score"] >= s["away_score"], s["home_team"], s["away_team"])
+                s["loser_team"] = np.where(s["home_score"] >= s["away_score"], s["away_team"], s["home_team"])
+                s["game_dt_et"] = pd.to_datetime(s.get("game_dt_et"), errors="coerce")
+                frames.append(s[[
+                    "game_id", "home_id", "away_id", "home_team", "away_team",
+                    "winner_id", "loser_id", "winner_team", "loser_team",
+                    "round_bucket", "status_type_completed", "status_type_state",
+                    "status_type_name", "status_type_short_detail", "game_dt_et"
+                ]].copy())
+
+    workbook_ff = _completed_first_four_from_workbook()
+    if workbook_ff is not None and len(workbook_ff) > 0:
+        frames.append(workbook_ff.copy())
+
+    if not frames:
         return pd.DataFrame()
 
-    s = normalize_board_for_downstream(schedule_cur.copy())
-    s = _coerce_schedule_tournament_flags(s, debug_key="bracket_accuracy_schedule")
-    if "season" in s.columns:
-        s["season"] = pd.to_numeric(s["season"], errors="coerce")
-        s = s[s["season"].fillna(CURRENT_SEASON).eq(CURRENT_SEASON)].copy()
-
-    completed = pd.Series(False, index=s.index)
-    completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
-    completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
-    completed |= (
-        pd.to_numeric(s.get("home_score"), errors="coerce").notna() &
-        pd.to_numeric(s.get("away_score"), errors="coerce").notna()
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    out["game_dt_et"] = pd.to_datetime(out.get("game_dt_et"), errors="coerce")
+    out["winner_key"] = out.get("winner_team", pd.Series("", index=out.index)).map(_bracket_team_canon)
+    out["loser_key"] = out.get("loser_team", pd.Series("", index=out.index)).map(_bracket_team_canon)
+    out = out.sort_values(["game_dt_et", "winner_team", "loser_team"], na_position="last").drop_duplicates(
+        subset=["winner_key", "loser_key", "round_bucket"], keep="last"
     )
-
-    text_blob = (
-        s.get("status_type_short_detail", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("status_type_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("notes", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("game_note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("game_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("event_name", pd.Series("", index=s.index)).astype(str).fillna("")
-    )
-    s["round_bucket"] = text_blob.map(_normalize_round_name)
-
-    tourney = s.get("is_ncaa_tourney", pd.Series(0, index=s.index))
-    tourney = pd.to_numeric(tourney, errors="coerce").fillna(0).astype(int).eq(1)
-    s = s[tourney & completed].copy()
-    if len(s) == 0:
-        return pd.DataFrame()
-
-    s["home_id"] = pd.to_numeric(s.get("home_id"), errors="coerce")
-    s["away_id"] = pd.to_numeric(s.get("away_id"), errors="coerce")
-    s["home_score"] = pd.to_numeric(s.get("home_score"), errors="coerce")
-    s["away_score"] = pd.to_numeric(s.get("away_score"), errors="coerce")
-    s = s.dropna(subset=["home_id", "away_id", "home_score", "away_score"]).copy()
-    s["home_id"] = s["home_id"].astype(int)
-    s["away_id"] = s["away_id"].astype(int)
-    s["winner_id"] = np.where(s["home_score"] >= s["away_score"], s["home_id"], s["away_id"]).astype(int)
-    s["loser_id"] = np.where(s["home_score"] >= s["away_score"], s["away_id"], s["home_id"]).astype(int)
-    s["winner_team"] = np.where(s["home_score"] >= s["away_score"], s["home_team"], s["away_team"])
-    s["loser_team"] = np.where(s["home_score"] >= s["away_score"], s["away_team"], s["home_team"])
-    s["game_dt_et"] = pd.to_datetime(s.get("game_dt_et"), errors="coerce")
-    s = s.sort_values(["game_dt_et", "winner_team", "loser_team"]).drop_duplicates(
-        subset=["winner_id", "loser_id", "round_bucket"], keep="last"
-    )
-    return s.reset_index(drop=True)
+    out = out.drop(columns=["winner_key", "loser_key"], errors="ignore")
+    return out.reset_index(drop=True)
 
 
 def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame) -> dict:
@@ -7451,9 +7538,39 @@ def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.D
     try:
         bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
         if not errors and "First_Four" in bracket_data and "winner_raw" in bracket_data["First_Four"].columns:
-            report["locked_winners"] = int(
-                bracket_data["First_Four"]["winner_raw"].astype(str).str.strip().ne("").sum()
-            )
+            ff = bracket_data["First_Four"].copy()
+            ff["winner_raw"] = ff["winner_raw"].map(_clean_bracket_text)
+            ff = ff[ff["winner_raw"].astype(str).str.strip().ne("")].copy()
+            if len(ff) and completed_games is not None and len(completed_games) > 0:
+                completed_ff = completed_games.copy()
+                completed_ff = completed_ff[
+                    completed_ff.get("round_bucket", pd.Series("", index=completed_ff.index)).astype(str).eq("First_Four")
+                ].copy()
+                if len(completed_ff):
+                    completed_ff["team_pair_key"] = completed_ff.apply(
+                        lambda r: tuple(sorted([
+                            _bracket_team_canon(r.get("home_team", "")),
+                            _bracket_team_canon(r.get("away_team", "")),
+                        ])),
+                        axis=1,
+                    )
+                    completed_ff["winner_key"] = completed_ff["winner_team"].map(_bracket_team_canon)
+
+                    ff["team_pair_key"] = ff.apply(
+                        lambda r: tuple(sorted([
+                            _bracket_team_canon(r.get("team1_raw", "")),
+                            _bracket_team_canon(r.get("team2_raw", "")),
+                        ])),
+                        axis=1,
+                    )
+                    ff["winner_key"] = ff["winner_raw"].map(_bracket_team_canon)
+
+                    merged_ff = ff.merge(
+                        completed_ff[["team_pair_key", "winner_key"]].drop_duplicates(),
+                        on=["team_pair_key", "winner_key"],
+                        how="inner",
+                    )
+                    report["locked_winners"] = int(len(merged_ff))
     except Exception:
         pass
 
@@ -7548,6 +7665,14 @@ def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.D
 
     actual = {}
     for _, row in completed_games.iterrows():
+        req_ids = pd.to_numeric(pd.Series([
+            row.get("home_id", np.nan),
+            row.get("away_id", np.nan),
+            row.get("winner_id", np.nan),
+            row.get("loser_id", np.nan),
+        ]), errors="coerce")
+        if req_ids.isna().any():
+            continue
         cur_round = str(row.get("round_bucket", "") or "")
         nxt_round = _next_advancement_bucket(cur_round)
         for tid in [int(row["home_id"]), int(row["away_id"])]:
