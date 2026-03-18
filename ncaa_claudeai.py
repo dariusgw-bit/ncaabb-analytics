@@ -3202,7 +3202,10 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         )
 
         meta["last_data_refresh"] = now_str
+        meta["last_data_refresh_action"] = "executed"
         _save_metadata(meta)
+    else:
+        meta["last_data_refresh_action"] = "skipped"
 
     print("📂 Loading team box history...")
     team_box_hist = load_team_box_history(TEAM_BOX_DIR, HIST_SEASONS)
@@ -3255,17 +3258,20 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         meta["last_model_fit"] = now_str
         meta["feature_cols"] = feature_cols
         meta["training_input_signature"] = current_training_sig
+        meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
         print("✅ Model retrain complete")
 
     else:
         print(f"⏭️  Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
+        meta["last_model_refresh_action"] = "skipped"
         try:
             spread_booster, winner_booster, lgb_spread, iso, imp = load_models(MODEL_DIR)
             meta_cols = meta.get("feature_cols", [])
             diff_cols2 = meta_cols
             diff_cols = [c for c in meta_cols if not c.endswith("__na")]
             feature_cols = meta_cols
+            _save_metadata(meta)
         except Exception as e:
             print(f"⚠️ Could not load saved models ({e}). Triggering fresh model train...")
             return check_and_retrain(force_data=False, force_model=True)
@@ -5216,6 +5222,212 @@ LAST_DATE  = None
 
 SEASON_ACC = None
 SEASON_ACC_DATE = None
+BOARD_CACHE = {}
+HC_FILTER_CACHE = {}
+MATCHUP_SNAPSHOT_CACHE = {}
+DASHBOARD_RUN_LOG = []
+DASHBOARD_LOG_PATH = os.path.join(BASE_DIR, "dashboard_runtime_log.jsonl")
+STARTUP_DIAGNOSTICS = {}
+_STARTUP_DIAGNOSTICS_EMITTED = False
+
+
+def _dashboard_runtime_signature() -> tuple:
+    meta = _load_metadata()
+    return (
+        str(meta.get("last_data_refresh", "")),
+        str(meta.get("last_model_fit", "")),
+        int(len(schedule_cur)) if "schedule_cur" in globals() and schedule_cur is not None else 0,
+        int(len(team_snaps)) if "team_snaps" in globals() and team_snaps is not None else 0,
+    )
+
+
+def _dashboard_log(event: str, **payload):
+    row = {
+        "ts": datetime.utcnow().isoformat(),
+        "event": str(event),
+        **payload,
+    }
+    DASHBOARD_RUN_LOG.append(row)
+    try:
+        with open(DASHBOARD_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _warning_html(title: str, items) -> str:
+    lines = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not lines:
+        return ""
+    body = "<br>".join(lines[:8])
+    return (
+        f"<div style='background:#2a2111;border-left:4px solid #d9a441;padding:8px 10px;"
+        f"color:#f2d28b;margin:0 0 8px 0;'><b>{title}</b><br>{body}</div>"
+    )
+
+
+def _safe_execute(section: str, fn):
+    try:
+        return fn(), None
+    except Exception as e:
+        _dashboard_log(section, status="error", error=str(e))
+        return None, e
+
+
+def _board_cache_key(date_et) -> tuple:
+    return (str(pd.Timestamp(date_et).date()), _dashboard_runtime_signature())
+
+
+def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
+    key = _board_cache_key(date_et)
+    if not force_rebuild and key in BOARD_CACHE:
+        return BOARD_CACHE[key].copy(), True
+
+    board = build_board_for_date(
+        date_et=date_et,
+        schedule_df=schedule_cur,
+        team_snaps=team_snaps,
+        roll_cols=roll_cols,
+        spread_booster=spread_booster,
+        winner_booster=winner_booster,
+        lgb_spread=lgb_spread,
+        iso=iso,
+        imp=imp,
+        feature_cols=feature_cols,
+        elo_snap=elo_snap,
+    )
+    if board is not None and len(board) > 0:
+        board = _attach_rotowire_to_board(board, date_et)
+    BOARD_CACHE[key] = board.copy() if board is not None else pd.DataFrame()
+    if len(BOARD_CACHE) > 12:
+        stale = [k for k in BOARD_CACHE if k != key]
+        for k in stale[:-11]:
+            BOARD_CACHE.pop(k, None)
+    return board.copy() if board is not None else pd.DataFrame(), False
+
+
+def _get_high_confidence_cached(board: pd.DataFrame, date_et, threshold: float) -> tuple:
+    key = (str(pd.Timestamp(date_et).date()), round(float(threshold), 4), _dashboard_runtime_signature())
+    if key in HC_FILTER_CACHE:
+        return HC_FILTER_CACHE[key].copy(), True
+    conf = pd.to_numeric(board.get("confidence", board.get("pick_conf")), errors="coerce")
+    hc = board.assign(confidence=conf)
+    hc = hc[hc["confidence"] >= float(threshold)].copy()
+    dedupe_cols = [c for c in ["game_id"] if c in hc.columns]
+    if not dedupe_cols:
+        dedupe_cols = [c for c in ["game_dt_et", "away_team", "home_team"] if c in hc.columns]
+    if dedupe_cols:
+        hc = hc.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
+    HC_FILTER_CACHE[key] = hc.copy()
+    return hc.copy(), False
+
+
+def _get_matchup_snapshot_cached(board: pd.DataFrame, team_a_id: int, team_b_id: int, date_et) -> tuple:
+    key = (str(pd.Timestamp(date_et).date()), min(int(team_a_id), int(team_b_id)), max(int(team_a_id), int(team_b_id)), _dashboard_runtime_signature())
+    if key in MATCHUP_SNAPSHOT_CACHE:
+        return MATCHUP_SNAPSHOT_CACHE[key].copy(), True
+    pair_mask = (
+        (pd.to_numeric(board.get("home_id"), errors="coerce") == int(team_a_id)) &
+        (pd.to_numeric(board.get("away_id"), errors="coerce") == int(team_b_id))
+    ) | (
+        (pd.to_numeric(board.get("home_id"), errors="coerce") == int(team_b_id)) &
+        (pd.to_numeric(board.get("away_id"), errors="coerce") == int(team_a_id))
+    )
+    snap = board.loc[pair_mask].copy()
+    MATCHUP_SNAPSHOT_CACHE[key] = snap.copy()
+    return snap.copy(), False
+
+
+def _validate_board_like(df: pd.DataFrame, context: str = "Board") -> list:
+    if df is None or len(df) == 0:
+        return []
+    msgs = []
+    required = ["away_team", "home_team"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        msgs.append(f"{context}: missing required columns: {', '.join(missing)}")
+    for c in ["away_team", "home_team"]:
+        if c in df.columns and df[c].astype(str).str.strip().eq("").any():
+            msgs.append(f"{context}: blank team names detected")
+            break
+    for c in ["away_id", "home_id"]:
+        if c in df.columns and pd.to_numeric(df[c], errors="coerce").isna().any():
+            msgs.append(f"{context}: missing team IDs detected")
+            break
+    if "game_id" in df.columns:
+        dupes = df["game_id"].astype(str).str.strip()
+        dupes = dupes[dupes.ne("")]
+        if dupes.duplicated().any():
+            msgs.append(f"{context}: duplicate game_id rows detected")
+    elif {"game_dt_et", "away_team", "home_team"}.issubset(df.columns):
+        dupes = df[["game_dt_et", "away_team", "home_team"]].astype(str)
+        if dupes.duplicated().any():
+            msgs.append(f"{context}: duplicate game rows detected")
+    for c in ["pick_conf", "confidence", "p_home_win"]:
+        if c in df.columns:
+            vals = pd.to_numeric(df[c], errors="coerce")
+            bad = vals.notna() & ((vals < 0) | (vals > 1))
+            if bad.any():
+                msgs.append(f"{context}: {c} outside [0, 1]")
+    for c in ["pred_margin_home", "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total"]:
+        if c in df.columns:
+            raw = df[c]
+            bad = raw.notna() & raw.astype(str).str.strip().ne("") & pd.to_numeric(raw, errors="coerce").isna()
+            if bad.any():
+                msgs.append(f"{context}: non-numeric values found in {c}")
+    return msgs
+
+
+def _validate_bracket_summary(summary_df: pd.DataFrame) -> list:
+    if summary_df is None or len(summary_df) == 0:
+        return []
+    msgs = []
+    if "team_id" in summary_df.columns and pd.to_numeric(summary_df["team_id"], errors="coerce").duplicated().any():
+        msgs.append("Bracket Sim: duplicate team rows detected in summary")
+    for c in [x for x in summary_df.columns if x.endswith("_Pct")]:
+        vals = pd.to_numeric(summary_df[c], errors="coerce")
+        bad = vals.notna() & ((vals < 0) | (vals > 100))
+        if bad.any():
+            msgs.append(f"Bracket Sim: {c} outside [0, 100]")
+            break
+    return msgs
+
+
+def _collect_startup_diagnostics():
+    meta = _load_metadata()
+    sched_rows = int(len(schedule_cur)) if "schedule_cur" in globals() and schedule_cur is not None else 0
+    snap_rows = int(len(team_snaps)) if "team_snaps" in globals() and team_snaps is not None else 0
+    rw_rows = 0
+    try:
+        rw_rows = int(len(load_rotowire_all_for_date(date_picker.value, ROTOWIRE_DIR)))
+    except Exception:
+        rw_rows = 0
+    latest_data_date = ""
+    if "schedule_cur" in globals() and schedule_cur is not None and len(schedule_cur) > 0 and "game_dt_et" in schedule_cur.columns:
+        latest_dt = pd.to_datetime(schedule_cur["game_dt_et"], errors="coerce").max()
+        latest_data_date = "" if pd.isna(latest_dt) else str(pd.Timestamp(latest_dt).date())
+    return {
+        "latest_data_date": latest_data_date,
+        "schedule_rows": sched_rows,
+        "team_snap_rows": snap_rows,
+        "odds_rows": rw_rows,
+        "last_model_fit": str(meta.get("last_model_fit", "never")),
+        "data_refresh": str(meta.get("last_data_refresh_action", "unknown")),
+        "model_refresh": str(meta.get("last_model_refresh_action", "unknown")),
+    }
+
+
+def _emit_startup_diagnostics():
+    global _STARTUP_DIAGNOSTICS_EMITTED, STARTUP_DIAGNOSTICS
+    if _STARTUP_DIAGNOSTICS_EMITTED:
+        return
+    STARTUP_DIAGNOSTICS = _collect_startup_diagnostics()
+    print(
+        "[Dashboard] latest_data_date={latest_data_date} | schedule_rows={schedule_rows:,} | "
+        "team_snaps={team_snap_rows:,} | odds_rows={odds_rows:,} | model_last_trained={last_model_fit} | "
+        "data_refresh={data_refresh} | model_refresh={model_refresh}".format(**STARTUP_DIAGNOSTICS)
+    )
+    _STARTUP_DIAGNOSTICS_EMITTED = True
 
 
 # --- Widgets ---
@@ -5791,6 +6003,7 @@ def refresh(_=None, force_rebuild=False):
             clear_output(wait=True)
 
             b2 = _apply_filters(LAST_BOARD)
+            warnings = _validate_board_like(b2, "Predictions")
             filtered_acc = compute_daily_accuracy(b2)
 
             note_html = data_status_note(
@@ -5815,33 +6028,34 @@ def refresh(_=None, force_rebuild=False):
                 manual_override=bool(tournament_mode.value),
             )
 
+            warn_html = _warning_html("Predictions validation", warnings)
+            if warn_html:
+                display(HTML(warn_html))
             display(HTML(render_predictions_table(b2, int(max_rows.value))))
+        _dashboard_log(
+            "predictions_render",
+            selected_date=str(date_picker.value),
+            games_processed=int(len(b2)),
+            odds_merged=bool("rw_spread_home" in LAST_BOARD.columns and pd.to_numeric(LAST_BOARD.get("rw_spread_home"), errors="coerce").notna().any()),
+            warnings=warnings,
+            cache_hit=True,
+        )
         return
 
     with out:
         clear_output(wait=True)
         display(HTML("<div style='color:#AAA; padding:8px;'>⏳ Building board...</div>"))
 
-    try:
-        with suppress_stdout_stderr():
-            board = build_board_for_date(
-                date_et=date_picker.value,
-                schedule_df=schedule_cur,
-                team_snaps=team_snaps,
-                roll_cols=roll_cols,
-                spread_booster=spread_booster,
-                winner_booster=winner_booster,
-                lgb_spread=lgb_spread,
-                iso=iso,
-                imp=imp,
-                feature_cols=feature_cols,
-                elo_snap=elo_snap,
-            )
-    except Exception as e:
+    result, err = _safe_execute(
+        "predictions_build",
+        lambda: _get_board_for_date_cached(date_picker.value, force_rebuild=force_rebuild),
+    )
+    if err is not None:
         with out:
             clear_output(wait=True)
-            display(HTML(f"<div style='color:#ffb4b4;'>❌ Board error: {e}</div>"))
+            display(HTML(f"<div style='color:#ffb4b4;'>❌ Board error: {err}</div>"))
         return
+    board, cache_hit = result
 
     if board is None or len(board) == 0:
         with out:
@@ -5849,12 +6063,11 @@ def refresh(_=None, force_rebuild=False):
             display(HTML("<div style='color:#AAA;'>No games found for this date.</div>"))
         return
 
-    board = _attach_rotowire_to_board(board, date_picker.value)
-
     LAST_BOARD = board
     LAST_DATE = date_picker.value
 
     b2 = _apply_filters(board)
+    warnings = _validate_board_like(b2, "Predictions")
     filtered_acc = compute_daily_accuracy(b2)
 
     note_html = data_status_note(
@@ -5881,12 +6094,23 @@ def refresh(_=None, force_rebuild=False):
 
     with out:
         clear_output(wait=True)
+        warn_html = _warning_html("Predictions validation", warnings)
+        if warn_html:
+            display(HTML(warn_html))
         if show_rw_missing.value:
             miss = board[board.get("rw_missing_reason", pd.Series("", index=board.index)).ne("")]
             if len(miss):
                 display(HTML(f"<div style='color:#AAA;'>⚠️ RW missing: {len(miss)} games</div>"))
                 display(miss[["away_team", "home_team", "rw_missing_reason"]].head(20))
         display(HTML(render_predictions_table(b2, int(max_rows.value))))
+    _dashboard_log(
+        "predictions_render",
+        selected_date=str(date_picker.value),
+        games_processed=int(len(b2)),
+        odds_merged=bool("rw_spread_home" in board.columns and pd.to_numeric(board.get("rw_spread_home"), errors="coerce").notna().any()),
+        warnings=warnings,
+        cache_hit=bool(cache_hit),
+    )
 
 
 def _matchup_team_options():
@@ -6509,28 +6733,14 @@ def render_matchup(_=None):
 
     with matchup_snapshot_out:
         clear_output(wait=True)
-        try:
-            if LAST_BOARD is not None and LAST_DATE == matchup_date_picker.value:
-                board = LAST_BOARD.copy()
-            else:
-                board = build_board_for_date(
-                    date_et=matchup_date_picker.value,
-                    schedule_df=schedule_cur,
-                    team_snaps=team_snaps,
-                    roll_cols=roll_cols,
-                    spread_booster=spread_booster,
-                    winner_booster=winner_booster,
-                    lgb_spread=lgb_spread,
-                    iso=iso,
-                    imp=imp,
-                    feature_cols=feature_cols,
-                    elo_snap=elo_snap,
-                )
-                if board is not None and len(board) > 0:
-                    board = _attach_rotowire_to_board(board, matchup_date_picker.value)
-        except Exception as e:
-            display(HTML(f"<div style='color:#ffb4b4;'>❌ Matchup prediction error: {e}</div>"))
+        result, err = _safe_execute(
+            "matchup_board",
+            lambda: _get_board_for_date_cached(matchup_date_picker.value, force_rebuild=False),
+        )
+        if err is not None:
+            display(HTML(f"<div style='color:#ffb4b4;'>❌ Matchup prediction error: {err}</div>"))
             return
+        board, board_cache_hit = result
 
         if board is None or len(board) == 0:
             display(HTML("<div style='color:#AAA; margin-top:8px;'>No board rows found for that slate date.</div>"))
@@ -6538,18 +6748,26 @@ def render_matchup(_=None):
 
         a_id = int(matchup_team_a.value)
         b_id = int(matchup_team_b.value)
-        pair_mask = (
-            (pd.to_numeric(board.get("home_id"), errors="coerce") == a_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == b_id)
-        ) | (
-            (pd.to_numeric(board.get("home_id"), errors="coerce") == b_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == a_id)
-        )
-        snap_board = board.loc[pair_mask].copy()
+        snap_board, snapshot_cache_hit = _get_matchup_snapshot_cached(board, a_id, b_id, matchup_date_picker.value)
+        warnings = _validate_board_like(snap_board, "Matchup Snapshot")
 
         if len(snap_board):
+            warn_html = _warning_html("Matchup snapshot validation", warnings)
+            if warn_html:
+                display(HTML(warn_html))
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
             display(HTML(render_predictions_table(snap_board, len(snap_board))))
         else:
             display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
+        _dashboard_log(
+            "matchup_render",
+            selected_date=str(matchup_date_picker.value),
+            games_processed=int(len(snap_board)),
+            odds_merged=bool("rw_spread_home" in board.columns and pd.to_numeric(board.get("rw_spread_home"), errors="coerce").notna().any()),
+            warnings=warnings,
+            cache_hit=bool(board_cache_hit),
+            snapshot_cache_hit=bool(snapshot_cache_hit),
+        )
 
 # ============================================================
 # BRACKET SIMULATOR: PATCH 1
@@ -6656,6 +6874,27 @@ def _bracket_file_signature(path: str) -> dict:
         "size": int(st.st_size),
         "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
     }
+
+
+def _bracket_lock_state_signature() -> list:
+    try:
+        bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
+    except Exception:
+        return []
+    if errors or "First_Four" not in bracket_data:
+        return []
+    ff = bracket_data["First_Four"].copy()
+    if ff is None or len(ff) == 0 or "winner_raw" not in ff.columns:
+        return []
+    ff["winner_raw"] = ff["winner_raw"].map(_clean_bracket_text)
+    ff["game_key"] = ff.get("game_key", pd.Series("", index=ff.index)).astype(str).str.strip()
+    ff = ff[ff["winner_raw"].astype(str).str.strip().ne("")].copy()
+    if len(ff) == 0:
+        return []
+    return [
+        {"game_key": str(row.get("game_key", "")).strip(), "winner": str(row.get("winner_raw", "")).strip()}
+        for _, row in ff.sort_values("game_key").iterrows()
+    ]
 
 
 def _normalize_bracket_key(x) -> str:
@@ -7536,6 +7775,7 @@ def _bracket_cache_signature(sim_n: int, asof_date) -> dict:
         "workbook": _bracket_file_signature(_get_bracket_workbook_path()),
         "sim_n": int(sim_n),
         "asof_date": str(pd.Timestamp(asof_date).date()),
+        "lock_state": _bracket_lock_state_signature(),
         "last_model_fit": meta.get("last_model_fit", ""),
         "feature_cols_n": len(meta.get("feature_cols", feature_cols if "feature_cols" in globals() else [])),
     }
@@ -8126,11 +8366,22 @@ def run_bracket_simulation(_=None, force_run: bool = True):
             extra = ""
             if info_msgs:
                 extra = "<br>" + "<br>".join(info_msgs)
+            warnings = _validate_bracket_summary(payload.get("summary_df"))
+            warn_html = _warning_html("Bracket validation", warnings)
             bracket_status_html.value = (
                 f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#bbb;'>"
                 f"Loaded cached bracket simulation for {signature['asof_date']} ({sim_n} sims).{extra}</div>"
+                + warn_html
             )
             _render_bracket_results(payload.get("summary_df"), payload.get("latest_run_df"))
+            _dashboard_log(
+                "bracket_sim",
+                selected_date=str(asof_date),
+                games_processed=int(len(payload.get("latest_run_df", pd.DataFrame()))),
+                warnings=warnings,
+                cache_hit=True,
+                sim_n=sim_n,
+            )
             return
 
     try:
@@ -8146,12 +8397,23 @@ def run_bracket_simulation(_=None, force_run: bool = True):
     extra = ""
     if info_msgs:
         extra = "<br>" + "<br>".join(info_msgs)
+    warnings = _validate_bracket_summary(summary_df)
+    warn_html = _warning_html("Bracket validation", warnings)
     bracket_status_html.value = (
         f"<div style='background:#111;border-left:4px solid #2ECC71;padding:10px;color:#bbb;'>"
         f"Completed bracket simulation for {pd.Timestamp(asof_date).date()} with {sim_n} runs.<br>"
         f"Saved to: {BRACKET_OUTPUT_DIR}{extra}</div>"
+        + warn_html
     )
     _render_bracket_results(summary_df, latest_run_df)
+    _dashboard_log(
+        "bracket_sim",
+        selected_date=str(asof_date),
+        games_processed=int(len(latest_run_df)),
+        warnings=warnings,
+        cache_hit=False,
+        sim_n=sim_n,
+    )
     if "dashboard_tabs" in globals() and getattr(dashboard_tabs, "selected_index", None) == 3:
         _render_bracket_accuracy()
 
@@ -8208,6 +8470,7 @@ dashboard_tabs.observe(_maybe_load_bracket_cache, names="selected_index")
 
 dashboard_layout = widgets.VBox([season_banner_html, daily_banner_html, dashboard_tabs])
 
+_emit_startup_diagnostics()
 display(dashboard_layout)
 refresh()
 
@@ -8342,20 +8605,17 @@ def _build_static_hc_report():
         except Exception:
             pass
 
-    conf = pd.to_numeric(board.get("confidence", board.get("pick_conf")), errors="coerce")
-    board = board.assign(confidence=conf)
-
-    hc = board[board["confidence"] >= float(hc_thresh.value)].copy()
-
-    # keep it static and deduped
-    dedupe_cols = [c for c in ["game_id"] if c in hc.columns]
-    if not dedupe_cols:
-        dedupe_cols = [c for c in ["game_dt_et", "away_team", "home_team"] if c in hc.columns]
-    if dedupe_cols:
-        hc = hc.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
+    hc, _ = _get_high_confidence_cached(board, report_date, float(hc_thresh.value))
 
     HC_REPORT_CACHE = hc.copy()
     HC_REPORT_DATE = report_date
+    _dashboard_log(
+        "high_conf_report_build",
+        selected_date=str(report_date),
+        games_processed=int(len(hc)),
+        warnings=_validate_board_like(hc, "High-Confidence"),
+        threshold=float(hc_thresh.value),
+    )
     return hc, None
 
 
@@ -8371,6 +8631,10 @@ def _render_static_hc_report(_=None):
         if hc is None or len(hc) == 0:
             display(HTML("<div style='color:#AAA;'>No high-confidence games for the current board.</div>"))
             return
+
+        warn_html = _warning_html("High-Confidence validation", _validate_board_like(hc, "High-Confidence"))
+        if warn_html:
+            display(HTML(warn_html))
 
         graded = hc.copy()
         graded["home_score"] = pd.to_numeric(graded.get("home_score"), errors="coerce")
