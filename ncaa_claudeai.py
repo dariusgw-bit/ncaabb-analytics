@@ -5592,6 +5592,10 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     b = b.rename(columns={k: v for k, v in rename.items() if k in b.columns})
     return b
 
+
+def render_predictions_table(board: pd.DataFrame, max_rows: int) -> str:
+    return df_to_html_table(_format_board_for_display(board), max_rows=max_rows)
+
 def render_two_level_banner(season_acc: dict = None, season_label: str = "", daily_acc: dict = None, daily_label: str = "", note: str = "") -> tuple:
     season_html = ""
     daily_html = ""
@@ -5661,7 +5665,7 @@ def _current_dashboard_snapshot_html() -> str:
 
     if LAST_BOARD is not None and len(LAST_BOARD) > 0:
         b2 = _apply_filters(LAST_BOARD)
-        table_html = df_to_html_table(_format_board_for_display(b2), int(max_rows.value))
+        table_html = render_predictions_table(b2, int(max_rows.value))
         if show_rw_missing.value:
             miss = LAST_BOARD[LAST_BOARD.get("rw_missing_reason", pd.Series("", index=LAST_BOARD.index)).ne("")]
             if len(miss):
@@ -5811,7 +5815,7 @@ def refresh(_=None, force_rebuild=False):
                 manual_override=bool(tournament_mode.value),
             )
 
-            display(HTML(df_to_html_table(_format_board_for_display(b2), int(max_rows.value))))
+            display(HTML(render_predictions_table(b2, int(max_rows.value))))
         return
 
     with out:
@@ -5882,7 +5886,7 @@ def refresh(_=None, force_rebuild=False):
             if len(miss):
                 display(HTML(f"<div style='color:#AAA;'>⚠️ RW missing: {len(miss)} games</div>"))
                 display(miss[["away_team", "home_team", "rw_missing_reason"]].head(20))
-        display(HTML(df_to_html_table(_format_board_for_display(b2), int(max_rows.value))))
+        display(HTML(render_predictions_table(b2, int(max_rows.value))))
 
 
 def _matchup_team_options():
@@ -6316,7 +6320,7 @@ def render_matchup(_=None):
 
         if len(snap_board):
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
-            display(HTML(df_to_html_table(_format_board_for_display(snap_board), max_rows=len(snap_board))))
+            display(HTML(render_predictions_table(snap_board, len(snap_board))))
         else:
             display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
 
@@ -6543,7 +6547,7 @@ def render_matchup(_=None):
 
         if len(snap_board):
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
-            display(HTML(df_to_html_table(_format_board_for_display(snap_board), max_rows=len(snap_board))))
+            display(HTML(render_predictions_table(snap_board, len(snap_board))))
         else:
             display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
 
@@ -8391,8 +8395,7 @@ def _render_static_hc_report(_=None):
             """
         ))
 
-        hc_view = _format_board_for_display(hc.copy())
-        display(HTML(df_to_html_table(hc_view, max_rows=len(hc_view))))
+        display(HTML(render_predictions_table(hc.copy(), len(hc))))
 
 
 build_hc_btn.on_click(_render_static_hc_report)
