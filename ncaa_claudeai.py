@@ -6101,7 +6101,14 @@ matchup_date_picker = widgets.DatePicker(description="Slate (ET):")
 matchup_date_picker.value = date_picker.value
 compare_btn = widgets.Button(description="Compare", button_style="primary")
 matchup_out = widgets.Output()
-matchup_radar_out = widgets.Output(layout=widgets.Layout(width="100%", min_height="560px"))
+matchup_radar_out = widgets.Output(layout=widgets.Layout(width="100%", min_height="380px", overflow="hidden"))
+matchup_snapshot_out = widgets.Output()
+matchup_radar_title = widgets.HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Head-to-Head Radar</div>")
+matchup_radar_section = widgets.VBox(
+    [matchup_radar_title, matchup_radar_out],
+    layout=widgets.Layout(display="none", width="100%"),
+)
+_MATCHUP_RADAR_STATE = {"fig": None, "summary_html": "", "empty_html": ""}
 
 bracket_sim_n = widgets.IntText(description="Sims", value=1000)
 bracket_asof_date = widgets.DatePicker(description="As-of (ET):")
@@ -6313,6 +6320,232 @@ def render_matchup(_=None):
         else:
             display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
 
+
+def _render_persisted_matchup_radar():
+    fig = _MATCHUP_RADAR_STATE.get("fig")
+    summary_html = _MATCHUP_RADAR_STATE.get("summary_html", "")
+    empty_html = _MATCHUP_RADAR_STATE.get("empty_html", "")
+    matchup_radar_section.layout.display = "" if (fig is not None or empty_html or summary_html) else "none"
+    with matchup_radar_out:
+        clear_output(wait=True)
+        if summary_html:
+            display(HTML(summary_html))
+        if fig is not None:
+            _display_plotly_figure(fig)
+        elif empty_html:
+            display(HTML(empty_html))
+
+
+def _set_matchup_radar_state(fig=None, summary_html: str = "", empty_html: str = ""):
+    _MATCHUP_RADAR_STATE["fig"] = fig
+    _MATCHUP_RADAR_STATE["summary_html"] = summary_html or ""
+    _MATCHUP_RADAR_STATE["empty_html"] = empty_html or ""
+    if "dashboard_tabs" not in globals() or getattr(dashboard_tabs, "selected_index", None) == 1:
+        _render_persisted_matchup_radar()
+
+
+def render_matchup(_=None):
+    with matchup_out:
+        clear_output(wait=True)
+    with matchup_snapshot_out:
+        clear_output(wait=True)
+    _set_matchup_radar_state(fig=None, summary_html="", empty_html="")
+
+    with matchup_out:
+        if matchup_team_a.value is None or matchup_team_b.value is None:
+            display(HTML("<div style='color:#AAA;'>Select two teams to compare.</div>"))
+            return
+        if matchup_team_a.value == matchup_team_b.value:
+            display(HTML("<div style='color:#ffb4b4;'>Choose two different teams.</div>"))
+            return
+
+        snap_a = _team_snapshot_asof(matchup_team_a.value, matchup_date_picker.value)
+        snap_b = _team_snapshot_asof(matchup_team_b.value, matchup_date_picker.value)
+        if len(snap_a) == 0 or len(snap_b) == 0:
+            display(HTML("<div style='color:#AAA;'>No team profile data available for one or both teams on that date.</div>"))
+            return
+
+        team_a_name = next((label for label, val in matchup_team_a.options if val == matchup_team_a.value), str(matchup_team_a.value))
+        team_b_name = next((label for label, val in matchup_team_b.options if val == matchup_team_b.value), str(matchup_team_b.value))
+        metric_specs = [
+            ("r10_mean_points_for", "Points For (Last 10)", False),
+            ("r10_mean_points_against", "Points Against (Last 10)", True),
+            ("r10_mean_point_diff", "Point Diff (Last 10)", False),
+            ("r10_mean_field_goal_pct", "FG%", False),
+            ("r10_mean_three_point_field_goal_pct", "3PT%", False),
+            ("r10_mean_free_throw_pct", "FT%", False),
+            ("r10_mean_total_rebounds", "Total Rebounds", False),
+            ("r10_mean_offensive_rebounds", "Offensive Rebounds", False),
+            ("r10_mean_steals", "Steals", False),
+            ("r10_mean_blocks", "Blocks", False),
+            ("r10_mean_turnovers", "Turnovers", True),
+            ("rest_days", "Rest Days", False),
+            ("r10_gp", "Games In Window", False),
+        ]
+        rows = []
+        radar_theta = []
+        radar_a = []
+        radar_b = []
+        for c, label, invert in metric_specs:
+            va = _matchup_num(snap_a.get(c))
+            vb = _matchup_num(snap_b.get(c))
+            if c == "r10_mean_point_diff" and (pd.isna(va) or pd.isna(vb)):
+                va_pf = _matchup_num(snap_a.get("r10_mean_points_for"))
+                vb_pf = _matchup_num(snap_b.get("r10_mean_points_for"))
+                va_pa = _matchup_num(snap_a.get("r10_mean_points_against"))
+                vb_pa = _matchup_num(snap_b.get("r10_mean_points_against"))
+                va = va_pf - va_pa if pd.notna(va_pf) and pd.notna(va_pa) else np.nan
+                vb = vb_pf - vb_pa if pd.notna(vb_pf) and pd.notna(vb_pa) else np.nan
+            if pd.isna(va) and pd.isna(vb):
+                continue
+            rows.append({
+                "Metric": label,
+                team_a_name: "" if pd.isna(va) else f"{float(va):.2f}",
+                team_b_name: "" if pd.isna(vb) else f"{float(vb):.2f}",
+            })
+            na = _season_metric_normalize(c, va, invert=invert)
+            nb = _season_metric_normalize(c, vb, invert=invert)
+            if pd.notna(na) and pd.notna(nb):
+                radar_theta.append(label)
+                radar_a.append(float(na))
+                radar_b.append(float(nb))
+
+        display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Team Profile Comparison</div>"))
+        display(HTML(df_to_html_table(pd.DataFrame(rows), max_rows=max(10, len(rows)))))
+        display(HTML(_render_model_edge_breakdown(
+            matchup_team_a.value,
+            matchup_team_b.value,
+            team_a_name,
+            team_b_name,
+            snap_a,
+            snap_b,
+            matchup_date_picker.value,
+        )))
+
+    fig = None
+    summary_html = ""
+    empty_html = ""
+    if radar_theta:
+        try:
+            import plotly.graph_objects as go
+
+            clean_theta = []
+            clean_a = []
+            clean_b = []
+            edge_vals = []
+            for theta, va, vb in zip(radar_theta, radar_a, radar_b):
+                va = _matchup_num(va)
+                vb = _matchup_num(vb)
+                if pd.isna(va) or pd.isna(vb) or not np.isfinite(float(va)) or not np.isfinite(float(vb)):
+                    continue
+                clean_theta.append(theta)
+                clean_a.append(float(va))
+                clean_b.append(float(vb))
+                edge_vals.append(float(va) - float(vb))
+
+            if len(clean_theta) >= 3:
+                edge_arr = np.asarray(edge_vals, dtype=float)
+                mean_abs_edge = float(np.nanmean(np.abs(edge_arr))) if len(edge_arr) else 0.0
+                edge_strength = float(np.clip(mean_abs_edge / 12.0, 0.0, 1.0))
+                a_wins = int((edge_arr > 0).sum())
+                b_wins = int((edge_arr < 0).sum())
+                ties = int((edge_arr == 0).sum())
+                a_fill = 0.16 + (0.18 * edge_strength)
+                b_fill = 0.12 + (0.14 * edge_strength)
+                a_color = f"rgba(46, 204, 113, {0.88 if a_wins >= b_wins else 0.68})"
+                b_color = f"rgba(231, 76, 60, {0.88 if b_wins > a_wins else 0.68})"
+                a_fill_color = f"rgba(46, 204, 113, {a_fill:.3f})"
+                b_fill_color = f"rgba(231, 76, 60, {b_fill:.3f})"
+
+                summary_html = (
+                    "<div style='margin:0 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
+                    "background:#15191f; border-radius:8px;'>"
+                    "<div style='color:#EEE; font-weight:700; margin-bottom:4px;'>Edge Summary</div>"
+                    f"<div style='color:#CFCFCF;'>{team_a_name}: <b>{a_wins}</b> metrics"
+                    f" &nbsp;|&nbsp; {team_b_name}: <b>{b_wins}</b> metrics"
+                    f"{'' if not ties else f' &nbsp;|&nbsp; Ties: <b>{ties}</b>'}"
+                    f" &nbsp;|&nbsp; Avg edge magnitude: <b>{mean_abs_edge:.1f}</b></div>"
+                    "</div>"
+                )
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatterpolar(
+                    r=clean_a + [clean_a[0]],
+                    theta=clean_theta + [clean_theta[0]],
+                    fill="toself",
+                    name=team_a_name,
+                    line=dict(color=a_color, width=3),
+                    fillcolor=a_fill_color,
+                ))
+                fig.add_trace(go.Scatterpolar(
+                    r=clean_b + [clean_b[0]],
+                    theta=clean_theta + [clean_theta[0]],
+                    fill="toself",
+                    name=team_b_name,
+                    line=dict(color=b_color, width=3),
+                    fillcolor=b_fill_color,
+                ))
+                fig.update_layout(
+                    title="Head-to-Head Radar",
+                    polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                    autosize=True,
+                    showlegend=True,
+                    margin=dict(l=28, r=28, t=48, b=28),
+                    height=360,
+                )
+            else:
+                empty_html = "<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Not enough matchup metrics are available to draw a radar chart.</div>"
+        except ImportError:
+            empty_html = "<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Plotly is not available, so the radar chart could not be rendered.</div>"
+        except Exception as e:
+            empty_html = f"<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Radar chart rendering failed: {e}</div>"
+    else:
+        empty_html = "<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Not enough matchup metrics are available to draw a radar chart.</div>"
+    _set_matchup_radar_state(fig=fig, summary_html=summary_html, empty_html=empty_html)
+
+    with matchup_snapshot_out:
+        clear_output(wait=True)
+        try:
+            if LAST_BOARD is not None and LAST_DATE == matchup_date_picker.value:
+                board = LAST_BOARD.copy()
+            else:
+                board = build_board_for_date(
+                    date_et=matchup_date_picker.value,
+                    schedule_df=schedule_cur,
+                    team_snaps=team_snaps,
+                    roll_cols=roll_cols,
+                    spread_booster=spread_booster,
+                    winner_booster=winner_booster,
+                    lgb_spread=lgb_spread,
+                    iso=iso,
+                    imp=imp,
+                    feature_cols=feature_cols,
+                    elo_snap=elo_snap,
+                )
+                if board is not None and len(board) > 0:
+                    board = _attach_rotowire_to_board(board, matchup_date_picker.value)
+        except Exception as e:
+            display(HTML(f"<div style='color:#ffb4b4;'>❌ Matchup prediction error: {e}</div>"))
+            return
+
+        if board is None or len(board) == 0:
+            display(HTML("<div style='color:#AAA; margin-top:8px;'>No board rows found for that slate date.</div>"))
+            return
+
+        a_id = int(matchup_team_a.value)
+        b_id = int(matchup_team_b.value)
+        pair_mask = (
+            (pd.to_numeric(board.get("home_id"), errors="coerce") == a_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == b_id)
+        ) | (
+            (pd.to_numeric(board.get("home_id"), errors="coerce") == b_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == a_id)
+        )
+        snap_board = board.loc[pair_mask].copy()
+
+        if len(snap_board):
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
+            display(HTML(df_to_html_table(_format_board_for_display(snap_board), max_rows=len(snap_board))))
+        else:
+            display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
 
 # ============================================================
 # BRACKET SIMULATOR: PATCH 1
@@ -7945,7 +8178,7 @@ controls_row2 = widgets.HBox([min_conf, min_abs_margin, side_filter])
 controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, tournament_mode, search_box, max_rows])
 matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_picker, compare_btn])
 bracket_controls = widgets.HBox([bracket_sim_n, bracket_asof_date, run_bracket_btn])
-matchup_tab = widgets.VBox([matchup_controls, matchup_out])
+matchup_tab = widgets.VBox([matchup_controls, matchup_out, matchup_radar_section, matchup_snapshot_out])
 bracket_tab = widgets.VBox([bracket_controls, bracket_status_html, bracket_summary_html, bracket_out])
 bracket_acc_tab = widgets.VBox([refresh_bracket_acc_btn, bracket_acc_status_html, bracket_acc_out])
 predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, tournament_banner_html, out])
@@ -7959,7 +8192,9 @@ dashboard_tabs.set_title(3, "Bracket Accuracy")
 def _maybe_load_bracket_cache(change):
     if change.get("name") != "selected_index":
         return
-    if change.get("new") == 2:
+    if change.get("new") == 1:
+        _render_persisted_matchup_radar()
+    elif change.get("new") == 2:
         run_bracket_simulation(force_run=False)
     elif change.get("new") == 3:
         _render_bracket_accuracy()
@@ -8156,17 +8391,8 @@ def _render_static_hc_report(_=None):
             """
         ))
 
-        show_cols = [
-            "game_dt_et", "away_team", "home_team",
-            "confidence", "p_home_win", "pred_margin_home",
-            "winner_pick", "spread_pick",
-            "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total",
-            "final_score",
-            "home_injury_impact", "away_injury_impact"
-        ]
-        show_cols = [c for c in show_cols if c in hc.columns]
-
-        display(hc[show_cols].sort_values(["game_dt_et", "home_team", "away_team"]).reset_index(drop=True))
+        hc_view = _format_board_for_display(hc.copy())
+        display(HTML(df_to_html_table(hc_view, max_rows=len(hc_view))))
 
 
 build_hc_btn.on_click(_render_static_hc_report)
