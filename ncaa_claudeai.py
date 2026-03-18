@@ -6482,10 +6482,24 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tup
 
         pred = _predict_neutral_matchup(team_a, team_b, asof_date)
         winner = team_a if np.random.random() < pred["p_team_a_win"] else team_b
+        loser = team_b if winner["team_id"] == team_a["team_id"] else team_a
         first_four_results.append({
             "game_key": row.get("game_key", ""),
+            "game_key_norm": row.get("game_key_norm", _normalize_bracket_key(row.get("game_key", ""))),
+            "round_name": "First_Four",
+            "region": str(row.get("region", "") or ""),
+            "team1": team_a["team_name"],
+            "team2": team_b["team_name"],
+            "team1_seed": str(row.get("seed1", "") or ""),
+            "team2_seed": str(row.get("seed2", "") or ""),
+            "winner": winner["team_name"],
             "winner_team": winner["team_name"],
             "winner_canon": canonical_team(winner["team_name"]),
+            "winner_seed": str(row.get("seed1", "") or "") if winner["team_id"] == team_a["team_id"] else str(row.get("seed2", "") or ""),
+            "loser": loser["team_name"],
+            "loser_team": loser["team_name"],
+            "loser_canon": canonical_team(loser["team_name"]),
+            "loser_seed": str(row.get("seed2", "") or "") if winner["team_id"] == team_a["team_id"] else str(row.get("seed1", "") or ""),
             "win_prob": pred["p_team_a_win"] if winner["team_id"] == team_a["team_id"] else pred["p_team_b_win"],
             "pred_margin": pred["pred_margin_team_a"] if winner["team_id"] == team_a["team_id"] else -pred["pred_margin_team_a"],
         })
@@ -6840,8 +6854,19 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
             display(HTML("<div style='color:#AAA;'>No bracket simulation results available.</div>"))
         return
 
-    champ_cols = [c for c in ["team", "seed", "region", "Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in summary_df.columns]
-    champs = summary_df[champ_cols].head(12).copy()
+    summary_view = summary_df.copy()
+    pct_cols = [c for c in summary_view.columns if c.endswith("_Pct")]
+    for col in pct_cols:
+        summary_view[col] = pd.to_numeric(summary_view[col], errors="coerce")
+
+    champ_cols = [c for c in ["team", "seed", "region", "Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in summary_view.columns]
+    champs = (
+        summary_view.sort_values(["Champion_Pct", "Finalist_Pct"], ascending=False, na_position="last")[champ_cols]
+        .head(12)
+        .copy()
+    )
+    for col in [c for c in ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in champs.columns]:
+        champs[col] = champs[col].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
     bracket_summary_html.value = (
         "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Champion Probability Summary</div>"
         + df_to_html_table(champs, max_rows=len(champs))
@@ -6853,13 +6878,23 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
         "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct",
     ]
     show_cols = [c for c in show_cols if c in summary_df.columns]
+    adv_view = (
+        summary_view.sort_values(["Champion_Pct", "Final_Four_Pct"], ascending=False, na_position="last")[show_cols]
+        .copy()
+    )
+    for col in [c for c in show_cols if c.endswith("_Pct")]:
+        adv_view[col] = adv_view[col].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
     with bracket_out:
         clear_output(wait=True)
         display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Round Advancement Probabilities</div>"))
-        display(HTML(df_to_html_table(summary_df[show_cols], max_rows=min(len(summary_df), 80))))
+        display(HTML(df_to_html_table(adv_view, max_rows=min(len(adv_view), 80))))
         if latest_run_df is not None and len(latest_run_df) > 0:
+            run_view = latest_run_df.copy()
+            for col in run_view.columns:
+                if run_view[col].dtype == object:
+                    run_view[col] = run_view[col].fillna("")
             display(HTML("<div style='color:#EEE; font-weight:700; margin:14px 0 8px 0;'>Latest Simulated Bracket Run</div>"))
-            display(HTML(df_to_html_table(latest_run_df, max_rows=len(latest_run_df))))
+            display(HTML(df_to_html_table(run_view, max_rows=len(run_view))))
 
 
 def run_bracket_simulation(_=None, force_run: bool = True):
