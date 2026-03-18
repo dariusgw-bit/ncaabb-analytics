@@ -3460,6 +3460,10 @@ def build_board_for_date(
         board = attach_actual_scores_from_team_box(board, team_box_hist, date_et)
         board = normalize_board_for_downstream(board)
 
+    # then patch stale same-day / prior-day finals from ESPN scoreboard data
+    board = attach_espn_scoreboard_finals_patch(board, date_et)
+    board = normalize_board_for_downstream(board)
+
     board = attach_fresh_scores_from_hoopr(board, date_et)
 
     # Attach final scores for completed games
@@ -4028,8 +4032,7 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
 #   - dedupes scoreboard / fresh games cleanly
 # ============================================================
 
-from rpy2.robjects import r, pandas2ri
-from rpy2.robjects.conversion import localconverter
+from rpy2.robjects import r
 import rpy2.rinterface_lib.callbacks as rcb
 from contextlib import contextmanager
 
@@ -4050,13 +4053,38 @@ def suppress_r_console():
         rcb.consolewrite_warnerror = old_warn
 
 
+def _run_r_dataframe(r_code: str, assigns: dict | None = None) -> pd.DataFrame:
+    """
+    Execute R code and convert the result to a plain pandas DataFrame using
+    an explicit local converter context each time. This avoids relying on
+    ambient rpy2 conversion state across widget callbacks.
+    """
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
+    with suppress_r_console():
+        with localconverter(ro.default_converter + pandas2ri.converter):
+            if assigns:
+                for key, value in assigns.items():
+                    ro.globalenv[key] = value
+            obj = ro.r(r_code)
+
+    if obj is None:
+        return pd.DataFrame()
+    try:
+        df = pd.DataFrame(obj)
+    except Exception:
+        return pd.DataFrame()
+    return df if df is not None else pd.DataFrame()
+
+
 def fetch_mbb_scoreboard_game_ids_r(date_et) -> pd.DataFrame:
     """
     Returns one row per game on a specific date from hoopR::espn_mbb_scoreboard("YYYYMMDD").
     Dedupe by game_id because hoopR can return duplicate rows on some dates.
     """
     date_str = pd.Timestamp(date_et).strftime("%Y%m%d")
-    r.assign("DATE_STR", date_str)
 
     r_code = r'''
     suppressPackageStartupMessages(library(hoopR))
@@ -4088,9 +4116,7 @@ def fetch_mbb_scoreboard_game_ids_r(date_et) -> pd.DataFrame:
     out
     '''
 
-    with suppress_r_console():
-        with localconverter(pandas2ri.converter):
-            df = r(r_code)
+    df = _run_r_dataframe(r_code, {"DATE_STR": date_str})
 
     if df is None or len(df) == 0:
         return pd.DataFrame()
@@ -4101,6 +4127,120 @@ def fetch_mbb_scoreboard_game_ids_r(date_et) -> pd.DataFrame:
     return out
 
 
+def fetch_mbb_scoreboard_finals_r(date_et) -> pd.DataFrame:
+    """
+    Pull a fresh ESPN scoreboard snapshot for one date and keep only
+    completed/final games with scores for dashboard final-score patching.
+    """
+    date_str = pd.Timestamp(date_et).strftime("%Y%m%d")
+
+    r_code = r'''
+    suppressPackageStartupMessages(library(hoopR))
+
+    sb <- tryCatch(
+      hoopR::espn_mbb_scoreboard(DATE_STR),
+      error = function(e) data.frame()
+    )
+
+    if (!is.data.frame(sb) || nrow(sb) == 0) {
+      out <- data.frame()
+    } else {
+      keep <- intersect(
+        c("game_id",
+          "home_team_display_name", "away_team_display_name",
+          "home_team_short_display_name", "away_team_short_display_name",
+          "home_score", "away_score",
+          "home_team_score", "away_team_score",
+          "status_name", "status_type_name", "status_type_state",
+          "status_type_completed", "status_type_short_detail",
+          "game_date_time"),
+        names(sb)
+      )
+      out <- sb[, keep, drop = FALSE]
+    }
+
+    out
+    '''
+
+    df = _run_r_dataframe(r_code, {"DATE_STR": date_str})
+
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(df)
+    if len(out) == 0:
+        return pd.DataFrame()
+
+    if "home_team_display_name" in out.columns:
+        out["home_team"] = out["home_team_display_name"].astype(str).str.strip()
+    elif "home_team_short_display_name" in out.columns:
+        out["home_team"] = out["home_team_short_display_name"].astype(str).str.strip()
+    else:
+        out["home_team"] = ""
+
+    if "away_team_display_name" in out.columns:
+        out["away_team"] = out["away_team_display_name"].astype(str).str.strip()
+    elif "away_team_short_display_name" in out.columns:
+        out["away_team"] = out["away_team_short_display_name"].astype(str).str.strip()
+    else:
+        out["away_team"] = ""
+
+    if "home_score" not in out.columns and "home_team_score" in out.columns:
+        out["home_score"] = out["home_team_score"]
+    if "away_score" not in out.columns and "away_team_score" in out.columns:
+        out["away_score"] = out["away_team_score"]
+
+    for c in ["game_id", "status_name", "status_type_name", "status_type_state", "status_type_short_detail"]:
+        if c not in out.columns:
+            out[c] = ""
+    for c in ["home_score", "away_score"]:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    out["game_id"] = out["game_id"].astype(str)
+    out["home_score"] = pd.to_numeric(out["home_score"], errors="coerce")
+    out["away_score"] = pd.to_numeric(out["away_score"], errors="coerce")
+
+    status_blob = (
+        out["status_name"].astype(str).fillna("") + " " +
+        out["status_type_name"].astype(str).fillna("") + " " +
+        out["status_type_state"].astype(str).fillna("") + " " +
+        out["status_type_short_detail"].astype(str).fillna("")
+    ).str.lower()
+
+    completed = pd.to_numeric(
+        out.get("status_type_completed", pd.Series(np.nan, index=out.index)),
+        errors="coerce"
+    ).fillna(0).astype(int).eq(1)
+    completed |= status_blob.str.contains(r"final|post|complete", case=False, na=False)
+    completed |= out["home_score"].notna() & out["away_score"].notna()
+
+    out = out[completed].copy()
+    if len(out) == 0:
+        return pd.DataFrame()
+
+    out["status_type_completed"] = True
+    out["status_type_state"] = "post"
+    out["status_type_name"] = out["status_type_name"].astype(str).replace("", "STATUS_FINAL")
+    out["status_type_short_detail"] = out["status_type_short_detail"].astype(str).replace("", "Final")
+    out["final_score"] = np.where(
+        out["home_score"].notna() & out["away_score"].notna(),
+        out["away_team"] + " " + out["away_score"].round(0).astype(int).astype(str) + " - " +
+        out["home_team"] + " " + out["home_score"].round(0).astype(int).astype(str),
+        "",
+    )
+    out["slate_date_et"] = pd.Timestamp(date_et).date()
+    out["k_away"] = out["away_team"].map(canonical_team)
+    out["k_home"] = out["home_team"].map(canonical_team)
+
+    out = out.drop_duplicates(subset=["game_id"], keep="last").reset_index(drop=True)
+    return out[[
+        "game_id", "away_team", "home_team", "away_score", "home_score", "final_score",
+        "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail",
+        "slate_date_et", "k_away", "k_home"
+    ]].copy()
+
+
 def fetch_mbb_team_boxes_for_game_ids_r(game_ids) -> pd.DataFrame:
     """
     Pull fresh game-level team box scores using hoopR::espn_mbb_team_box(game_id).
@@ -4109,8 +4249,6 @@ def fetch_mbb_team_boxes_for_game_ids_r(game_ids) -> pd.DataFrame:
     game_ids = [str(g) for g in game_ids if pd.notna(g)]
     if len(game_ids) == 0:
         return pd.DataFrame()
-
-    r.assign("GAME_IDS", game_ids)
 
     r_code = r'''
     suppressPackageStartupMessages(library(hoopR))
@@ -4145,9 +4283,7 @@ def fetch_mbb_team_boxes_for_game_ids_r(game_ids) -> pd.DataFrame:
     out
     '''
 
-    with suppress_r_console():
-        with localconverter(pandas2ri.converter):
-            df = r(r_code)
+    df = _run_r_dataframe(r_code, {"GAME_IDS": game_ids})
 
     if df is None or len(df) == 0:
         return pd.DataFrame()
@@ -4456,6 +4592,114 @@ def attach_fresh_scores_from_hoopr(board: pd.DataFrame, date_et) -> pd.DataFrame
     if dedupe_cols:
         out = out.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
 
+    return out
+
+
+def attach_espn_scoreboard_finals_patch(board: pd.DataFrame, date_et) -> pd.DataFrame:
+    """
+    Patch stale finals from hoopR ESPN scoreboard data.
+    Prefers exact game_id, then falls back to normalized away/home/date matching.
+    Optionally uses team-box game scores as a second pass if scoreboard scores are missing.
+    """
+    if board is None or len(board) == 0:
+        return pd.DataFrame()
+
+    out = normalize_board_for_downstream(board.copy())
+    try:
+        patch = fetch_mbb_scoreboard_finals_r(date_et)
+    except Exception:
+        return out
+    if patch is None or len(patch) == 0:
+        return out
+
+    if patch["home_score"].isna().any() or patch["away_score"].isna().any():
+        try:
+            tb_patch = build_fresh_team_box_scores_for_date(date_et)
+        except Exception:
+            tb_patch = pd.DataFrame()
+        if tb_patch is not None and len(tb_patch) > 0:
+            tb_patch = tb_patch.copy()
+            tb_patch["game_id"] = tb_patch["game_id"].astype(str)
+            patch = patch.merge(
+                tb_patch[["game_id", "home_score", "away_score"]].rename(
+                    columns={"home_score": "home_score_tb", "away_score": "away_score_tb"}
+                ),
+                on="game_id",
+                how="left",
+            )
+            patch["home_score"] = patch["home_score"].where(patch["home_score"].notna(), patch["home_score_tb"])
+            patch["away_score"] = patch["away_score"].where(patch["away_score"].notna(), patch["away_score_tb"])
+            patch = patch.drop(columns=["home_score_tb", "away_score_tb"], errors="ignore")
+            patch["final_score"] = np.where(
+                patch["home_score"].notna() & patch["away_score"].notna(),
+                patch["away_team"] + " " + patch["away_score"].round(0).astype(int).astype(str) + " - " +
+                patch["home_team"] + " " + patch["home_score"].round(0).astype(int).astype(str),
+                patch["final_score"].astype(str),
+            )
+
+    for c in ["home_score", "away_score"]:
+        if c not in out.columns:
+            out[c] = np.nan
+    for c in ["status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail", "final_score"]:
+        if c not in out.columns:
+            out[c] = ""
+
+    hs0 = pd.to_numeric(out.get("home_score"), errors="coerce")
+    aw0 = pd.to_numeric(out.get("away_score"), errors="coerce")
+    completed0 = out.get("status_type_completed", pd.Series(False, index=out.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+    state0 = out.get("status_type_state", pd.Series("", index=out.index)).astype(str).str.lower()
+    detail0 = out.get("status_type_short_detail", pd.Series("", index=out.index)).astype(str)
+    replace_mask = hs0.isna() | aw0.isna() | ((hs0 == 0) & (aw0 == 0) & ~completed0 & ~state0.isin(["post", "postgame", "final"]) & ~detail0.str.contains("Final", case=False, na=False))
+
+    if "game_id" in out.columns:
+        out["game_id"] = out["game_id"].astype(str)
+        tmp = out.merge(
+            patch[[
+                "game_id", "home_score", "away_score", "final_score",
+                "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"
+            ]],
+            on="game_id",
+            how="left",
+            suffixes=("", "_espn"),
+        )
+        gid_hit = (
+            tmp.get("home_score_espn", pd.Series(np.nan, index=tmp.index)).notna() |
+            tmp.get("away_score_espn", pd.Series(np.nan, index=tmp.index)).notna() |
+            tmp.get("final_score_espn", pd.Series("", index=tmp.index)).astype(str).str.strip().ne("")
+        )
+        use_gid = replace_mask & gid_hit
+        if use_gid.any():
+            for c in ["home_score", "away_score", "final_score", "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"]:
+                ce = f"{c}_espn"
+                if ce in tmp.columns:
+                    out.loc[use_gid, c] = tmp.loc[use_gid, ce].values
+
+    still_missing = pd.to_numeric(out.get("home_score"), errors="coerce").isna() | pd.to_numeric(out.get("away_score"), errors="coerce").isna()
+    if still_missing.any():
+        out["slate_date_et"] = pd.to_datetime(out.get("game_dt_et"), errors="coerce").dt.date
+        tmp = out.loc[still_missing].merge(
+            patch[[
+                "slate_date_et", "k_away", "k_home",
+                "home_score", "away_score", "final_score",
+                "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"
+            ]],
+            on=["slate_date_et", "k_away", "k_home"],
+            how="left",
+            suffixes=("", "_espn_match"),
+        )
+        hit = (
+            tmp.get("home_score_espn_match", pd.Series(np.nan, index=tmp.index)).notna() |
+            tmp.get("away_score_espn_match", pd.Series(np.nan, index=tmp.index)).notna() |
+            tmp.get("final_score_espn_match", pd.Series("", index=tmp.index)).astype(str).str.strip().ne("")
+        )
+        if hit.any():
+            hit_idx = out.loc[still_missing].index[hit.values]
+            for c in ["home_score", "away_score", "final_score", "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"]:
+                ce = f"{c}_espn_match"
+                if ce in tmp.columns:
+                    out.loc[hit_idx, c] = tmp.loc[hit, ce].values
+
+    out = out.drop(columns=["slate_date_et"], errors="ignore")
     return out
 
 # ============================================================
@@ -5329,7 +5573,6 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
         "pick_conf": "Confidence",
         "p_home_win": "Home Win%",
         "winner_pick": "ML Pick",
-        "spread_pick": "Spread Pick",
         "rw_total": "Total",
         "home_injury_impact": "Home Inj",
         "away_injury_impact": "Away Inj",
@@ -5338,7 +5581,7 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     final_order = [
         "game_dt_et", "away_team", "home_team",
         "pick_conf", "p_home_win",
-        "Model Spread", "winner_pick", "spread_pick",
+        "Model Spread", "winner_pick",
         "Vegas Spread", "Vegas ML",
         "Final", "Pred_vs_Final",
         "rw_total",
