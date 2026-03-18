@@ -87,6 +87,7 @@ import pandas as pd
 import xgboost as xgb
 import lightgbm as lgb
 import ipywidgets as widgets
+import plotly.io as pio
 
 from IPython.display import display, HTML, clear_output, Javascript
 from sklearn.impute import SimpleImputer
@@ -95,6 +96,10 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
+try:
+    pio.renderers.default = "notebook_connected"
+except Exception:
+    pass
 
 # ============================================================
 # CELL 2: CONFIG — All paths live here
@@ -5686,6 +5691,120 @@ def _matchup_num(v):
     return pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
 
 
+def _display_plotly_figure(fig):
+    try:
+        display(fig)
+    except Exception:
+        display(HTML(pio.to_html(fig, full_html=False, include_plotlyjs="cdn")))
+
+
+def _elo_asof_value(team_id, date_et):
+    if "elo_snap" not in globals() or elo_snap is None or len(elo_snap) == 0:
+        return np.nan
+    e = elo_snap.copy()
+    e["team_id"] = pd.to_numeric(e.get("team_id"), errors="coerce")
+    e["game_dt_et"] = pd.to_datetime(e.get("game_dt_et"), errors="coerce")
+    e = e.dropna(subset=["team_id", "game_dt_et", "elo_after"]).copy()
+    if len(e) == 0:
+        return np.nan
+    cutoff = pd.Timestamp(date_et) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    e = e[(e["team_id"] == int(team_id)) & (e["game_dt_et"] <= cutoff)].copy()
+    if len(e) == 0:
+        return np.nan
+    return float(pd.to_numeric(e.sort_values("game_dt_et").iloc[-1].get("elo_after"), errors="coerce"))
+
+
+def _render_model_edge_breakdown(team_a_id, team_b_id, team_a_name, team_b_name, snap_a, snap_b, date_et):
+    try:
+        pred = _predict_neutral_matchup(
+            {"team_id": int(team_a_id), "team_name": team_a_name},
+            {"team_id": int(team_b_id), "team_name": team_b_name},
+            date_et,
+        )
+        favored = "A" if float(pred.get("p_team_a_win", 0.5)) >= 0.5 else "B"
+        favored_name = team_a_name if favored == "A" else team_b_name
+        favored_prob = float(pred.get("p_team_a_win", 0.5)) if favored == "A" else float(pred.get("p_team_b_win", 0.5))
+        pred_margin = float(pred.get("pred_margin_team_a", 0.0))
+        favored_margin = pred_margin if favored == "A" else -pred_margin
+    except Exception:
+        favored = "A"
+        favored_name = team_a_name
+        favored_prob = np.nan
+        favored_margin = np.nan
+
+    injury_map = {}
+    try:
+        inj = _load_injury_impact_for_date(date_et, INJURY_DIR)
+        if inj is not None and len(inj) > 0 and "team_canon" in inj.columns and "injury_impact_score" in inj.columns:
+            injury_map = (
+                inj[["team_canon", "injury_impact_score"]]
+                .dropna(subset=["team_canon"])
+                .drop_duplicates(subset=["team_canon"], keep="last")
+                .set_index("team_canon")["injury_impact_score"]
+                .to_dict()
+            )
+    except Exception:
+        injury_map = {}
+
+    team_a_canon = canonical_team(team_a_name)
+    team_b_canon = canonical_team(team_b_name)
+
+    metric_specs = [
+        {"label": "Shooting efficiency", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_field_goal_pct")), "b": _matchup_num(snap_b.get("r10_mean_field_goal_pct")), "weight": 1.35, "fmt": "{:+.1f}% FG"},
+        {"label": "3-point shooting", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_three_point_field_goal_pct")), "b": _matchup_num(snap_b.get("r10_mean_three_point_field_goal_pct")), "weight": 1.15, "fmt": "{:+.1f}% 3PT"},
+        {"label": "Free-throw shooting", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_free_throw_pct")), "b": _matchup_num(snap_b.get("r10_mean_free_throw_pct")), "weight": 0.75, "fmt": "{:+.1f}% FT"},
+        {"label": "Scoring output", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_points_for")), "b": _matchup_num(snap_b.get("r10_mean_points_for")), "weight": 1.05, "fmt": "{:+.1f} pts"},
+        {"label": "Defense", "kind": "lower", "a": _matchup_num(snap_a.get("r10_mean_points_against")), "b": _matchup_num(snap_b.get("r10_mean_points_against")), "weight": 1.30, "fmt": "{:+.1f} pts allowed"},
+        {"label": "Point differential", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_point_diff")), "b": _matchup_num(snap_b.get("r10_mean_point_diff")), "weight": 1.45, "fmt": "{:+.1f} diff"},
+        {"label": "Turnover edge", "kind": "lower", "a": _matchup_num(snap_a.get("r10_mean_turnovers")), "b": _matchup_num(snap_b.get("r10_mean_turnovers")), "weight": 1.00, "fmt": "{:+.1f} TO"},
+        {"label": "Rebounding", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_total_rebounds")), "b": _matchup_num(snap_b.get("r10_mean_total_rebounds")), "weight": 0.70, "fmt": "{:+.1f} reb"},
+        {"label": "Offensive rebounding", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_offensive_rebounds")), "b": _matchup_num(snap_b.get("r10_mean_offensive_rebounds")), "weight": 0.60, "fmt": "{:+.1f} OReb"},
+        {"label": "Steals", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_steals")), "b": _matchup_num(snap_b.get("r10_mean_steals")), "weight": 0.55, "fmt": "{:+.1f} stl"},
+        {"label": "Blocks", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_blocks")), "b": _matchup_num(snap_b.get("r10_mean_blocks")), "weight": 0.45, "fmt": "{:+.1f} blk"},
+        {"label": "Rest advantage", "kind": "higher", "a": _matchup_num(snap_a.get("rest_days")), "b": _matchup_num(snap_b.get("rest_days")), "weight": 0.55, "fmt": "{:+.1f} days"},
+        {"label": "ELO rating", "kind": "higher", "a": _elo_asof_value(team_a_id, date_et), "b": _elo_asof_value(team_b_id, date_et), "weight": 0.018, "fmt": "{:+.0f} Elo"},
+        {"label": "Injury edge", "kind": "lower", "a": _matchup_num(injury_map.get(team_a_canon, 0.0)), "b": _matchup_num(injury_map.get(team_b_canon, 0.0)), "weight": 0.85, "fmt": "{:+.1f} injury load"},
+    ]
+
+    contributors = []
+    for spec in metric_specs:
+        a = _matchup_num(spec["a"])
+        b = _matchup_num(spec["b"])
+        if pd.isna(a) or pd.isna(b):
+            continue
+        delta_ab = float(a - b)
+        support_a = delta_ab if spec["kind"] == "higher" else -delta_ab
+        support_favored = support_a if favored == "A" else -support_a
+        if support_favored <= 0:
+            continue
+        favored_delta = delta_ab if favored == "A" else -delta_ab
+        contributors.append({
+            "label": spec["label"],
+            "weight": float(spec["weight"]),
+            "score": abs(float(support_favored)) * float(spec["weight"]),
+            "text": spec["fmt"].format(favored_delta),
+        })
+
+    contributors = sorted(contributors, key=lambda x: x["score"], reverse=True)[:5]
+    if contributors:
+        bullets = "".join(
+            f"<li style='margin:4px 0;'>+ {c['label']} ({c['text']})</li>"
+            for c in contributors
+        )
+    else:
+        bullets = "<li style='margin:4px 0;'>+ No strong single-feature edge; the matchup profiles are fairly balanced.</li>"
+
+    prob_text = "" if pd.isna(favored_prob) else f" <span style='color:#AAA;'>(Win prob: {100.0 * favored_prob:.1f}%, proj margin: {favored_margin:+.1f})</span>"
+    return (
+        "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
+        "background:#15191f; border-radius:8px;'>"
+        "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Model Edge Breakdown</div>"
+        f"<div style='color:#CFCFCF; margin-bottom:6px;'><b>{favored_name}</b> is favored mainly because of:{prob_text}</div>"
+        f"<ul style='color:#D7D7D7; margin:0 0 0 16px; padding:0;'>{bullets}</ul>"
+        "</div>"
+    )
+
+
 def _season_metric_normalize(metric_name, value, invert=False):
     value = _matchup_num(value)
     if pd.isna(value) or team_snaps is None or len(team_snaps) == 0:
@@ -5739,6 +5858,7 @@ matchup_date_picker = widgets.DatePicker(description="Slate (ET):")
 matchup_date_picker.value = date_picker.value
 compare_btn = widgets.Button(description="Compare", button_style="primary")
 matchup_out = widgets.Output()
+matchup_radar_out = widgets.Output(layout=widgets.Layout(width="100%", min_height="560px"))
 
 bracket_sim_n = widgets.IntText(description="Sims", value=1000)
 bracket_asof_date = widgets.DatePicker(description="As-of (ET):")
@@ -5813,45 +5933,98 @@ def render_matchup(_=None):
 
         display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Team Profile Comparison</div>"))
         display(HTML(df_to_html_table(pd.DataFrame(rows), max_rows=max(10, len(rows)))))
+        display(HTML(_render_model_edge_breakdown(
+            matchup_team_a.value,
+            matchup_team_b.value,
+            team_a_name,
+            team_b_name,
+            snap_a,
+            snap_b,
+            matchup_date_picker.value,
+        )))
+        display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Head-to-Head Radar</div>"))
+        display(matchup_radar_out)
 
+    with matchup_radar_out:
+        clear_output(wait=True)
         if radar_theta:
             try:
                 import plotly.graph_objects as go
-                import plotly.io as pio
 
-                fig = go.Figure()
-                fig.add_trace(go.Scatterpolar(
-                    r=radar_a + [radar_a[0]],
-                    theta=radar_theta + [radar_theta[0]],
-                    fill="toself",
-                    name=team_a_name,
-                ))
-                fig.add_trace(go.Scatterpolar(
-                    r=radar_b + [radar_b[0]],
-                    theta=radar_theta + [radar_theta[0]],
-                    fill="toself",
-                    name=team_b_name,
-                ))
-                fig.update_layout(
-                    title="Head-to-Head Radar",
-                    polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-                    showlegend=True,
-                    margin=dict(l=40, r=40, t=60, b=40),
-                    height=520,
-                )
-                pio.renderers.default = "notebook_connected"
-                try:
-                    fig_widget = go.FigureWidget(fig)
-                    display(fig_widget)
-                except Exception:
-                    display(HTML(pio.to_html(fig, full_html=False, include_plotlyjs=False)))
+                clean_theta = []
+                clean_a = []
+                clean_b = []
+                edge_vals = []
+                for theta, va, vb in zip(radar_theta, radar_a, radar_b):
+                    va = _matchup_num(va)
+                    vb = _matchup_num(vb)
+                    if pd.isna(va) or pd.isna(vb) or not np.isfinite(float(va)) or not np.isfinite(float(vb)):
+                        continue
+                    clean_theta.append(theta)
+                    clean_a.append(float(va))
+                    clean_b.append(float(vb))
+                    edge_vals.append(float(va) - float(vb))
+
+                if len(clean_theta) >= 3:
+                    edge_arr = np.asarray(edge_vals, dtype=float)
+                    mean_abs_edge = float(np.nanmean(np.abs(edge_arr))) if len(edge_arr) else 0.0
+                    edge_strength = float(np.clip(mean_abs_edge / 12.0, 0.0, 1.0))
+                    a_wins = int((edge_arr > 0).sum())
+                    b_wins = int((edge_arr < 0).sum())
+                    ties = int((edge_arr == 0).sum())
+                    a_fill = 0.16 + (0.18 * edge_strength)
+                    b_fill = 0.12 + (0.14 * edge_strength)
+                    a_color = f"rgba(46, 204, 113, {0.88 if a_wins >= b_wins else 0.68})"
+                    b_color = f"rgba(231, 76, 60, {0.88 if b_wins > a_wins else 0.68})"
+                    a_fill_color = f"rgba(46, 204, 113, {a_fill:.3f})"
+                    b_fill_color = f"rgba(231, 76, 60, {b_fill:.3f})"
+
+                    display(HTML(
+                        "<div style='margin:0 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
+                        "background:#15191f; border-radius:8px;'>"
+                        "<div style='color:#EEE; font-weight:700; margin-bottom:4px;'>Edge Summary</div>"
+                        f"<div style='color:#CFCFCF;'>{team_a_name}: <b>{a_wins}</b> metrics"
+                        f" &nbsp;|&nbsp; {team_b_name}: <b>{b_wins}</b> metrics"
+                        f"{'' if not ties else f' &nbsp;|&nbsp; Ties: <b>{ties}</b>'}"
+                        f" &nbsp;|&nbsp; Avg edge magnitude: <b>{mean_abs_edge:.1f}</b></div>"
+                        "</div>"
+                    ))
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatterpolar(
+                        r=clean_a + [clean_a[0]],
+                        theta=clean_theta + [clean_theta[0]],
+                        fill="toself",
+                        name=team_a_name,
+                        line=dict(color=a_color, width=3),
+                        fillcolor=a_fill_color,
+                    ))
+                    fig.add_trace(go.Scatterpolar(
+                        r=clean_b + [clean_b[0]],
+                        theta=clean_theta + [clean_theta[0]],
+                        fill="toself",
+                        name=team_b_name,
+                        line=dict(color=b_color, width=3),
+                        fillcolor=b_fill_color,
+                    ))
+                    fig.update_layout(
+                        title="Head-to-Head Radar",
+                        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                        showlegend=True,
+                        margin=dict(l=40, r=40, t=60, b=40),
+                        height=520,
+                    )
+                    _display_plotly_figure(fig)
+                else:
+                    display(HTML("<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Not enough matchup metrics are available to draw a radar chart.</div>"))
             except ImportError:
-                display(HTML("<div style='color:#AAA; margin:8px 0;'>Plotly is not available, so the radar chart could not be rendered.</div>"))
+                display(HTML("<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Plotly is not available, so the radar chart could not be rendered.</div>"))
             except Exception as e:
-                display(HTML(f"<div style='color:#AAA; margin:8px 0;'>Radar chart rendering failed: {e}</div>"))
+                display(HTML(f"<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Radar chart rendering failed: {e}</div>"))
         else:
-            display(HTML("<div style='color:#AAA; margin:8px 0;'>Not enough matchup metrics are available to draw a radar chart.</div>"))
+            display(HTML("<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Not enough matchup metrics are available to draw a radar chart.</div>"))
 
+    with matchup_out:
         try:
             if LAST_BOARD is not None and LAST_DATE == matchup_date_picker.value:
                 board = LAST_BOARD.copy()
