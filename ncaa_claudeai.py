@@ -3265,6 +3265,9 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
     need_data = force_data or _hours_since(meta.get("last_data_refresh")) >= RETRAIN_DATA_HOURS
     need_model = force_model or _days_since(meta.get("last_model_fit")) >= RETRAIN_MODEL_DAYS
+    training_rows = 0
+    injury_cols_in_dataset = []
+    injury_cols_in_features = []
 
     if need_data:
         print(f"Data refresh triggered (last: {meta.get('last_data_refresh', 'never')})")
@@ -3333,7 +3336,10 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             elo_df=elo_snap,
         )
         dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
-        print(f"  Training rows: {len(dataset_all):,}")
+        training_rows = int(len(dataset_all))
+        injury_cols_in_dataset = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in dataset_all.columns]
+        print(f"  Training rows: {training_rows:,}")
+        print(f"  Injury columns in dataset: {injury_cols_in_dataset if injury_cols_in_dataset else 'none'}")
 
         spread_booster, winner_booster, lgb_spread, iso, imp, diff_cols2, feature_cols =             train_models(dataset_all, CURRENT_SEASON)
 
@@ -3341,13 +3347,22 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
         save_models(spread_booster, winner_booster, lgb_spread, iso, imp, MODEL_DIR)
         spread_booster, winner_booster, lgb_spread, iso, imp = load_models(MODEL_DIR)
+        injury_cols_in_features = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in list(feature_cols or [])]
         meta["last_model_fit"] = now_str
         meta["feature_cols"] = feature_cols
         meta["training_input_signature"] = current_training_sig
         meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
-        for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE"]:
+        for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE", "_BRACKET_MATCHUP_CACHE"]:
             globals().get(cache_name, {}).clear()
+        if "LAST_BOARD" in globals():
+            globals()["LAST_BOARD"] = None
+        if "LAST_DATE" in globals():
+            globals()["LAST_DATE"] = None
+        if "HC_REPORT_CACHE" in globals():
+            globals()["HC_REPORT_CACHE"] = None
+        if "HC_REPORT_DATE" in globals():
+            globals()["HC_REPORT_DATE"] = None
         print("Model retrain complete")
     else:
         print(f"Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
@@ -3358,6 +3373,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             diff_cols2 = meta_cols
             diff_cols = [c for c in meta_cols if not c.endswith("__na")]
             feature_cols = meta_cols
+            injury_cols_in_features = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in list(feature_cols or [])]
             _save_metadata(meta)
         except Exception as e:
             print(f"Could not load saved models ({e}). Triggering fresh model train...")
@@ -3379,6 +3395,10 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         "model_refresh_action": meta.get("last_model_refresh_action", "unknown"),
         "last_data_refresh": meta.get("last_data_refresh", ""),
         "last_model_fit": meta.get("last_model_fit", ""),
+        "training_rows": training_rows,
+        "injury_cols_in_dataset": injury_cols_in_dataset,
+        "injury_cols_in_features": injury_cols_in_features,
+        "training_input_signature": current_training_sig,
     }
 
 # ============================================================
@@ -8583,10 +8603,23 @@ def force_retrain_clicked(_=None):
         display(HTML("<div style='color:#FFD700;'>Starting force retrain...</div>"))
         try:
             result = check_and_retrain(force_data=True, force_model=True)
+            training_rows = int((result or {}).get("training_rows", 0) or 0)
+            injury_cols_in_features = list((result or {}).get("injury_cols_in_features", []) or [])
+            injury_cols_in_dataset = list((result or {}).get("injury_cols_in_dataset", []) or [])
+            sig = str((result or {}).get("training_input_signature", "") or "")
             display(HTML(
                 "<div style='color:#9FD89F; padding:6px 0;'>"
                 f"Force retrain completed. Data refresh: <b>{html.escape(str((result or {}).get('data_refresh_action', 'unknown')))}</b>"
                 f" | Model refresh: <b>{html.escape(str((result or {}).get('model_refresh_action', 'unknown')))}</b>"
+                "</div>"
+            ))
+            display(HTML(
+                "<div style='color:#bbb; padding:2px 0 8px 0;'>"
+                f"Training rows: <b>{training_rows:,}</b><br>"
+                f"Injury columns in training dataset: <b>{html.escape(', '.join(injury_cols_in_dataset) if injury_cols_in_dataset else 'none')}</b><br>"
+                f"Injury columns in final trained feature set: <b>{html.escape(', '.join(injury_cols_in_features) if injury_cols_in_features else 'none')}</b><br>"
+                f"Saved model timestamp: <b>{html.escape(str((result or {}).get('last_model_fit', 'unknown')))}</b><br>"
+                f"Feature signature: <b>{html.escape(sig)}</b>"
                 "</div>"
             ))
         except Exception as e:
