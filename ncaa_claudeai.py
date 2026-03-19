@@ -6943,6 +6943,69 @@ def _render_model_edge_breakdown(team_a_id, team_b_id, team_a_name, team_b_name,
     )
 
 
+def _render_matchup_injury_summary_html(team_a_name, team_b_name, date_et) -> str:
+    try:
+        inj = _load_injury_impact_for_date(date_et, INJURY_DIR)
+    except Exception:
+        inj = pd.DataFrame()
+
+    if inj is None or len(inj) == 0 or "team_canon" not in inj.columns:
+        return (
+            "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
+            "background:#15191f; border-radius:8px;'>"
+            "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Injury Summary</div>"
+            "<div style='color:#AAA;'>No injury data available for one or both teams.</div>"
+            "</div>"
+        )
+
+    team_a_canon = canonical_team(team_a_name)
+    team_b_canon = canonical_team(team_b_name)
+    cols = [c for c in ["team_canon", "injury_impact_score", "injury_count_out", "injury_count_q"] if c in inj.columns]
+    work = inj[cols].copy().drop_duplicates(subset=["team_canon"], keep="last").set_index("team_canon")
+
+    a_impact = _matchup_num(work["injury_impact_score"].get(team_a_canon)) if "injury_impact_score" in work.columns else np.nan
+    b_impact = _matchup_num(work["injury_impact_score"].get(team_b_canon)) if "injury_impact_score" in work.columns else np.nan
+    a_out = _matchup_num(work["injury_count_out"].get(team_a_canon)) if "injury_count_out" in work.columns else np.nan
+    b_out = _matchup_num(work["injury_count_out"].get(team_b_canon)) if "injury_count_out" in work.columns else np.nan
+
+    if pd.isna(a_impact) and pd.isna(b_impact) and pd.isna(a_out) and pd.isna(b_out):
+        return (
+            "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
+            "background:#15191f; border-radius:8px;'>"
+            "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Injury Summary</div>"
+            "<div style='color:#AAA;'>No injury data available for one or both teams.</div>"
+            "</div>"
+        )
+
+    edge_line = ""
+    if pd.notna(a_impact) and pd.notna(b_impact):
+        diff = float(b_impact) - float(a_impact)
+        if abs(diff) < 1e-9:
+            edge_line = "<div style='color:#CFCFCF; margin-top:6px;'>Injury Edge: Even</div>"
+        elif diff > 0:
+            edge_line = f"<div style='color:#CFCFCF; margin-top:6px;'>Injury Edge: {team_a_name} healthier by <b>{diff:.1f}</b></div>"
+        else:
+            edge_line = f"<div style='color:#CFCFCF; margin-top:6px;'>Injury Edge: {team_b_name} healthier by <b>{abs(diff):.1f}</b></div>"
+
+    def _fmt_impact(v):
+        return "—" if pd.isna(v) else f"{float(v):.1f}"
+
+    def _fmt_out(v):
+        return "—" if pd.isna(v) else str(int(round(float(v))))
+
+    return (
+        "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
+        "background:#15191f; border-radius:8px;'>"
+        "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Injury Summary</div>"
+        f"<div style='color:#CFCFCF;'>{team_a_name}: <b>{_fmt_impact(a_impact)}</b> impact"
+        f" &nbsp;|&nbsp; Out: <b>{_fmt_out(a_out)}</b></div>"
+        f"<div style='color:#CFCFCF; margin-top:4px;'>{team_b_name}: <b>{_fmt_impact(b_impact)}</b> impact"
+        f" &nbsp;|&nbsp; Out: <b>{_fmt_out(b_out)}</b></div>"
+        f"{edge_line}"
+        "</div>"
+    )
+
+
 def _season_metric_normalize(metric_name, value, invert=False):
     value = _matchup_num(value)
     if pd.isna(value) or team_snaps is None or len(team_snaps) == 0:
@@ -7314,6 +7377,11 @@ def render_matchup(_=None):
             team_b_name,
             snap_a,
             snap_b,
+            matchup_date_picker.value,
+        )))
+        display(HTML(_render_matchup_injury_summary_html(
+            team_a_name,
+            team_b_name,
             matchup_date_picker.value,
         )))
 
