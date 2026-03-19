@@ -113,7 +113,7 @@ else:
     BASE_DIR = os.environ.get("NCAABB_BASE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "NCAABB")
 RAW_DIR         = os.path.join(BASE_DIR, "raw_hoopr_parquets")
 ROTOWIRE_DIR    = "/content/drive/MyDrive/NCAABB/roto-odds" if IN_COLAB else (os.environ.get("NCAABB_ROTOWIRE_DIR") or r"G:\My Drive\NCAABB\roto-odds")
-INJURY_DIR      = os.path.join(BASE_DIR, "cbb-injuries")
+INJURY_DIR      = "/content/drive/MyDrive/NCAABB/cbb-injuries" if IN_COLAB else (os.environ.get("NCAABB_INJURY_DIR") or r"G:\My Drive\NCAABB\cbb-injuries")
 MODEL_DIR       = os.path.join(BASE_DIR, "models")
 METADATA_PATH   = os.path.join(MODEL_DIR, "retrain_metadata.json")
 TEAM_BOX_DIR    = os.path.join(RAW_DIR, "team_box")
@@ -543,29 +543,29 @@ def find_injury_files_for_date(date_et, injury_dir: str) -> list:
       college-basketball-injury-report-MMDD.xlsx / .csv
       cbb-injuries-MMDD.xlsx / .csv
       cbb-injuries-YYYY-MM-DD.xlsx / .csv
-    Returns files sorted: base first, then a/b/c suffix updates.
+    Returns matching files sorted by newest modified time first.
     """
     d = pd.Timestamp(date_et).date()
     mmdd     = f"{d.month:02d}{d.day:02d}"
     yyyymmdd = f"{d.year}-{d.month:02d}-{d.day:02d}"
 
     patterns = [
-        re.compile(rf"college-basketball-injury-report-{mmdd}([a-z]?)\.(xlsx|csv)$", re.IGNORECASE),
-        re.compile(rf"cbb-injuries-{mmdd}([a-z]?)\.(xlsx|csv)$", re.IGNORECASE),
-        re.compile(rf"cbb-injuries-{yyyymmdd}([a-z]?)\.(xlsx|csv)$", re.IGNORECASE),
+        re.compile(rf"^college-basketball-injury-report-{mmdd}\.(xlsx|csv)$", re.IGNORECASE),
+        re.compile(rf"^cbb-injuries-{mmdd}\.(xlsx|csv)$", re.IGNORECASE),
+        re.compile(rf"^cbb-injuries-{yyyymmdd}\.(xlsx|csv)$", re.IGNORECASE),
     ]
 
     hits = []
     for f in glob.glob(os.path.join(injury_dir, "*")):
         bn = os.path.basename(f)
-        for pat in patterns:
-            m = pat.search(bn)
-            if m:
-                suffix = (m.group(1) or "").lower()
-                hits.append((suffix, f))
-                break
+        if any(pat.search(bn) for pat in patterns):
+            try:
+                mtime = os.path.getmtime(f)
+            except OSError:
+                mtime = 0.0
+            hits.append((mtime, f))
 
-    hits.sort(key=lambda x: (x[0] != "", x[0]))  # base first, then a, b, c...
+    hits.sort(key=lambda x: (x[0], os.path.basename(x[1]).lower()), reverse=True)
     return [f for _, f in hits]
 
 
@@ -5595,6 +5595,7 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
     schedule_max = None
     team_box_max = None
     rw_rows = 0
+    injury_file_used = "NONE"
 
     try:
         s = schedule_df.copy()
@@ -5618,6 +5619,14 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
         if board is not None:
             gid = board.get("game_id", pd.Series(index=board.index, dtype=object)).astype(str)
             rw_rows = int(gid.str.startswith("RW_").sum())
+    except:
+        pass
+
+    try:
+        if selected_date is not None:
+            injury_files = find_injury_files_for_date(selected_date, INJURY_DIR)
+            if injury_files:
+                injury_file_used = os.path.basename(injury_files[-1])
     except:
         pass
 
@@ -5679,6 +5688,7 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
     ">
     Schedule data through: {schedule_max}<br>
     Team box data through: {team_box_max}<br>
+    Injury file used: {injury_file_used}<br>
     Rotowire fallback rows: {rw_rows}
     </div>
     """
