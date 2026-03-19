@@ -6189,17 +6189,23 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
 
         def _col(txt, res):
             if res == "W":
-                return f"<span style='color:#2ECC71;font-weight:800;'>{txt}</span>"
+                return f"<span style='color:#2ECC71;'>{txt}</span>"
             if res == "L":
-                return f"<span style='color:#FF6B6B;font-weight:800;'>{txt}</span>"
+                return f"<span style='color:#FF6B6B;'>{txt}</span>"
             if res == "P":
-                return f"<span style='color:#FFD166;font-weight:800;'>{txt}</span>"
+                return f"<span style='color:#FFD166;'>{txt}</span>"
             return txt
 
         b["Model Spread"] = [_col(t, r) for t, r in zip(model_txt, b["Pred_vs_Final"])]
     else:
         b["Model Spread"] = ""
         b["Pred_vs_Final"] = ""
+
+    if {"winner_pick", "Pred_vs_Final"}.issubset(b.columns):
+        b["winner_pick"] = [
+            f"<span style='color:#2ECC71;font-weight:800;'>{txt}</span>" if res == "W" else txt
+            for txt, res in zip(b["winner_pick"], b["Pred_vs_Final"])
+        ]
 
     finals = []
     if all(c in b.columns for c in ["home_score", "away_score"]):
