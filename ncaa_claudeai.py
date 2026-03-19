@@ -1689,8 +1689,8 @@ def _fill_tbd_schedule_from_rotowire(
     rw["away_team"] = _safe_team_text_col(
         rw, ["away_team", "away_short_display_name", "away_display_name", "away_name"], default="TBD"
     ).astype(str).str.strip()
-    bad_home = rw["home_team"].map(_bad_team_name).astype(bool)
-    bad_away = rw["away_team"].map(_bad_team_name).astype(bool)
+    bad_home = _normalize_bool_mask(rw["home_team"].map(_bad_team_name), label="bad_home", context="_fill_tbd_schedule_from_rotowire")
+    bad_away = _normalize_bool_mask(rw["away_team"].map(_bad_team_name), label="bad_away", context="_fill_tbd_schedule_from_rotowire")
     rw = rw[~(bad_home | bad_away)].copy()
     rw["home_canon"] = rw["home_team"].map(canonical_team)
     rw["away_canon"] = rw["away_team"].map(canonical_team)
@@ -3733,7 +3733,16 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     )
     merged["_rw_id_exact_match"] = False
     if {"home_id", "away_id"}.issubset(merged.columns) and {"home_id", "away_id"}.issubset(m.columns):
-        missing_mask = ~merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
+        has_rw_any = _normalize_bool_mask(
+            merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1),
+            label="has_rw_any",
+            context="_attach_rotowire_to_board",
+        )
+        missing_mask = _normalize_bool_mask(
+            ~has_rw_any,
+            label="missing_mask",
+            context="_attach_rotowire_to_board",
+        )
         if missing_mask.any():
             m_id = m.dropna(subset=["home_id", "away_id"]).copy()
             if len(m_id):
@@ -3777,7 +3786,11 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
                     if len(matched_fix):
                         merged.loc[matched_fix["_row_ix"], "_rw_id_exact_match"] = True
 
-    missing_rw = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
+    missing_rw = _normalize_bool_mask(
+        merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1),
+        label="missing_rw_has_odds",
+        context="_attach_rotowire_to_board",
+    )
     for _, row in merged.loc[~missing_rw].head(10).iterrows():
         _record_canonical_mismatch("rotowire_board_unmatched", {
             "date": str(pd.Timestamp(slate_date_et).date()),
@@ -3789,9 +3802,30 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
         })
 
     if "k_home_rw" in merged.columns:
-        same_home = merged["home_team"].map(canonical_team) == merged["k_home_rw"]
-        same_home = same_home | merged["_rw_id_exact_match"].fillna(False).astype(bool)
-        flip_mask = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1) & ~same_home
+        same_home = _normalize_bool_mask(
+            merged["home_team"].map(canonical_team) == merged["k_home_rw"],
+            label="same_home_compare",
+            context="_attach_rotowire_to_board",
+        )
+        same_home = _normalize_bool_mask(
+            same_home | _normalize_bool_mask(
+                merged["_rw_id_exact_match"],
+                label="rw_id_exact_match",
+                context="_attach_rotowire_to_board",
+            ),
+            label="same_home",
+            context="_attach_rotowire_to_board",
+        )
+        has_rw = _normalize_bool_mask(
+            merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1),
+            label="has_rw",
+            context="_attach_rotowire_to_board",
+        )
+        flip_mask = _normalize_bool_mask(
+            has_rw & (~same_home),
+            label="flip_mask",
+            context="_attach_rotowire_to_board",
+        )
         merged.loc[flip_mask, "rw_spread_home"] = -pd.to_numeric(merged.loc[flip_mask, "rw_spread_home"], errors="coerce")
         old_hml = merged["rw_home_ml"].copy()
         old_aml = merged["rw_away_ml"].copy()
@@ -3809,7 +3843,11 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     }
 
     merged = merged.drop(columns=["k_away","k_home","k_game","k_home_rw","k_away_rw","_rw_id_exact_match"], errors="ignore")
-    has_rw = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
+    has_rw = _normalize_bool_mask(
+        merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1),
+        label="has_rw_final",
+        context="_attach_rotowire_to_board",
+    )
     merged["rw_missing_reason"] = np.where(has_rw, "", "No RW odds in file")
     return merged
 
@@ -4884,7 +4922,29 @@ def attach_espn_scoreboard_finals_patch(board: pd.DataFrame, date_et) -> pd.Data
             for c in ["home_score", "away_score", "final_score", "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"]:
                 ce = f"{c}_espn"
                 if ce in tmp.columns:
-                    out.loc[use_gid, c] = tmp.loc[use_gid, ce].values
+                    src = tmp.loc[use_gid, ce]
+                    if len(src) == 0:
+                        continue
+
+                    src_num = pd.to_numeric(src, errors="coerce")
+                    src_all_nan = src.isna().all() if hasattr(src, "isna") else False
+                    src_num_all_nan = src_num.isna().all() if hasattr(src_num, "isna") else True
+                    if src_all_nan and src_num_all_nan:
+                        continue
+
+                    dest_is_bool = False
+                    if c in out.columns:
+                        try:
+                            dest_is_bool = pd.api.types.is_bool_dtype(out[c]) or str(out[c].dtype) == "boolean"
+                        except Exception:
+                            dest_is_bool = False
+
+                    if dest_is_bool:
+                        valid = src.notna()
+                        if valid.any():
+                            out.loc[out.index[use_gid][valid.values], c] = src.loc[valid].astype("boolean").values
+                    else:
+                        out.loc[use_gid, c] = src.values
 
     still_missing = pd.to_numeric(out.get("home_score"), errors="coerce").isna() | pd.to_numeric(out.get("away_score"), errors="coerce").isna()
     if still_missing.any():
@@ -4909,7 +4969,29 @@ def attach_espn_scoreboard_finals_patch(board: pd.DataFrame, date_et) -> pd.Data
             for c in ["home_score", "away_score", "final_score", "status_type_completed", "status_type_state", "status_type_name", "status_type_short_detail"]:
                 ce = f"{c}_espn_match"
                 if ce in tmp.columns:
-                    out.loc[hit_idx, c] = tmp.loc[hit, ce].values
+                    src = tmp.loc[hit, ce]
+                    if len(src) == 0:
+                        continue
+
+                    src_num = pd.to_numeric(src, errors="coerce")
+                    src_all_nan = src.isna().all() if hasattr(src, "isna") else False
+                    src_num_all_nan = src_num.isna().all() if hasattr(src_num, "isna") else True
+                    if src_all_nan and src_num_all_nan:
+                        continue
+
+                    dest_is_bool = False
+                    if c in out.columns:
+                        try:
+                            dest_is_bool = pd.api.types.is_bool_dtype(out[c]) or str(out[c].dtype) == "boolean"
+                        except Exception:
+                            dest_is_bool = False
+
+                    if dest_is_bool:
+                        valid = src.notna()
+                        if valid.any():
+                            out.loc[hit_idx[valid.values], c] = src.loc[valid].astype("boolean").values
+                    else:
+                        out.loc[hit_idx, c] = src.values
 
     out = out.drop(columns=["slate_date_et"], errors="ignore")
     return out
@@ -5594,6 +5676,43 @@ def _warning_html(title: str, items) -> str:
         f"<div style='background:#2a2111;border-left:4px solid #d9a441;padding:8px 10px;"
         f"color:#f2d28b;margin:0 0 8px 0;'><b>{title}</b><br>{body}</div>"
     )
+
+
+def _normalize_bool_mask(mask, label: str = "", context: str = "") -> pd.Series:
+    s = mask.copy() if isinstance(mask, pd.Series) else pd.Series(mask)
+    try:
+        _dashboard_log(
+            "bool_mask_debug",
+            function=context,
+            label=label,
+            stage="pre",
+            dtype=str(s.dtype),
+            has_na=bool(s.isna().any()) if hasattr(s, "isna") else False,
+            head=s.head(5).astype(object).tolist() if hasattr(s, "head") else list(s)[:5],
+        )
+    except Exception:
+        pass
+
+    if str(s.dtype) == "bool":
+        out = s.fillna(False).astype(bool)
+    elif str(s.dtype) == "boolean":
+        out = s.fillna(False).astype(bool)
+    else:
+        out = s.map(lambda v: False if pd.isna(v) else bool(v)).astype(bool)
+
+    try:
+        _dashboard_log(
+            "bool_mask_debug",
+            function=context,
+            label=label,
+            stage="post",
+            dtype=str(out.dtype),
+            has_na=bool(out.isna().any()),
+            head=out.head(5).astype(object).tolist(),
+        )
+    except Exception:
+        pass
+    return out
 
 
 def _safe_execute(section: str, fn):
