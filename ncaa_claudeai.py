@@ -2539,6 +2539,10 @@ def run_hoopr_refresh(
     Runs the user's hoopR -> parquet export pipeline in R.
     This updates schedule/team_box/etc before Python reloads them.
     """
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
     if seasons is None:
         seasons = list(range(2020, current_season + 1))
 
@@ -2556,22 +2560,6 @@ def run_hoopr_refresh(
         }
 
     os.makedirs(raw_dir, exist_ok=True)
-
-    r.assign("RAW_DIR", raw_dir)
-    r.assign("SEASONS", seasons)
-    r.assign("FORCE", force)
-    r.assign("CURRENT_SEASON", current_season)
-    r.assign("CHECK_CHANGES_FOR_CURRENT", check_changes_for_current)
-
-    r.assign("EXPORT_SCHEDULE", export["schedule"])
-    r.assign("EXPORT_TEAM_BOX", export["team_box"])
-    r.assign("EXPORT_PLAYER_BOX", export["player_box"])
-    r.assign("EXPORT_PBP", export["pbp"])
-    r.assign("EXPORT_TEAMS", export["teams"])
-    r.assign("EXPORT_STANDINGS", export["standings"])
-    r.assign("EXPORT_RANKINGS", export["rankings"])
-    r.assign("EXPORT_TEAM_STATS", export["team_stats"])
-    r.assign("EXPORT_PLAYER_STATS", export["player_stats"])
 
     r_code = r'''
     options(warn = -1)
@@ -2861,7 +2849,24 @@ def run_hoopr_refresh(
     cat("🧾 Manifest:", manifest_path, "\n")
     '''
 
-    r(r_code)
+    with suppress_r_console():
+        with localconverter(ro.default_converter + pandas2ri.converter):
+            ro.globalenv["RAW_DIR"] = raw_dir
+            ro.globalenv["SEASONS"] = seasons
+            ro.globalenv["FORCE"] = force
+            ro.globalenv["CURRENT_SEASON"] = current_season
+            ro.globalenv["CHECK_CHANGES_FOR_CURRENT"] = check_changes_for_current
+
+            ro.globalenv["EXPORT_SCHEDULE"] = export["schedule"]
+            ro.globalenv["EXPORT_TEAM_BOX"] = export["team_box"]
+            ro.globalenv["EXPORT_PLAYER_BOX"] = export["player_box"]
+            ro.globalenv["EXPORT_PBP"] = export["pbp"]
+            ro.globalenv["EXPORT_TEAMS"] = export["teams"]
+            ro.globalenv["EXPORT_STANDINGS"] = export["standings"]
+            ro.globalenv["EXPORT_RANKINGS"] = export["rankings"]
+            ro.globalenv["EXPORT_TEAM_STATS"] = export["team_stats"]
+            ro.globalenv["EXPORT_PLAYER_STATS"] = export["player_stats"]
+            ro.r(r_code)
 
 
 # ============================================================
@@ -3327,11 +3332,14 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         diff_cols = [c for c in diff_cols2 if not c.endswith("__na")]
 
         save_models(spread_booster, winner_booster, lgb_spread, iso, imp, MODEL_DIR)
+        spread_booster, winner_booster, lgb_spread, iso, imp = load_models(MODEL_DIR)
         meta["last_model_fit"] = now_str
         meta["feature_cols"] = feature_cols
         meta["training_input_signature"] = current_training_sig
         meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
+        for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE"]:
+            globals().get(cache_name, {}).clear()
         print("Model retrain complete")
     else:
         print(f"Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
@@ -3399,7 +3407,18 @@ def make_xgb_matrix(pregame: pd.DataFrame, booster, imp_ref=None) -> xgb.DMatrix
         X = pd.concat([X, flags], axis=1)
 
     if imp_ref is not None and base_diff:
-        X[base_diff] = imp_ref.transform(X[base_diff])
+        imp_cols = list(getattr(imp_ref, "feature_names_in_", base_diff))
+        for c in imp_cols:
+            if c not in X.columns:
+                X[c] = np.nan
+        X_imp = X.reindex(columns=imp_cols)
+        X_imp = pd.DataFrame(
+            imp_ref.transform(X_imp),
+            columns=imp_cols,
+            index=X.index,
+        )
+        for c in imp_cols:
+            X[c] = X_imp[c]
 
     X = X.reindex(columns=fnames, fill_value=0.0)
     if X.columns.duplicated().any():
@@ -3440,7 +3459,8 @@ def predict_slate(
 
     # LGB margin using same feature set
     fnames = list(spread_booster.feature_names)
-    X_lgb = model_pregame.reindex(columns=fnames, fill_value=0.0)
+    lgb_fnames = list(lgb_spread.feature_name()) if hasattr(lgb_spread, "feature_name") else fnames
+    X_lgb = model_pregame.reindex(columns=lgb_fnames or fnames, fill_value=0.0)
     lgb_margin = lgb_spread.predict(X_lgb.values)
 
     # Ensemble margin: weighted blend
@@ -4833,7 +4853,8 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
 
     g = board.copy()
     g["final_score"] = g.get("final_score", "").astype(str)
-    g = g[g["final_score"].str.strip().ne("")]
+    real_final_mask = g.apply(_is_real_final_row, axis=1)
+    g = g[real_final_mask & g["final_score"].str.strip().ne("")]
     if len(g) == 0:
         return {}
 
@@ -5075,7 +5096,8 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
 
     g = board.copy()
     g["final_score"] = g.get("final_score", "").astype(str)
-    g = g[g["final_score"].str.strip().ne("")]
+    real_final_mask = g.apply(_is_real_final_row, axis=1)
+    g = g[real_final_mask & g["final_score"].str.strip().ne("")]
     if len(g) == 0:
         return {
             "games_graded": 0,
@@ -5371,7 +5393,11 @@ def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
         raise RuntimeError("Models are not loaded yet. Run retrain/startup initialization first.")
     key = _board_cache_key(date_et)
     if not force_rebuild and key in BOARD_CACHE:
-        return BOARD_CACHE[key].copy(), True
+        board = BOARD_CACHE[key].copy()
+        if "home_injury_impact" not in board.columns or "away_injury_impact" not in board.columns:
+            board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
+            BOARD_CACHE[key] = board.copy()
+        return board, True
 
     board = build_board_for_date(
         date_et=date_et,
@@ -5386,6 +5412,8 @@ def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
         feature_cols=feature_cols,
         elo_snap=elo_snap,
     )
+    if board is not None and len(board) > 0 and ("home_injury_impact" not in board.columns or "away_injury_impact" not in board.columns):
+        board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
     if board is not None and len(board) > 0:
         board = _attach_rotowire_to_board(board, date_et)
     BOARD_CACHE[key] = board.copy() if board is not None else pd.DataFrame()
