@@ -889,6 +889,7 @@ def attach_injury_features_by_row_date(board: pd.DataFrame, injury_dir: str, dat
 
 RW_FIELDS = ["rw_away_ml", "rw_home_ml", "rw_spread_home", "rw_total"]
 ROTOWIRE_DATE_CACHE = {}
+ROTOWIRE_ATTACH_DEBUG = {}
 
 
 def _to_float(x):
@@ -3682,7 +3683,16 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     outb = outb.drop(columns=[c for c in rw_cols if c in outb.columns], errors="ignore")
 
     mkt = load_rotowire_all_for_date(slate_date_et, ROTOWIRE_DIR)
+    debug_date_key = str(pd.Timestamp(slate_date_et).date())
+    debug_files = [os.path.basename(f) for f in find_rotowire_files_for_date(slate_date_et, ROTOWIRE_DIR)]
+    target_key = "||".join(sorted([canonical_team("Howard Bison"), canonical_team("Michigan Wolverines")]))
     if mkt is None or len(mkt) == 0:
+        ROTOWIRE_ATTACH_DEBUG[debug_date_key] = {
+            "files": debug_files,
+            "raw_parsed_row": [],
+            "board_before_attach": [],
+            "board_after_attach": [],
+        }
         outb["rw_missing_reason"] = "No RW odds in file"
         return outb
 
@@ -3707,12 +3717,21 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
         m["home_id"] = np.nan
     b["k_game"] = b.apply(lambda r: "||".join(sorted([r["k_away"], r["k_home"]])), axis=1)
     m["k_game"] = m.apply(lambda r: "||".join(sorted([r["k_away"], r["k_home"]])), axis=1)
+
+    debug_raw = m.loc[m["k_game"].eq(target_key), [
+        c for c in ["away_team", "home_team", "rw_away_ml", "rw_home_ml", "rw_spread_home", "rw_total", "away_id", "home_id"] if c in m.columns
+    ]].copy()
+    debug_before = b.loc[b["k_game"].eq(target_key), [
+        c for c in ["away_team", "home_team", "away_id", "home_id", "k_away", "k_home"] if c in b.columns
+    ]].copy()
+
     m = m.drop_duplicates("k_game", keep="last")
 
     merged = b.merge(
-        m[["k_game","rw_spread_home","rw_home_ml","rw_away_ml","rw_total","k_home","k_away"]],
+        m[["k_game","rw_spread_home","rw_home_ml","rw_away_ml","rw_total","k_home","k_away","home_id","away_id"]],
         on="k_game", how="left", suffixes=("", "_rw")
     )
+    merged["_rw_id_exact_match"] = False
     if {"home_id", "away_id"}.issubset(merged.columns) and {"home_id", "away_id"}.issubset(m.columns):
         missing_mask = ~merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
         if missing_mask.any():
@@ -3732,7 +3751,7 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
                     left_valid_df["home_id"] = left_valid_df["home_id"].astype(int)
                     left_valid_df["away_id"] = left_valid_df["away_id"].astype(int)
                     fix = left_valid_df.merge(
-                        m_id[["home_id", "away_id", "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total"]],
+                        m_id[["home_id", "away_id", "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total", "k_home", "k_away"]],
                         on=["home_id", "away_id"],
                         how="left",
                         suffixes=("", "_id"),
@@ -3744,6 +3763,19 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
                                 merged.loc[fix["_row_ix"], c].notna(),
                                 fix[cid].values,
                             )
+                    if "k_home_id" in fix.columns:
+                        merged.loc[fix["_row_ix"], "k_home_rw"] = merged.loc[fix["_row_ix"], "k_home_rw"].where(
+                            merged.loc[fix["_row_ix"], "k_home_rw"].notna(),
+                            fix["k_home_id"].values,
+                        )
+                    if "k_away_id" in fix.columns:
+                        merged.loc[fix["_row_ix"], "k_away_rw"] = merged.loc[fix["_row_ix"], "k_away_rw"].where(
+                            merged.loc[fix["_row_ix"], "k_away_rw"].notna(),
+                            fix["k_away_id"].values,
+                        )
+                    matched_fix = fix[fix["rw_spread_home_id"].notna() | fix["rw_home_ml_id"].notna() | fix["rw_away_ml_id"].notna() | fix["rw_total_id"].notna()]
+                    if len(matched_fix):
+                        merged.loc[matched_fix["_row_ix"], "_rw_id_exact_match"] = True
 
     missing_rw = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
     for _, row in merged.loc[~missing_rw].head(10).iterrows():
@@ -3758,13 +3790,25 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
 
     if "k_home_rw" in merged.columns:
         same_home = merged["home_team"].map(canonical_team) == merged["k_home_rw"]
-        merged["rw_spread_home"] = np.where(same_home, merged["rw_spread_home"], -merged["rw_spread_home"])
+        same_home = same_home | merged["_rw_id_exact_match"].fillna(False).astype(bool)
+        flip_mask = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1) & ~same_home
+        merged.loc[flip_mask, "rw_spread_home"] = -pd.to_numeric(merged.loc[flip_mask, "rw_spread_home"], errors="coerce")
         old_hml = merged["rw_home_ml"].copy()
         old_aml = merged["rw_away_ml"].copy()
-        merged["rw_home_ml"] = np.where(same_home, old_hml, old_aml)
-        merged["rw_away_ml"] = np.where(same_home, old_aml, old_hml)
+        merged.loc[flip_mask, "rw_home_ml"] = old_aml.loc[flip_mask]
+        merged.loc[flip_mask, "rw_away_ml"] = old_hml.loc[flip_mask]
 
-    merged = merged.drop(columns=["k_away","k_home","k_game","k_home_rw","k_away_rw"], errors="ignore")
+    debug_after = merged.loc[merged["k_game"].eq(target_key), [
+        c for c in ["away_team", "home_team", "away_id", "home_id", "rw_away_ml", "rw_home_ml", "rw_spread_home", "rw_total", "k_away", "k_home", "k_away_rw", "k_home_rw", "_rw_id_exact_match"] if c in merged.columns
+    ]].copy()
+    ROTOWIRE_ATTACH_DEBUG[debug_date_key] = {
+        "files": debug_files,
+        "raw_parsed_row": debug_raw.to_dict("records"),
+        "board_before_attach": debug_before.to_dict("records"),
+        "board_after_attach": debug_after.to_dict("records"),
+    }
+
+    merged = merged.drop(columns=["k_away","k_home","k_game","k_home_rw","k_away_rw","_rw_id_exact_match"], errors="ignore")
     has_rw = merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1)
     merged["rw_missing_reason"] = np.where(has_rw, "", "No RW odds in file")
     return merged
