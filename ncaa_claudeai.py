@@ -543,30 +543,60 @@ def find_injury_files_for_date(date_et, injury_dir: str) -> list:
       college-basketball-injury-report-MMDD.xlsx / .csv
       cbb-injuries-MMDD.xlsx / .csv
       cbb-injuries-YYYY-MM-DD.xlsx / .csv
-    Returns matching files sorted by newest modified time first.
+    Returns matching files for the exact slate date when available.
+    If no exact file exists, falls back to the newest file whose encoded date
+    is on or before the selected slate date.
+    Files for the chosen date are returned sorted oldest->newest modified time
+    so downstream deduping keeps the latest update.
     """
-    d = pd.Timestamp(date_et).date()
-    mmdd     = f"{d.month:02d}{d.day:02d}"
-    yyyymmdd = f"{d.year}-{d.month:02d}-{d.day:02d}"
+    selected_date = pd.Timestamp(date_et).date()
 
-    patterns = [
-        re.compile(rf"^college-basketball-injury-report-{mmdd}\.(xlsx|csv)$", re.IGNORECASE),
-        re.compile(rf"^cbb-injuries-{mmdd}\.(xlsx|csv)$", re.IGNORECASE),
-        re.compile(rf"^cbb-injuries-{yyyymmdd}\.(xlsx|csv)$", re.IGNORECASE),
-    ]
+    def _parse_file_date(basename: str):
+        name = str(basename or "").strip()
+        m = re.match(r"^college-basketball-injury-report-(\d{4})(?:[a-z])?\.(xlsx|csv)$", name, re.IGNORECASE)
+        if m:
+            mmdd = m.group(1)
+            try:
+                return date(selected_date.year, int(mmdd[:2]), int(mmdd[2:]))
+            except Exception:
+                return None
 
-    hits = []
+        m = re.match(r"^cbb-injuries-(\d{4})(?:[a-z])?\.(xlsx|csv)$", name, re.IGNORECASE)
+        if m:
+            mmdd = m.group(1)
+            try:
+                return date(selected_date.year, int(mmdd[:2]), int(mmdd[2:]))
+            except Exception:
+                return None
+
+        m = re.match(r"^cbb-injuries-(\d{4})-(\d{2})-(\d{2})(?:[a-z])?\.(xlsx|csv)$", name, re.IGNORECASE)
+        if m:
+            try:
+                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except Exception:
+                return None
+
+        return None
+
+    candidates = []
     for f in glob.glob(os.path.join(injury_dir, "*")):
         bn = os.path.basename(f)
-        if any(pat.search(bn) for pat in patterns):
-            try:
-                mtime = os.path.getmtime(f)
-            except OSError:
-                mtime = 0.0
-            hits.append((mtime, f))
+        file_date = _parse_file_date(bn)
+        if file_date is None or file_date > selected_date:
+            continue
+        try:
+            mtime = os.path.getmtime(f)
+        except OSError:
+            mtime = 0.0
+        candidates.append((file_date, mtime, f))
 
-    hits.sort(key=lambda x: (x[0], os.path.basename(x[1]).lower()), reverse=True)
-    return [f for _, f in hits]
+    if not candidates:
+        return []
+
+    exact = [row for row in candidates if row[0] == selected_date]
+    chosen = exact if exact else [row for row in candidates if row[0] == max(r[0] for r in candidates)]
+    chosen.sort(key=lambda x: (x[1], os.path.basename(x[2]).lower()))
+    return [f for _, _, f in chosen]
 
 
 def _injury_file_signature(files) -> tuple:
@@ -1857,80 +1887,77 @@ def build_pregame_dataset_for_slate(
                 tb["game_date_time"] = pd.to_datetime(tb["game_date_time"], errors="coerce", utc=True)
                 tb = tb.dropna(subset=["game_id", "game_date_time"]).copy()
                 tb["game_dt_et"] = tb["game_date_time"].dt.tz_convert("America/New_York").dt.tz_localize(None)
-                completed_ids = set(tb.loc[tb["game_dt_et"].dt.date == slate_date_et, "game_id"].astype(str))
-                if completed_ids:
-                    if slate is None or len(slate) == 0 or "game_id" not in slate.columns:
-                        slate = pd.DataFrame(columns=["game_id"])
-                    else:
-                        slate = slate[slate["game_id"].astype(str).isin(completed_ids)].copy()
-                    tb = tb[tb["game_id"].isin(completed_ids) & (tb["game_dt_et"].dt.date == slate_date_et)].copy()
-                    if len(tb) > 0:
-                        id_to_name = _build_id_team_name_map(schedule_df, team_snaps)
-                        def _pick_hist_team_name(row, suffix: str) -> str:
-                            display_name = str(row.get(f"team_display_name{suffix}", "")).strip()
-                            if not _bad_team_name(display_name):
-                                return display_name
+                tb = tb[tb["game_dt_et"].dt.date == slate_date_et].copy()
+                if len(tb) > 0:
+                    id_to_name = _build_id_team_name_map(schedule_df, team_snaps)
+                    def _pick_hist_team_name(row, suffix: str) -> str:
+                        display_name = str(row.get(f"team_display_name{suffix}", "")).strip()
+                        if not _bad_team_name(display_name):
+                            return display_name
 
-                            team_name = str(row.get(f"team_name{suffix}", "")).strip()
-                            if not _bad_team_name(team_name):
-                                return team_name
+                        team_name = str(row.get(f"team_name{suffix}", "")).strip()
+                        if not _bad_team_name(team_name):
+                            return team_name
 
-                            location = str(row.get(f"team_location{suffix}", "")).strip()
-                            mascot = str(row.get(f"team_mascot{suffix}", "")).strip()
-                            if not _bad_team_name(location) and not _bad_team_name(mascot):
-                                return f"{location} {mascot}".strip()
-                            if not _bad_team_name(location):
-                                return location
-                            if not _bad_team_name(mascot):
-                                return mascot
-                            return ""
+                        location = str(row.get(f"team_location{suffix}", "")).strip()
+                        mascot = str(row.get(f"team_mascot{suffix}", "")).strip()
+                        if not _bad_team_name(location) and not _bad_team_name(mascot):
+                            return f"{location} {mascot}".strip()
+                        if not _bad_team_name(location):
+                            return location
+                        if not _bad_team_name(mascot):
+                            return mascot
+                        return ""
 
-                        if "team_name" not in tb.columns:
-                            tb["team_name"] = np.nan
-                        tb["team_name"] = tb["team_name"].astype(str).str.strip()
+                    if "team_name" not in tb.columns:
+                        tb["team_name"] = np.nan
+                    tb["team_name"] = tb["team_name"].astype(str).str.strip()
 
-                        rows = []
-                        if "team_home_away" in tb.columns:
-                            home = tb[tb["team_home_away"].astype(str).str.lower().eq("home")].copy()
-                            away = tb[tb["team_home_away"].astype(str).str.lower().eq("away")].copy()
-                            if len(home) and len(away):
-                                home = home.sort_values(["game_dt_et", "game_id"]).drop_duplicates(["game_id"], keep="last")
-                                away = away.sort_values(["game_dt_et", "game_id"]).drop_duplicates(["game_id"], keep="last")
-                                merged_tb = home.merge(
-                                    away,
-                                    on="game_id",
-                                    how="inner",
-                                    suffixes=("_home", "_away"),
-                                )
-                                for _, r in merged_tb.iterrows():
-                                    home_name = _pick_hist_team_name(r, "_home")
-                                    away_name = _pick_hist_team_name(r, "_away")
-                                    home_id = pd.to_numeric(pd.Series([r.get("team_id_home")]), errors="coerce").iloc[0]
-                                    away_id = pd.to_numeric(pd.Series([r.get("team_id_away")]), errors="coerce").iloc[0]
-                                    if _bad_team_name(home_name) and pd.notna(home_id):
-                                        home_name = id_to_name.get(int(home_id), home_name)
-                                    if _bad_team_name(away_name) and pd.notna(away_id):
-                                        away_name = id_to_name.get(int(away_id), away_name)
-                                    rows.append({
-                                        "game_id": str(r["game_id"]),
-                                        "game_dt_et": r.get("game_dt_et_home", r.get("game_dt_et_away")),
-                                        "neutral_site": False,
-                                        "home_id": home_id,
-                                        "away_id": away_id,
-                                        "home_team": home_name if not _bad_team_name(home_name) else "TBD",
-                                        "away_team": away_name if not _bad_team_name(away_name) else "TBD",
-                                        "home_short_display_name": home_name if not _bad_team_name(home_name) else "TBD",
-                                        "away_short_display_name": away_name if not _bad_team_name(away_name) else "TBD",
-                                        "home_score": pd.to_numeric(pd.Series([r.get("team_score_home")]), errors="coerce").iloc[0],
-                                        "away_score": pd.to_numeric(pd.Series([r.get("team_score_away")]), errors="coerce").iloc[0],
-                                        "status_type_completed": True,
-                                        "status_type_state": "post",
-                                        "status_type_name": "STATUS_FINAL",
-                                        "status_type_short_detail": "Final",
-                                    })
+                    rows = []
+                    if "team_home_away" in tb.columns:
+                        home = tb[tb["team_home_away"].astype(str).str.lower().eq("home")].copy()
+                        away = tb[tb["team_home_away"].astype(str).str.lower().eq("away")].copy()
+                        if len(home) and len(away):
+                            home = home.sort_values(["game_dt_et", "game_id"]).drop_duplicates(["game_id"], keep="last")
+                            away = away.sort_values(["game_dt_et", "game_id"]).drop_duplicates(["game_id"], keep="last")
+                            merged_tb = home.merge(
+                                away,
+                                on="game_id",
+                                how="inner",
+                                suffixes=("_home", "_away"),
+                            )
+                            for _, r in merged_tb.iterrows():
+                                home_name = _pick_hist_team_name(r, "_home")
+                                away_name = _pick_hist_team_name(r, "_away")
+                                home_id = pd.to_numeric(pd.Series([r.get("team_id_home")]), errors="coerce").iloc[0]
+                                away_id = pd.to_numeric(pd.Series([r.get("team_id_away")]), errors="coerce").iloc[0]
+                                if _bad_team_name(home_name) and pd.notna(home_id):
+                                    home_name = id_to_name.get(int(home_id), home_name)
+                                if _bad_team_name(away_name) and pd.notna(away_id):
+                                    away_name = id_to_name.get(int(away_id), away_name)
+                                rows.append({
+                                    "game_id": str(r["game_id"]),
+                                    "game_dt_et": r.get("game_dt_et_home", r.get("game_dt_et_away")),
+                                    "neutral_site": False,
+                                    "home_id": home_id,
+                                    "away_id": away_id,
+                                    "home_team": home_name if not _bad_team_name(home_name) else "TBD",
+                                    "away_team": away_name if not _bad_team_name(away_name) else "TBD",
+                                    "home_short_display_name": home_name if not _bad_team_name(home_name) else "TBD",
+                                    "away_short_display_name": away_name if not _bad_team_name(away_name) else "TBD",
+                                    "home_score": pd.to_numeric(pd.Series([r.get("team_score_home")]), errors="coerce").iloc[0],
+                                    "away_score": pd.to_numeric(pd.Series([r.get("team_score_away")]), errors="coerce").iloc[0],
+                                    "status_type_completed": True,
+                                    "status_type_state": "post",
+                                    "status_type_name": "STATUS_FINAL",
+                                    "status_type_short_detail": "Final",
+                                })
 
-                        if rows:
-                            tb_slate = pd.DataFrame(rows).drop_duplicates(subset=["game_id"], keep="last")
+                    if rows:
+                        tb_slate = pd.DataFrame(rows).drop_duplicates(subset=["game_id"], keep="last")
+                        if slate is None or len(slate) == 0:
+                            slate = tb_slate.copy()
+                        else:
                             slate["game_id"] = slate["game_id"].astype(str)
                             if {"home_team", "away_team"}.issubset(slate.columns):
                                 bad_hist = (
@@ -3353,9 +3380,11 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         meta["last_model_fit"] = now_str
         meta["feature_cols"] = feature_cols
         meta["training_input_signature"] = current_training_sig
+        meta["last_training_rows"] = training_rows
+        meta["injury_feature_cols"] = injury_cols_in_features
         meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
-        for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE", "_BRACKET_MATCHUP_CACHE"]:
+        for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE", "FILTERED_BOARD_CACHE", "_BRACKET_MATCHUP_CACHE"]:
             globals().get(cache_name, {}).clear()
         if "LAST_BOARD" in globals():
             globals()["LAST_BOARD"] = None
@@ -3376,6 +3405,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             diff_cols = [c for c in meta_cols if not c.endswith("__na")]
             feature_cols = meta_cols
             injury_cols_in_features = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in list(feature_cols or [])]
+            meta["injury_feature_cols"] = injury_cols_in_features
             _save_metadata(meta)
         except Exception as e:
             print(f"Could not load saved models ({e}). Triggering fresh model train...")
@@ -4883,7 +4913,7 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
 
     g = board.copy()
     g["final_score"] = g.get("final_score", "").astype(str)
-    real_final_mask = g.apply(_is_real_final_row, axis=1)
+    real_final_mask = _real_final_mask(g)
     g = g[real_final_mask & g["final_score"].str.strip().ne("")]
     if len(g) == 0:
         return {}
@@ -5113,6 +5143,115 @@ def _combine_accuracy_dicts(acc_list: list) -> dict:
     }
 
 
+CONFIDENCE_BANDS = [
+    ("50-60%", 0.50, 0.60),
+    ("60-70%", 0.60, 0.70),
+    ("70-80%", 0.70, 0.80),
+    ("80-90%", 0.80, 0.90),
+    ("90%+", 0.90, 1.01),
+]
+
+
+def _compute_confidence_band_detailed(board: pd.DataFrame) -> list:
+    if board is None or len(board) == 0:
+        return []
+
+    g = board.copy()
+    g["pick_conf_num"] = pd.to_numeric(g.get("pick_conf", g.get("confidence")), errors="coerce")
+    g["home_score"] = pd.to_numeric(g.get("home_score"), errors="coerce")
+    g["away_score"] = pd.to_numeric(g.get("away_score"), errors="coerce")
+    g = g[_real_final_mask(g)].copy()
+    g = g.dropna(subset=["pick_conf_num", "home_score", "away_score"])
+    if len(g) == 0:
+        return []
+
+    g["actual_winner"] = np.where(
+        g["home_score"] > g["away_score"],
+        g["home_team"],
+        np.where(g["away_score"] > g["home_score"], g["away_team"], "PUSH")
+    )
+    g["winner_correct"] = False
+    if "winner_pick" in g.columns:
+        non_push = g["actual_winner"].astype(str).ne("PUSH")
+        g.loc[non_push, "winner_correct"] = (
+            g.loc[non_push, "winner_pick"].map(canonical_team) ==
+            g.loc[non_push, "actual_winner"].map(canonical_team)
+        )
+
+    g["ats_correct"] = np.nan
+    if {"pred_margin_home", "rw_spread_home"}.issubset(g.columns):
+        pm = pd.to_numeric(g["pred_margin_home"], errors="coerce")
+        rw = pd.to_numeric(g["rw_spread_home"], errors="coerce")
+        hma = g["home_score"] - g["away_score"]
+        edge = pm - rw
+        cover = hma + rw
+        ats_valid = pm.notna() & rw.notna() & hma.notna() & edge.ne(0) & cover.ne(0)
+        g.loc[ats_valid, "ats_correct"] = np.where(
+            edge[ats_valid] > 0,
+            cover[ats_valid] > 0,
+            cover[ats_valid] < 0,
+        ).astype(float)
+
+    out = []
+    for label, lo, hi in CONFIDENCE_BANDS:
+        if hi >= 1.0:
+            band = g[g["pick_conf_num"] >= lo].copy()
+        else:
+            band = g[(g["pick_conf_num"] >= lo) & (g["pick_conf_num"] < hi)].copy()
+        ats_vals = pd.to_numeric(band.get("ats_correct"), errors="coerce")
+        out.append({
+            "band": label,
+            "games": int(len(band)),
+            "avg_conf_sum": float(band["pick_conf_num"].sum()) if len(band) else 0.0,
+            "avg_conf_n": int(len(band)),
+            "winner_correct": int(pd.to_numeric(band.get("winner_correct"), errors="coerce").fillna(0).sum()) if len(band) else 0,
+            "winner_total": int((band["actual_winner"].astype(str) != "PUSH").sum()) if len(band) else 0,
+            "ats_correct": int(ats_vals.fillna(0).sum()) if ats_vals.notna().any() else 0,
+            "ats_total": int(ats_vals.notna().sum()),
+        })
+    return out
+
+
+def _combine_confidence_band_dicts(acc_list: list) -> list:
+    order = [label for label, _, _ in CONFIDENCE_BANDS]
+    bucketed = {
+        label: {
+            "band": label,
+            "games": 0,
+            "avg_conf_sum": 0.0,
+            "avg_conf_n": 0,
+            "winner_correct": 0,
+            "winner_total": 0,
+            "ats_correct": 0,
+            "ats_total": 0,
+        }
+        for label in order
+    }
+
+    for entry in acc_list:
+        for row in entry or []:
+            label = str(row.get("band", ""))
+            if label not in bucketed:
+                continue
+            dest = bucketed[label]
+            for key in ["games", "avg_conf_n", "winner_correct", "winner_total", "ats_correct", "ats_total"]:
+                dest[key] += int(row.get(key, 0) or 0)
+            dest["avg_conf_sum"] += float(row.get("avg_conf_sum", 0.0) or 0.0)
+
+    out = []
+    for label in order:
+        row = bucketed[label]
+        out.append({
+            "band": label,
+            "games": int(row["games"]),
+            "avg_conf": (float(row["avg_conf_sum"]) / float(row["avg_conf_n"])) if row["avg_conf_n"] > 0 else np.nan,
+            "winner_acc": _safe_pct_mean(row["winner_correct"], row["winner_total"]),
+            "ats_acc": _safe_pct_mean(row["ats_correct"], row["ats_total"]),
+            "ats_games": int(row["ats_total"]),
+        })
+    return out
+
+
 def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
     if board is None or len(board) == 0:
         return {
@@ -5126,7 +5265,7 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
 
     g = board.copy()
     g["final_score"] = g.get("final_score", "").astype(str)
-    real_final_mask = g.apply(_is_real_final_row, axis=1)
+    real_final_mask = _real_final_mask(g)
     g = g[real_final_mask & g["final_score"].str.strip().ne("")]
     if len(g) == 0:
         return {
@@ -5258,6 +5397,7 @@ def build_or_update_season_accuracy_cache():
         "margin_mae_sum", "margin_mae_n",
         "within5_correct", "within5_total",
         "ats_correct", "ats_total",
+        "confidence_bands",
     }
 
     cache = _load_season_acc_cache()
@@ -5317,6 +5457,7 @@ def build_or_update_season_accuracy_cache():
                 keep="last"
             )
             cache[wk] = compute_daily_accuracy_detailed(week_board)
+            cache[wk]["confidence_bands"] = _compute_confidence_band_detailed(week_board)
         else:
             cache[wk] = {
                 "games_graded": 0,
@@ -5325,6 +5466,7 @@ def build_or_update_season_accuracy_cache():
                 "margin_mae_sum": 0.0, "margin_mae_n": 0,
                 "within5_correct": 0, "within5_total": 0,
                 "ats_correct": 0, "ats_total": 0,
+                "confidence_bands": [],
             }
 
         updated = True
@@ -5344,6 +5486,15 @@ def load_cached_season_accuracy_snapshot() -> dict:
     acc_list = [cache[k] for k in week_keys]
     return _combine_accuracy_dicts(acc_list)
 
+
+def load_cached_confidence_calibration_snapshot() -> list:
+    cache = _load_season_acc_cache()
+    if not cache:
+        return []
+    week_keys = sorted(cache.keys())
+    acc_list = [cache.get(k, {}).get("confidence_bands", []) for k in week_keys]
+    return _combine_confidence_band_dicts(acc_list)
+
 """# DASHBOARD"""
 
 # @title
@@ -5359,6 +5510,7 @@ SEASON_ACC_DATE = None
 BOARD_CACHE = {}
 HC_FILTER_CACHE = {}
 MATCHUP_SNAPSHOT_CACHE = {}
+FILTERED_BOARD_CACHE = {}
 DASHBOARD_RUN_LOG = []
 DASHBOARD_LOG_PATH = os.path.join(BASE_DIR, "dashboard_runtime_log.jsonl")
 STARTUP_DIAGNOSTICS = {}
@@ -5416,6 +5568,18 @@ def _models_ready() -> bool:
 
 def _board_cache_key(date_et) -> tuple:
     return (str(pd.Timestamp(date_et).date()), _dashboard_runtime_signature())
+
+
+def _filter_cache_key(date_et) -> tuple:
+    return (
+        str(pd.Timestamp(date_et).date()),
+        round(float(min_conf.value), 6),
+        round(float(min_abs_margin.value), 6),
+        str(side_filter.value),
+        bool(neutral_only.value),
+        str(search_box.value).strip().lower(),
+        _dashboard_runtime_signature(),
+    )
 
 
 def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
@@ -5479,6 +5643,15 @@ def _get_high_confidence_cached(board: pd.DataFrame, date_et, threshold: float) 
         hc = hc.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
     HC_FILTER_CACHE[key] = hc.copy()
     return hc.copy(), False
+
+
+def _get_filtered_board_cached(board: pd.DataFrame, date_et) -> tuple:
+    key = _filter_cache_key(date_et)
+    if key in FILTERED_BOARD_CACHE:
+        return FILTERED_BOARD_CACHE[key].copy(), True
+    filtered = _apply_filters(board)
+    FILTERED_BOARD_CACHE[key] = filtered.copy()
+    return filtered.copy(), False
 
 
 def _get_matchup_snapshot_cached(board: pd.DataFrame, team_a_id: int, team_b_id: int, date_et) -> tuple:
@@ -5605,6 +5778,7 @@ search_box      = widgets.Text(description="Search", placeholder="team name...")
 max_rows        = widgets.IntSlider(description="Rows", min=10, max=300, step=10, value=80)
 
 out         = widgets.Output()
+status_note_html = widgets.HTML()
 season_banner_html = widgets.HTML()
 daily_banner_html = widgets.HTML()
 tournament_banner_html = widgets.HTML()
@@ -5630,6 +5804,103 @@ def _win_style(t):
 
 def _lose_style(t):
     return f"<span style='color:#FF6B6B;'>{t}</span>"
+
+
+def _render_compact_health_html(meta: dict, board=None, selected_date=None, injury_file_used: str = "NONE",
+                                schedule_max=None, team_box_max=None, rw_rows: int = 0, stale: bool = False) -> str:
+    feature_sig = str(meta.get("training_input_signature", "") or "")
+    if len(feature_sig) > 48:
+        feature_sig = feature_sig[:48] + "..."
+
+    active_features = list(globals().get("feature_cols", []) or meta.get("feature_cols", []) or [])
+    injury_included = all(c in active_features for c in ["diff_injury_impact", "diff_inj_out"])
+    training_rows = meta.get("last_training_rows", "")
+    training_rows_txt = f"{int(training_rows):,}" if str(training_rows).strip() not in {"", "None"} else "NA"
+
+    warnings = []
+    if not _models_ready():
+        warnings.append("models not loaded")
+    if injury_file_used == "NONE":
+        warnings.append("injury file missing")
+    if stale:
+        warnings.append("stale schedule/team box data")
+    if selected_date is not None and board is not None and len(board) == 0:
+        warnings.append("empty board for selected date")
+
+    warnings_html = ""
+    if warnings:
+        warnings_html = f"<div style='margin-top:6px;color:#d9a441;'>Warnings: {' | '.join(warnings)}</div>"
+
+    return f"""
+    <div style="
+        background:#111;
+        border-left:4px solid #555;
+        padding:8px;
+        font-size:12px;
+        color:#bbb;
+        margin-bottom:10px;
+    ">
+    Model ts: {meta.get("last_model_fit", "never")}<br>
+    Feature signature: {feature_sig or "NA"}<br>
+    Injury features active: {"YES" if injury_included else "NO"}<br>
+    Training rows: {training_rows_txt}<br>
+    Last data refresh: {meta.get("last_data_refresh", "never")}<br>
+    Last model action: {meta.get("last_model_refresh_action", "unknown")}<br>
+    Injury file found: {"YES" if injury_file_used != "NONE" else "NO"}<br>
+    Schedule through: {schedule_max}<br>
+    Team box through: {team_box_max}<br>
+    Odds fallback rows: {rw_rows}
+    {warnings_html}
+    </div>
+    """
+
+
+def _render_confidence_calibration_summary_html() -> str:
+    rows = load_cached_confidence_calibration_snapshot()
+    if not rows:
+        return ""
+
+    def _fmt_pct(v):
+        return "—" if v is None or pd.isna(v) else f"{100.0 * float(v):.1f}%"
+
+    html_rows = []
+    for row in rows:
+        html_rows.append(
+            "<tr>"
+            f"<td style='padding:4px 8px; border-bottom:1px solid #222;'>{row.get('band', '')}</td>"
+            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{int(row.get('games', 0) or 0)}</td>"
+            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{_fmt_pct(row.get('winner_acc'))}</td>"
+            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{_fmt_pct(row.get('ats_acc'))}</td>"
+            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{_fmt_pct(row.get('avg_conf'))}</td>"
+            "</tr>"
+        )
+
+    return """
+    <div style="
+        background:#111;
+        border-left:4px solid #555;
+        padding:8px;
+        font-size:12px;
+        color:#bbb;
+        margin-bottom:10px;
+    ">
+    <div style="color:#ddd; font-weight:700; margin-bottom:6px;">Confidence Calibration (Season to Date)</div>
+    <table style="border-collapse:collapse; width:100%; color:#bbb;">
+      <thead>
+        <tr style="color:#888;">
+          <th style="padding:4px 8px; text-align:left; border-bottom:1px solid #333;">Band</th>
+          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">Games</th>
+          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">Winner</th>
+          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">ATS</th>
+          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">Avg Conf</th>
+        </tr>
+      </thead>
+      <tbody>
+        """ + "".join(html_rows) + """
+      </tbody>
+    </table>
+    </div>
+    """
 
 
 def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
@@ -5734,7 +6005,20 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
     </div>
     """
 
-    return warning_html + info_html
+    meta = _load_metadata()
+    health_html = _render_compact_health_html(
+        meta=meta,
+        board=board,
+        selected_date=selected_date,
+        injury_file_used=injury_file_used,
+        schedule_max=schedule_max,
+        team_box_max=team_box_max,
+        rw_rows=rw_rows,
+        stale=stale,
+    )
+    calibration_html = _render_confidence_calibration_summary_html()
+
+    return warning_html + info_html + health_html + calibration_html
 
 
 def render_dashboard_banner(acc: dict, date_et=None, note: str = "") -> str:
@@ -5810,6 +6094,18 @@ def _is_real_final_row(row) -> bool:
     return completed or state_ok or detail_ok
 
 
+def _real_final_mask(df: pd.DataFrame) -> pd.Series:
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=bool)
+
+    hs = pd.to_numeric(df.get("home_score", pd.Series(np.nan, index=df.index)), errors="coerce")
+    aw = pd.to_numeric(df.get("away_score", pd.Series(np.nan, index=df.index)), errors="coerce")
+    completed = df.get("status_type_completed", pd.Series(False, index=df.index)).astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+    state_ok = df.get("status_type_state", pd.Series("", index=df.index)).astype(str).str.strip().str.lower().isin({"post", "postgame", "final"})
+    detail_ok = df.get("status_type_short_detail", pd.Series("", index=df.index)).astype(str).str.strip().str.lower().str.contains("final", na=False)
+    return hs.notna() & aw.notna() & (completed | state_ok | detail_ok)
+
+
 def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     b = board.copy()
 
@@ -5864,8 +6160,7 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
         pm = pd.to_numeric(b["pred_margin_home"], errors="coerce")
         hs = pd.to_numeric(b.get("home_score", pd.Series(np.nan, index=b.index)), errors="coerce")
         aw = pd.to_numeric(b.get("away_score", pd.Series(np.nan, index=b.index)), errors="coerce")
-
-        real_final_mask = b.apply(_is_real_final_row, axis=1)
+        real_final_mask = _real_final_mask(b)
         actual_margin = (hs - aw).where(real_final_mask, np.nan)
 
         def _pred_vs_final_spread(pred_margin, actual_margin):
@@ -5910,7 +6205,7 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     if all(c in b.columns for c in ["home_score", "away_score"]):
         hs = pd.to_numeric(b["home_score"], errors="coerce")
         aw = pd.to_numeric(b["away_score"], errors="coerce")
-        real_final_mask = b.apply(_is_real_final_row, axis=1)
+        real_final_mask = _real_final_mask(b)
 
         for ht, at, h, a, is_final in zip(b["home_team"], b["away_team"], hs, aw, real_final_mask):
             if not is_final or pd.isna(h) or pd.isna(a):
@@ -5987,9 +6282,6 @@ def render_two_level_banner(season_acc: dict = None, season_label: str = "", dai
     if daily_acc is not None:
         daily_html = render_accuracy_banner(daily_acc, date_et=daily_label)
 
-    if note:
-        daily_html += note
-
     return season_html, daily_html
 
 
@@ -6045,7 +6337,7 @@ def _current_dashboard_snapshot_html() -> str:
     rw_html = ""
 
     if LAST_BOARD is not None and len(LAST_BOARD) > 0:
-        b2 = _apply_filters(LAST_BOARD)
+        b2, _ = _get_filtered_board_cached(LAST_BOARD, LAST_DATE if LAST_DATE is not None else date_picker.value)
         table_html = render_predictions_table(b2, int(max_rows.value))
         if show_rw_missing.value:
             miss = LAST_BOARD[LAST_BOARD.get("rw_missing_reason", pd.Series("", index=LAST_BOARD.index)).ne("")]
@@ -6110,6 +6402,7 @@ def _current_dashboard_snapshot_html() -> str:
 <body>
   <div class="app-wrap">
     <div class="app-title">NCAA AI Dashboard</div>
+    {status_note_html.value}
     {season_banner_html.value}
     {daily_banner_html.value}
     {tournament_banner_html.value}
@@ -6164,6 +6457,7 @@ def refresh(_=None, force_rebuild=False):
     )
     season_banner_html.value = season_html
     daily_banner_html.value = daily_html
+    status_note_html.value = ""
     tournament_banner_html.value = ""
 
     if not _models_ready():
@@ -6179,7 +6473,7 @@ def refresh(_=None, force_rebuild=False):
         with out:
             clear_output(wait=True)
 
-            b2 = _apply_filters(LAST_BOARD)
+            b2, _ = _get_filtered_board_cached(LAST_BOARD, date_picker.value)
             warnings = _validate_board_like(b2, "Predictions")
             filtered_acc = compute_daily_accuracy(b2)
 
@@ -6200,6 +6494,7 @@ def refresh(_=None, force_rebuild=False):
 
             season_banner_html.value = season_html
             daily_banner_html.value = daily_html
+            status_note_html.value = note_html
             tournament_banner_html.value = render_tournament_status_banner(
                 LAST_BOARD,
                 manual_override=bool(tournament_mode.value),
@@ -6243,7 +6538,7 @@ def refresh(_=None, force_rebuild=False):
     LAST_BOARD = board
     LAST_DATE = date_picker.value
 
-    b2 = _apply_filters(board)
+    b2, _ = _get_filtered_board_cached(board, date_picker.value)
     warnings = _validate_board_like(b2, "Predictions")
     filtered_acc = compute_daily_accuracy(b2)
 
@@ -6264,6 +6559,7 @@ def refresh(_=None, force_rebuild=False):
 
     season_banner_html.value = season_html
     daily_banner_html.value = daily_html
+    status_note_html.value = note_html
     tournament_banner_html.value = render_tournament_status_banner(
         board,
         manual_override=bool(tournament_mode.value),
@@ -8718,7 +9014,7 @@ def _maybe_load_bracket_cache(change):
 
 dashboard_tabs.observe(_maybe_load_bracket_cache, names="selected_index")
 
-dashboard_layout = widgets.VBox([season_banner_html, daily_banner_html, dashboard_tabs])
+dashboard_layout = widgets.VBox([status_note_html, season_banner_html, daily_banner_html, dashboard_tabs])
 
 _startup_init_error = None
 try:
