@@ -3312,6 +3312,8 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     print("Building rolling snapshots + Elo...")
     team_snaps, roll_cols = build_team_rolling_snapshots(tb_hist, window=ROLL_WINDOW)
     elo_snap = compute_elo_ratings(tb_hist)
+    if "_refresh_matchup_team_options" in globals():
+        _refresh_matchup_team_options()
 
     if not force_model and need_model:
         saved_training_sig = meta.get("training_input_signature")
@@ -6170,6 +6172,8 @@ def refresh(_=None, force_rebuild=False):
             display(HTML("<div style='color:#AAA; padding:8px;'>Models are not loaded yet. Run retrain/startup initialization first.</div>"))
         return
 
+    _refresh_matchup_team_options()
+
     # fast path
     if (LAST_DATE == date_picker.value) and (LAST_BOARD is not None) and not force_rebuild:
         with out:
@@ -6317,6 +6321,29 @@ def _matchup_team_options():
     out["team_id"] = out["team_id"].astype(int)
     out = out.drop_duplicates(subset=["team_id"], keep="last")
     return sorted([(row["team_label"], int(row["team_id"])) for _, row in out.iterrows()], key=lambda x: x[0])
+
+
+def _refresh_matchup_team_options():
+    if "matchup_team_a" not in globals() or "matchup_team_b" not in globals():
+        return
+
+    options = _matchup_team_options()
+    valid_ids = {int(val) for _, val in options} if options else set()
+
+    prev_a = globals()["matchup_team_a"].value
+    prev_b = globals()["matchup_team_b"].value
+
+    globals()["matchup_team_a"].options = options
+    globals()["matchup_team_b"].options = options
+
+    globals()["matchup_team_a"].value = prev_a if prev_a in valid_ids else None
+    globals()["matchup_team_b"].value = prev_b if prev_b in valid_ids else None
+
+    if options and globals()["matchup_team_a"].value is None:
+        globals()["matchup_team_a"].value = options[0][1]
+    if options and globals()["matchup_team_b"].value is None:
+        fallback_b = next((val for _, val in options if val != globals()["matchup_team_a"].value), options[0][1])
+        globals()["matchup_team_b"].value = fallback_b
 
 
 def _team_snapshot_asof(team_id, date_et):
