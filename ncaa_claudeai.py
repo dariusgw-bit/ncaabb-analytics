@@ -757,8 +757,16 @@ def attach_injury_features_to_board(board: pd.DataFrame, date_et, injury_dir: st
         return board
 
     b = board.copy()
-    b["k_home"] = b["home_team"].map(canonical_team)
-    b["k_away"] = b["away_team"].map(canonical_team)
+    b["k_home"] = _safe_team_text_col(
+        b,
+        ["home_short_display_name", "home_team", "home_display_name", "home_name"],
+        default="TBD",
+    ).map(canonical_team)
+    b["k_away"] = _safe_team_text_col(
+        b,
+        ["away_short_display_name", "away_team", "away_display_name", "away_name"],
+        default="TBD",
+    ).map(canonical_team)
 
     inj_dict = inj.set_index("team_canon")["injury_impact_score"].to_dict()
     out_dict  = inj.set_index("team_canon")["injury_count_out"].to_dict()
@@ -5391,10 +5399,21 @@ def _board_cache_key(date_et) -> tuple:
 def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
     if not _models_ready():
         raise RuntimeError("Models are not loaded yet. Run retrain/startup initialization first.")
+
+    def _needs_injury_refresh(df: pd.DataFrame) -> bool:
+        if df is None or len(df) == 0:
+            return False
+        required = ["home_injury_impact", "away_injury_impact"]
+        if any(col not in df.columns for col in required):
+            return True
+        home_vals = pd.to_numeric(df.get("home_injury_impact"), errors="coerce")
+        away_vals = pd.to_numeric(df.get("away_injury_impact"), errors="coerce")
+        return (home_vals.notna().sum() == 0) and (away_vals.notna().sum() == 0)
+
     key = _board_cache_key(date_et)
     if not force_rebuild and key in BOARD_CACHE:
         board = BOARD_CACHE[key].copy()
-        if "home_injury_impact" not in board.columns or "away_injury_impact" not in board.columns:
+        if _needs_injury_refresh(board):
             board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
             BOARD_CACHE[key] = board.copy()
         return board, True
@@ -5412,7 +5431,7 @@ def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
         feature_cols=feature_cols,
         elo_snap=elo_snap,
     )
-    if board is not None and len(board) > 0 and ("home_injury_impact" not in board.columns or "away_injury_impact" not in board.columns):
+    if _needs_injury_refresh(board):
         board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
     if board is not None and len(board) > 0:
         board = _attach_rotowire_to_board(board, date_et)
@@ -5893,14 +5912,14 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
 
     if show_inj.value and "home_injury_impact" in b.columns:
         b["home_injury_impact"] = pd.to_numeric(b["home_injury_impact"], errors="coerce").map(
-            lambda v: f"{v:.0f}" if pd.notna(v) and v > 0 else ""
+            lambda v: f"{v:.0f}" if pd.notna(v) and float(v) > 0 else "-"
         )
         b["away_injury_impact"] = pd.to_numeric(b["away_injury_impact"], errors="coerce").map(
-            lambda v: f"{v:.0f}" if pd.notna(v) and v > 0 else ""
+            lambda v: f"{v:.0f}" if pd.notna(v) and float(v) > 0 else "-"
         )
     else:
         b = b.drop(columns=["home_injury_impact", "away_injury_impact"], errors="ignore")
-
+            
     if "rw_total" in b.columns:
         b["rw_total"] = pd.to_numeric(b["rw_total"], errors="coerce").map(
             lambda v: "" if pd.isna(v) else f"{float(v):.1f}"
