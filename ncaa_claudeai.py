@@ -9583,55 +9583,18 @@ def _completed_lock_debug_summary(asof_date, completed_games: pd.DataFrame, comp
     return out
 
 
-def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame) -> dict:
-    completed_games = _completed_tournament_games_for_accuracy()
+def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame, asof_date=None) -> dict:
+    # Keep accuracy/integrity counts aligned with the same authoritative lock source
+    # used by the Bracket Sim tab.
+    completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
     report = {
         "completed_games": int(len(completed_games)),
-        "locked_winners": 0,
+        "locked_winners": int(len(completed_lookup or {})),
         "integrity_counts": {},
         "integrity_tables": {},
         "calibration": {},
         "status_note": "",
     }
-
-    try:
-        bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
-        if not errors and "First_Four" in bracket_data and "winner_raw" in bracket_data["First_Four"].columns:
-            ff = bracket_data["First_Four"].copy()
-            ff["winner_raw"] = ff["winner_raw"].map(_clean_bracket_text)
-            ff = ff[ff["winner_raw"].astype(str).str.strip().ne("")].copy()
-            if len(ff) and completed_games is not None and len(completed_games) > 0:
-                completed_ff = completed_games.copy()
-                completed_ff = completed_ff[
-                    completed_ff.get("round_bucket", pd.Series("", index=completed_ff.index)).astype(str).eq("First_Four")
-                ].copy()
-                if len(completed_ff):
-                    completed_ff["team_pair_key"] = completed_ff.apply(
-                        lambda r: tuple(sorted([
-                            _bracket_team_canon(r.get("home_team", "")),
-                            _bracket_team_canon(r.get("away_team", "")),
-                        ])),
-                        axis=1,
-                    )
-                    completed_ff["winner_key"] = completed_ff["winner_team"].map(_bracket_team_canon)
-
-                    ff["team_pair_key"] = ff.apply(
-                        lambda r: tuple(sorted([
-                            _bracket_team_canon(r.get("team1_raw", "")),
-                            _bracket_team_canon(r.get("team2_raw", "")),
-                        ])),
-                        axis=1,
-                    )
-                    ff["winner_key"] = ff["winner_raw"].map(_bracket_team_canon)
-
-                    merged_ff = ff.merge(
-                        completed_ff[["team_pair_key", "winner_key"]].drop_duplicates(),
-                        on=["team_pair_key", "winner_key"],
-                        how="inner",
-                    )
-                    report["locked_winners"] = int(len(merged_ff))
-    except Exception:
-        pass
 
     if completed_games is None or len(completed_games) == 0:
         report["status_note"] = "No completed NCAA tournament games detected yet."
@@ -9799,7 +9762,7 @@ def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.D
 
     report["integrity_counts"] = {
         "completed_games": int(len(completed_games)),
-        "locked_winners": int(report["locked_winners"]),
+        "locked_winners": int(len(completed_lookup or {})),
         "eliminated_with_future_prob": int(len(eliminated_rows)),
         "alive_with_zero_reached_prob": int(len(alive_zero_rows)),
         "round_probability_violations": int(len(monotonic_violations)),
@@ -9830,7 +9793,7 @@ def _render_bracket_accuracy():
 
     summary_df = payload.get("summary_df") if isinstance(payload, dict) else pd.DataFrame()
     latest_run_df = payload.get("latest_run_df") if isinstance(payload, dict) else pd.DataFrame()
-    report = _build_bracket_accuracy_report(summary_df, latest_run_df)
+    report = _build_bracket_accuracy_report(summary_df, latest_run_df, asof_date=asof_date)
     if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
         base_note = report.get("status_note", "")
         extra_note = "Run the Bracket Sim tab for this as-of date and sim count to populate accuracy checks."
@@ -9899,11 +9862,21 @@ def _render_bracket_accuracy():
 
 
 def run_bracket_simulation(_=None, force_run: bool = True):
+    status_lines = []
+
+    def _push_bracket_status(line: str):
+        status_lines.append(str(line))
+        with bracket_out:
+            clear_output(wait=True)
+            display(HTML(
+                "<div style='color:#AAA; padding:8px;'>" +
+                "<br>".join(status_lines) +
+                "</div>"
+            ))
+
     bracket_status_html.value = ""
     bracket_summary_html.value = ""
-    with bracket_out:
-        clear_output(wait=True)
-        display(HTML("<div style='color:#AAA; padding:8px;'>Loading bracket workbook...</div>"))
+    _push_bracket_status("🔄 Loading bracket workbook...")
 
     sim_n = int(bracket_sim_n.value)
     asof_date = bracket_asof_date.value or date_picker.value
@@ -9961,6 +9934,7 @@ def run_bracket_simulation(_=None, force_run: bool = True):
 
     payload = None
     if not force_run:
+        _push_bracket_status("📦 Checking cache...")
         try:
             payload = _load_cached_bracket_sim(signature)
         except Exception as e:
@@ -9969,6 +9943,8 @@ def run_bracket_simulation(_=None, force_run: bool = True):
                 clear_output(wait=True)
             return
         if payload is not None:
+            _push_bracket_status("⚡ Cache hit → loading saved simulation")
+            _push_bracket_status("💾 Loading simulation from disk")
             extra = ""
             if info_msgs:
                 extra = "<br>" + "<br>".join(info_msgs)
@@ -10007,11 +9983,16 @@ def run_bracket_simulation(_=None, force_run: bool = True):
                 sim_n=sim_n,
             )
             return
+        _push_bracket_status("❌ Cache miss → rebuilding bracket")
+    else:
+        _push_bracket_status("❌ Cache miss → rebuilding bracket")
 
     try:
+        _push_bracket_status(f"🧠 Running simulations ({sim_n} sims)...")
         adv_df, latest_run_df = _simulate_bracket_many(normalized_data, team_lookup, asof_date, sim_n, completed_lookup=completed_lookup)
         summary_df = _summarize_bracket_simulations(adv_df, sim_n, completed_games=completed_games)
         _save_cached_bracket_sim(signature, summary_df, latest_run_df)
+        _push_bracket_status("✅ Simulation complete")
     except Exception as e:
         bracket_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Bracket simulation failed: {e}</div>"
         with bracket_out:
