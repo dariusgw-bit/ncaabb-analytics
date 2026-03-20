@@ -132,6 +132,10 @@ ROLL_WINDOW     = 10          # games for rolling stats
 ELO_K           = 20          # Elo K-factor
 ELO_INIT        = 1500        # starting Elo
 MARKET_BLEND    = 0.15        # only used when a market spread exists
+TOURNEY_SPREAD_DAMP_STRONG = 0.30
+TOURNEY_SPREAD_DAMP_MEDIUM = 0.45
+TOURNEY_SPREAD_DAMP_LIGHT  = 0.62
+TOURNEY_SPREAD_DAMP_SMALL  = 0.82
 MARKET_EDGE_MODEL_VERSION = 2
 
 for d in [RAW_DIR, ROTOWIRE_DIR, INJURY_DIR, MODEL_DIR, TEAM_BOX_DIR, SCHEDULE_DIR]:
@@ -2574,6 +2578,57 @@ def season_weights(season_series, current_season=CURRENT_SEASON, decay_rate: flo
     return np.exp(-float(decay_rate) * age).astype(float).values
 
 
+def _print_sample_weight_debug(
+    season_series,
+    raw_weights,
+    final_weights,
+    label: str = "training",
+):
+    seasons = pd.to_numeric(season_series, errors="coerce")
+    raw_w = pd.to_numeric(pd.Series(raw_weights), errors="coerce")
+    final_w = pd.to_numeric(pd.Series(final_weights), errors="coerce")
+    dbg = pd.DataFrame({
+        "season": seasons,
+        "raw_weight": raw_w,
+        "final_weight": final_w,
+    }).dropna(subset=["season"]).copy()
+
+    if len(dbg) == 0:
+        print(f"{label.title()} sample weights: no valid season rows available")
+        return
+
+    dbg["season"] = dbg["season"].astype(int)
+    season_summary = (
+        dbg.groupby("season", as_index=False)
+        .agg(
+            rows=("season", "size"),
+            raw_mean=("raw_weight", "mean"),
+            raw_min=("raw_weight", "min"),
+            raw_max=("raw_weight", "max"),
+            final_mean=("final_weight", "mean"),
+            final_min=("final_weight", "min"),
+            final_max=("final_weight", "max"),
+            zero_rows=("final_weight", lambda s: int(np.isclose(pd.to_numeric(s, errors="coerce").fillna(0.0), 0.0).sum())),
+        )
+        .sort_values("season")
+    )
+
+    print(f"{label.title()} season weight summary:")
+    for _, row in season_summary.iterrows():
+        print(
+            f"{int(row['season'])}: rows={int(row['rows'])} "
+            f"raw_mean={float(row['raw_mean']):.4f} raw_min={float(row['raw_min']):.4f} raw_max={float(row['raw_max']):.4f} "
+            f"final_mean={float(row['final_mean']):.4f} final_min={float(row['final_min']):.4f} final_max={float(row['final_max']):.4f}"
+        )
+        if int(row["zero_rows"]) >= int(row["rows"]):
+            print(f"WARNING: season {int(row['season'])} has all-zero sample weights")
+
+    global_min = float(final_w.min()) if len(final_w) else float("nan")
+    global_max = float(final_w.max()) if len(final_w) else float("nan")
+    zero_rows = int(np.isclose(final_w.fillna(0.0), 0.0).sum()) if len(final_w) else 0
+    print(f"Global weights: min={global_min:.4f} max={global_max:.4f} zero_rows={zero_rows}")
+
+
 def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON):
     """
     Trains:
@@ -2656,22 +2711,14 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
 
     recency_tr = np.exp(-((train.loc[tr_idx, "game_dt_et"].max() - train.loc[tr_idx, "game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
     recency_va = np.exp(-((train.loc[va_idx, "game_dt_et"].max() - train.loc[va_idx, "game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
-    w_tr = season_weights(train.loc[tr_idx, "season"], current_season) * recency_tr.to_numpy()
-    w_va = season_weights(train.loc[va_idx, "season"], current_season) * recency_va.to_numpy()
+    season_w_tr = season_weights(train.loc[tr_idx, "season"], current_season)
+    season_w_va = season_weights(train.loc[va_idx, "season"], current_season)
+    w_tr = season_w_tr * recency_tr.to_numpy()
+    w_va = season_w_va * recency_va.to_numpy()
     w_tr = np.asarray(w_tr, dtype=float)
     w_va = np.asarray(w_va, dtype=float)
-
-    tr_weight_summary = (
-        pd.DataFrame({"season": pd.to_numeric(train.loc[tr_idx, "season"], errors="coerce"), "weight": w_tr})
-        .dropna(subset=["season"])
-        .groupby("season", as_index=False)["weight"].mean()
-        .sort_values("season", ascending=False)
-    )
-    if len(tr_weight_summary) > 0:
-        summary_txt = " | ".join(
-            [f"{int(row['season'])}: {float(row['weight']):.3f}" for _, row in tr_weight_summary.iterrows()]
-        )
-        print(f"Training sample weights by season: {summary_txt}")
+    _print_sample_weight_debug(train.loc[tr_idx, "season"], season_w_tr, w_tr, label="training")
+    _print_sample_weight_debug(train.loc[va_idx, "season"], season_w_va, w_va, label="validation")
 
     if len(X_tr_spread) == 0 or len(X_va_spread) == 0:
         raise ValueError("Training/validation split is empty. Check dataset size and split logic.")
@@ -2768,8 +2815,12 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         y_va_edge = (market_valid["actual_home_margin"] - _market_implied_home_margin(market_valid["vegas_spread_home"])).clip(-25, 25)
         recency_tr_edge = np.exp(-((market_train["game_dt_et"].max() - market_train["game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
         recency_va_edge = np.exp(-((market_valid["game_dt_et"].max() - market_valid["game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
-        w_tr_edge = season_weights(market_train["season"], current_season) * recency_tr_edge.to_numpy()
-        w_va_edge = season_weights(market_valid["season"], current_season) * recency_va_edge.to_numpy()
+        season_w_tr_edge = season_weights(market_train["season"], current_season)
+        season_w_va_edge = season_weights(market_valid["season"], current_season)
+        w_tr_edge = season_w_tr_edge * recency_tr_edge.to_numpy()
+        w_va_edge = season_w_va_edge * recency_va_edge.to_numpy()
+        _print_sample_weight_debug(market_train["season"], season_w_tr_edge, w_tr_edge, label="market-edge training")
+        _print_sample_weight_debug(market_valid["season"], season_w_va_edge, w_va_edge, label="market-edge validation")
 
         dtrain_edge = xgb.DMatrix(X_tr_edge, label=y_tr_edge, weight=w_tr_edge, feature_names=spread_feature_cols)
         dvalid_edge = xgb.DMatrix(X_va_edge, label=y_va_edge, weight=w_va_edge, feature_names=spread_feature_cols)
@@ -3931,19 +3982,46 @@ def predict_slate(
             pred_margin_home_raw,
         )
 
-    # Clip for display (never show 0% / 100%)
-    EPS = 0.02
-    p_home_win = np.clip(p_home_win_raw, EPS, 1 - EPS)
-
-    pred_margin_home = np.round(pred_margin_home, 1)
-    pred_margin_home[np.abs(pred_margin_home) < 0.05] = 0.0
-
     neutral = _coerce_bool_series(model_pregame.get("neutral_site", False), model_pregame.index)
     is_tournament = pd.to_numeric(
         model_pregame.get("is_tournament", pd.Series(0, index=model_pregame.index)),
         errors="coerce"
     ).fillna(0).astype(int).eq(1)
     tournament_neutral = neutral & is_tournament
+    tournament_mode_enabled = False
+    try:
+        tournament_mode_enabled = bool(globals().get("tournament_mode").value)
+    except Exception:
+        tournament_mode_enabled = False
+
+    tournament_mode_applied = np.zeros(len(model_pregame), dtype=int)
+    if tournament_mode_enabled and tournament_neutral.any():
+        tournament_mask = tournament_neutral.to_numpy(dtype=bool)
+        abs_margin = np.abs(pred_margin_home).astype(float)
+        damp_scale = np.where(
+            abs_margin >= 20.0, TOURNEY_SPREAD_DAMP_STRONG,
+            np.where(
+                abs_margin >= 12.0, TOURNEY_SPREAD_DAMP_MEDIUM,
+                np.where(abs_margin >= 8.0, TOURNEY_SPREAD_DAMP_LIGHT, TOURNEY_SPREAD_DAMP_SMALL)
+            )
+        ).astype(float)
+        target_margin = np.where(has_market_spread, market_implied_home_margin.to_numpy(dtype=float), 0.0).astype(float)
+        damped_margin = np.where(
+            has_market_spread,
+            target_margin + damp_scale * (pred_margin_home - target_margin),
+            pred_margin_home * damp_scale,
+        ).astype(float)
+        pred_margin_home = np.where(tournament_mask, damped_margin, pred_margin_home).astype(float)
+        tournament_mode_applied = tournament_mask.astype(int)
+
+    # Clip for display (never show 0% / 100%)
+    EPS = 0.02
+    p_home_win = np.clip(p_home_win_raw, EPS, 1 - EPS)
+
+    pred_margin_home = np.round(pred_margin_home, 1)
+    pred_margin_home[np.abs(pred_margin_home) < 0.05] = 0.0
+    pred_margin_home_final = pred_margin_home.copy()
+
     if tournament_neutral.any():
         neutral_scale = np.where(np.abs(pred_margin_home) < 10, 0.84, 0.88)
         p_home_win = np.where(
@@ -3985,7 +4063,9 @@ def predict_slate(
         vegas_spread_home=vegas_spread_home.to_numpy(dtype=float),
         market_implied_home_margin=market_implied_home_margin.to_numpy(dtype=float),
         pred_margin_home_market=pred_margin_home_market,
+        pred_margin_home_final=pred_margin_home_final,
         has_market_spread=has_market_spread.astype(int),
+        tournament_mode_applied=tournament_mode_applied.astype(int),
         p_home_win=p_home_win,
         p_home_win_raw=p_home_win_raw,
         winner_pick=winner_pick,
@@ -6165,12 +6245,18 @@ def _board_cache_key(date_et) -> tuple:
 
 
 def _filter_cache_key(date_et) -> tuple:
+    tournament_mode_on = False
+    try:
+        tournament_mode_on = bool(tournament_mode.value)
+    except Exception:
+        tournament_mode_on = False
     return (
         str(pd.Timestamp(date_et).date()),
         round(float(min_conf.value), 6),
         round(float(min_abs_margin.value), 6),
         str(side_filter.value),
         bool(neutral_only.value),
+        tournament_mode_on,
         str(search_box.value).strip().lower(),
         _dashboard_runtime_signature(),
     )
@@ -10134,6 +10220,7 @@ date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, nam
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
     widget.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
+tournament_mode.observe(lambda ch: refresh(force_rebuild=True) if ch["name"] == "value" else None, names="value")
 
 # Layout
 controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn, open_dashboard_btn])
