@@ -101,8 +101,6 @@ try:
 except Exception:
     pass
 
-DEV_MODE = str(os.environ.get("NCAABB_DEV_MODE", "1")).strip().lower() not in {"0", "false", "no", "off"}
-
 # ============================================================
 # CELL 2: CONFIG — All paths live here
 # ============================================================
@@ -118,8 +116,6 @@ ROTOWIRE_DIR    = "/content/drive/MyDrive/NCAABB/roto-odds" if IN_COLAB else (os
 INJURY_DIR      = "/content/drive/MyDrive/NCAABB/cbb-injuries" if IN_COLAB else (os.environ.get("NCAABB_INJURY_DIR") or r"G:\My Drive\NCAABB\cbb-injuries")
 MODEL_DIR       = os.path.join(BASE_DIR, "models")
 METADATA_PATH   = os.path.join(MODEL_DIR, "retrain_metadata.json")
-TRAINING_DATASET_CACHE_PATH = os.path.join(MODEL_DIR, "engineered_training_dataset.parquet")
-TRAINING_DATASET_CACHE_META_PATH = os.path.join(MODEL_DIR, "engineered_training_dataset_meta.json")
 TEAM_BOX_DIR    = os.path.join(RAW_DIR, "team_box")
 SCHEDULE_DIR    = os.path.join(RAW_DIR, "schedule")
 
@@ -131,8 +127,6 @@ HIST_SEASONS    = list(range(2020, CURRENT_SEASON + 1))
 ROLL_WINDOW     = 10          # games for rolling stats
 ELO_K           = 20          # Elo K-factor
 ELO_INIT        = 1500        # starting Elo
-MARKET_BLEND    = 0.15        # only used when a market spread exists
-MARKET_EDGE_MODEL_VERSION = 2
 
 for d in [RAW_DIR, ROTOWIRE_DIR, INJURY_DIR, MODEL_DIR, TEAM_BOX_DIR, SCHEDULE_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -147,10 +141,8 @@ team_box_hist = pd.DataFrame()
 roll_cols = []
 feature_cols = []
 spread_booster = None
-spread_edge_booster = None
 winner_booster = None
 lgb_spread = None
-lgb_spread_edge = None
 iso = None
 imp = None
 
@@ -218,48 +210,6 @@ def _training_input_signature(*base_dirs) -> str:
                     parts.append((root, rel_path, None, None))
     payload = json.dumps(parts, sort_keys=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _training_dataset_cache_signature(training_input_signature: str, current_season: int) -> dict:
-    return {
-        "training_input_signature": str(training_input_signature or ""),
-        "current_season": int(current_season),
-        "pipeline_version": 1,
-    }
-
-
-def _load_training_dataset_cache(expected_signature: dict):
-    if not (os.path.exists(TRAINING_DATASET_CACHE_PATH) and os.path.exists(TRAINING_DATASET_CACHE_META_PATH)):
-        return None
-    try:
-        with open(TRAINING_DATASET_CACHE_META_PATH, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception:
-        return None
-    if meta.get("signature") != expected_signature:
-        return None
-    try:
-        return pd.read_parquet(TRAINING_DATASET_CACHE_PATH)
-    except Exception:
-        return None
-
-
-def _save_training_dataset_cache(dataset_df: pd.DataFrame, signature: dict) -> None:
-    if dataset_df is None or len(dataset_df) == 0:
-        return
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    dataset_df.to_parquet(TRAINING_DATASET_CACHE_PATH, index=False)
-    with open(TRAINING_DATASET_CACHE_META_PATH, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "signature": signature,
-                "rows": int(len(dataset_df)),
-                "columns": list(dataset_df.columns),
-                "saved_at": datetime.utcnow().isoformat(),
-            },
-            f,
-            indent=2,
-        )
 
 
 # ============================================================
@@ -2198,160 +2148,12 @@ def build_pregame_dataset_for_slate(
 
     neutral = _coerce_bool_series(joined.get("neutral_site", False), joined.index)
     joined["home_court_A"] = np.where(neutral, 0.0, np.where(teamA_is_home, 1.0, -1.0))
-    joined = attach_rotowire_features_by_row_date(joined, date_col="game_dt_et")
-    joined = _add_hybrid_spread_features(joined)
 
     if joined.columns.duplicated().any():
         joined = joined.loc[:, ~joined.columns.duplicated()].copy()
 
     joined = ensure_board_team_columns(joined).reset_index(drop=True)
     return _dedupe_game_rows(joined)
-
-
-def attach_rotowire_features_by_row_date(board: pd.DataFrame, date_col: str = "game_dt_et") -> pd.DataFrame:
-    """Attach optional Rotowire market fields to a mixed-date frame by row date."""
-    if board is None or len(board) == 0:
-        return board
-
-    out = board.copy()
-    prior_rw_cols = [c for c in out.columns if str(c).endswith("_rw")]
-    prior_rw_cols += [
-        "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total", "rw_missing_reason",
-        "vegas_spread_home", "has_market_spread", "market_abs_spread", "market_home_fav",
-        "vegas_total", "has_market_total",
-    ]
-    out = out.drop(columns=[c for c in prior_rw_cols if c in out.columns], errors="ignore")
-    row_dates = pd.to_datetime(out.get(date_col), errors="coerce").dt.date
-    out["_rw_row_date"] = row_dates
-
-    default_cols = ["rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total", "rw_missing_reason"]
-    for col in default_cols:
-        if col not in out.columns:
-            out[col] = "" if col == "rw_missing_reason" else np.nan
-
-    valid_mask = out["_rw_row_date"].notna()
-    if valid_mask.any():
-        for d, idx in out.loc[valid_mask].groupby("_rw_row_date").groups.items():
-            patched = _attach_rotowire_to_board(out.loc[idx].copy(), d)
-            for col in default_cols:
-                if col in patched.columns:
-                    out.loc[idx, col] = patched[col].values
-
-    return out.drop(columns=["_rw_row_date"], errors="ignore")
-
-
-def _num_or_nan(df: pd.DataFrame, col: str) -> pd.Series:
-    return pd.to_numeric(df.get(col, pd.Series(np.nan, index=df.index)), errors="coerce")
-
-
-def _market_implied_home_margin(spread_home) -> pd.Series:
-    """
-    Convert sportsbook home spread convention into home-minus-away margin convention.
-    Example: home -7.5 implies expected home margin +7.5.
-    """
-    return -pd.to_numeric(spread_home, errors="coerce")
-
-
-def _first_existing_team_col(df: pd.DataFrame, templates: list[str]) -> str | None:
-    for c in templates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _add_hybrid_spread_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add spread-model features that keep working when market data is sparse.
-    These columns intentionally do not start with diff_ so the winner model
-    stays on its existing feature family unless explicitly changed.
-    """
-    if df is None or len(df) == 0:
-        return df
-
-    out = df.copy()
-
-    if "vegas_spread_home" not in out.columns:
-        out["vegas_spread_home"] = _num_or_nan(out, "rw_spread_home")
-    else:
-        out["vegas_spread_home"] = pd.to_numeric(out["vegas_spread_home"], errors="coerce")
-
-    out["has_market_spread"] = out["vegas_spread_home"].notna().astype(float)
-    out["market_abs_spread"] = out["vegas_spread_home"].abs()
-    out["market_home_fav"] = (out["vegas_spread_home"] < 0).astype(float)
-    out["vegas_total"] = _num_or_nan(out, "rw_total")
-    out["has_market_total"] = out["vegas_total"].notna().astype(float)
-
-    out["neutral_site_flag"] = _coerce_bool_series(out.get("neutral_site", False), out.index).astype(float)
-    out["is_tournament"] = pd.to_numeric(out.get("is_tournament", pd.Series(0, index=out.index)), errors="coerce").fillna(0.0)
-    out["is_conf_tourney"] = pd.to_numeric(out.get("is_conf_tourney", pd.Series(0, index=out.index)), errors="coerce").fillna(0.0)
-    out["is_ncaa_tourney"] = pd.to_numeric(out.get("is_ncaa_tourney", pd.Series(0, index=out.index)), errors="coerce").fillna(0.0)
-    out["neutral_tourney_flag"] = out["neutral_site_flag"] * out["is_tournament"]
-
-    if "rest_diff" not in out.columns:
-        if "diff_rest_days" in out.columns:
-            out["rest_diff"] = _num_or_nan(out, "diff_rest_days")
-        elif {"rest_days_HOME", "rest_days_AWAY"}.issubset(out.columns):
-            out["rest_diff"] = _num_or_nan(out, "rest_days_HOME") - _num_or_nan(out, "rest_days_AWAY")
-
-    trend_bases = [
-        "points_for", "points_against", "point_diff", "field_goal_pct",
-        "three_point_field_goal_pct", "free_throw_pct", "total_rebounds",
-        "offensive_rebounds", "turnovers", "steals", "blocks",
-    ]
-    for base in trend_bases:
-        r3 = f"diff_r3_mean_{base}"
-        r10 = f"diff_r10_mean_{base}"
-        if r3 in out.columns and r10 in out.columns:
-            out[f"trend_{base}"] = _num_or_nan(out, r3) - _num_or_nan(out, r10)
-
-    for base in ["point_diff", "points_for", "points_against"]:
-        std_col = f"diff_r10_std_{base}"
-        if std_col in out.columns:
-            out[f"volatility_{base}"] = _num_or_nan(out, std_col)
-
-    point_diff_a = _first_existing_team_col(out, ["r10_mean_point_diff_TA", "r10_mean_point_diff_A"])
-    point_diff_b = _first_existing_team_col(out, ["r10_mean_point_diff_TB", "r10_mean_point_diff_B"])
-    point_std_a = _first_existing_team_col(out, ["r10_std_point_diff_TA", "r10_std_point_diff_A"])
-    point_std_b = _first_existing_team_col(out, ["r10_std_point_diff_TB", "r10_std_point_diff_B"])
-    if point_diff_a and point_diff_b:
-        a_pd = _num_or_nan(out, point_diff_a)
-        b_pd = _num_or_nan(out, point_diff_b)
-        if point_std_a and point_std_b:
-            a_blow = (a_pd - _num_or_nan(out, point_std_a)).clip(lower=0)
-            b_blow = (b_pd - _num_or_nan(out, point_std_b)).clip(lower=0)
-            out["blowout_tendency_diff"] = a_blow - b_blow
-        else:
-            out["blowout_tendency_diff"] = a_pd - b_pd
-    elif {"diff_r10_mean_point_diff", "diff_r10_std_point_diff"}.issubset(out.columns):
-        out["blowout_tendency_diff"] = _num_or_nan(out, "diff_r10_mean_point_diff") - 0.5 * _num_or_nan(out, "diff_r10_std_point_diff")
-
-    poss_a = _first_existing_team_col(out, [
-        "r10_mean_possessions_TA", "r10_mean_estimated_possessions_TA", "r10_mean_pace_TA"
-    ])
-    poss_b = _first_existing_team_col(out, [
-        "r10_mean_possessions_TB", "r10_mean_estimated_possessions_TB", "r10_mean_pace_TB"
-    ])
-    pf_a = _first_existing_team_col(out, ["r10_mean_points_for_TA"])
-    pf_b = _first_existing_team_col(out, ["r10_mean_points_for_TB"])
-    pa_a = _first_existing_team_col(out, ["r10_mean_points_against_TA"])
-    pa_b = _first_existing_team_col(out, ["r10_mean_points_against_TB"])
-
-    if poss_a and poss_b:
-        possA = _num_or_nan(out, poss_a)
-        possB = _num_or_nan(out, poss_b)
-        out["pace_diff"] = possA - possB
-
-        if pf_a and pf_b:
-            off_eff_a = 100.0 * _num_or_nan(out, pf_a) / possA.replace(0, np.nan)
-            off_eff_b = 100.0 * _num_or_nan(out, pf_b) / possB.replace(0, np.nan)
-            out["off_eff_diff"] = off_eff_a - off_eff_b
-
-        if pa_a and pa_b:
-            def_eff_a = 100.0 * _num_or_nan(out, pa_a) / possA.replace(0, np.nan)
-            def_eff_b = 100.0 * _num_or_nan(out, pa_b) / possB.replace(0, np.nan)
-            out["def_eff_diff"] = def_eff_a - def_eff_b
-
-    return out
 
 # ============================================================
 # CELL 8b: SAFETY PATCH FOR DOWNSTREAM
@@ -2527,36 +2329,18 @@ def build_game_dataset_from_team_box(
     teamA_is_home = merged["teamA_id"] == pd.to_numeric(merged["home_id"], errors="coerce")
     merged["home_court_A"] = np.where(neutral, 0, np.where(teamA_is_home, 1, -1)).astype(float)
     diff_cols.append("home_court_A")
-    merged["actual_home_margin"] = np.where(teamA_is_home, merged["y_margin"], -merged["y_margin"]).astype(float)
 
     merged = attach_injury_features_by_row_date(merged, INJURY_DIR, date_col="game_dt_et")
-    merged = attach_rotowire_features_by_row_date(merged, date_col="game_dt_et")
-    merged = _add_hybrid_spread_features(merged)
     for c in ["diff_injury_impact", "diff_inj_out"]:
         if c in merged.columns:
             diff_cols.append(c)
 
     merged[diff_cols] = merged[diff_cols].fillna(0.0)
 
-    spread_extra_cols = [
-        c for c in [
-            "actual_home_margin",
-            "vegas_spread_home", "has_market_spread", "market_abs_spread", "market_home_fav",
-            "vegas_total", "has_market_total",
-            "rest_diff", "neutral_site_flag", "neutral_tourney_flag",
-            "trend_points_for", "trend_points_against", "trend_point_diff",
-            "trend_field_goal_pct", "trend_three_point_field_goal_pct", "trend_free_throw_pct",
-            "trend_total_rebounds", "trend_offensive_rebounds", "trend_turnovers", "trend_steals", "trend_blocks",
-            "volatility_point_diff", "volatility_points_for", "volatility_points_against",
-            "blowout_tendency_diff", "pace_diff", "off_eff_diff", "def_eff_diff",
-        ] if c in merged.columns
-    ]
-
     keep = [
         "game_id", "season", "game_dt_et", "teamA_id", "teamB_id",
-        "home_id", "away_id",
         "y_margin", "y_win"
-    ] + diff_cols + spread_extra_cols + [c for c in ["is_tournament", "is_conf_tourney", "is_ncaa_tourney"] if c in merged.columns]
+    ] + diff_cols + [c for c in ["is_tournament", "is_conf_tourney", "is_ncaa_tourney"] if c in merged.columns]
 
     return merged[[c for c in keep if c in merged.columns]].copy()
 
@@ -2565,23 +2349,18 @@ def build_game_dataset_from_team_box(
 # CELL 10: MODEL TRAINING (FULL REWRITE)
 # ============================================================
 
-SEASON_WEIGHT_DECAY_RATE = 0.5
-
-
-def season_weights(season_series, current_season=CURRENT_SEASON, decay_rate: float = SEASON_WEIGHT_DECAY_RATE):
-    season_vals = pd.to_numeric(season_series, errors="coerce").fillna(current_season).astype(float)
-    age = (float(current_season) - season_vals).clip(lower=0)
-    return np.exp(-float(decay_rate) * age).astype(float).values
+def season_weights(season_series, current_season=CURRENT_SEASON, half_life=2.0):
+    age = (current_season - season_series).clip(lower=0).astype(float)
+    return (0.5 ** (age / half_life)).values
 
 
 def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON):
     """
     Trains:
-      1. Raw margin regression fallback (existing path, improved features)
-      2. Optional market-edge regression on rows with spread history
-      3. Winner model (kept on the existing feature family)
-      4. LightGBM companions for spread models
-      5. Isotonic calibration on win probability
+      1. XGBoost spread (margin regression)
+      2. XGBoost win (classification)
+      3. LightGBM margin
+      4. Isotonic calibration on win probability
     """
     train = dataset_all[dataset_all["season"] < current_season].copy()
     current = dataset_all[dataset_all["season"] == current_season].copy()
@@ -2589,48 +2368,30 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
     if len(train) < 100:
         raise ValueError("Not enough historical training data to fit models.")
 
-    winner_base_cols = [c for c in dataset_all.columns if c.startswith("diff_") or c == "home_court_A"]
-    winner_base_cols = [c for c in winner_base_cols if c in train.columns]
+    diff_cols = [c for c in dataset_all.columns if c.startswith("diff_") or c == "home_court_A"]
+    diff_cols = [c for c in diff_cols if c in train.columns]
 
-    spread_extra_cols = [
-        c for c in [
-            "rest_diff", "neutral_site_flag", "neutral_tourney_flag",
-            "is_tournament", "is_conf_tourney", "is_ncaa_tourney",
-            "trend_points_for", "trend_points_against", "trend_point_diff",
-            "trend_field_goal_pct", "trend_three_point_field_goal_pct", "trend_free_throw_pct",
-            "trend_total_rebounds", "trend_offensive_rebounds", "trend_turnovers", "trend_steals", "trend_blocks",
-            "volatility_point_diff", "volatility_points_for", "volatility_points_against",
-            "blowout_tendency_diff", "pace_diff", "off_eff_diff", "def_eff_diff",
-            "vegas_spread_home", "has_market_spread", "market_abs_spread", "market_home_fav",
-            "vegas_total", "has_market_total",
-        ]
-        if c in dataset_all.columns
-    ]
-    spread_base_cols = list(dict.fromkeys(winner_base_cols + spread_extra_cols))
-
-    for c in spread_base_cols:
+    for c in diff_cols:
         dataset_all[c + "__na"] = dataset_all[c].isna().astype("int8")
         train[c + "__na"] = train[c].isna().astype("int8")
         if len(current) > 0:
             current[c + "__na"] = current[c].isna().astype("int8")
 
+    diff_cols2 = diff_cols + [c + "__na" for c in diff_cols]
+
     imp = SimpleImputer(strategy="median")
-    train[spread_base_cols] = imp.fit_transform(train[spread_base_cols])
+    train[diff_cols] = imp.fit_transform(train[diff_cols])
     if len(current) > 0:
-        current[spread_base_cols] = imp.transform(current[spread_base_cols])
+        current[diff_cols] = imp.transform(current[diff_cols])
 
-    spread_feature_cols_all = spread_base_cols + [c + "__na" for c in spread_base_cols]
-    winner_feature_cols_all = winner_base_cols + [c + "__na" for c in winner_base_cols]
-
-    var = train[spread_feature_cols_all].var()
+    var = train[diff_cols2].var()
     keep_cols = var[var > 1e-8].index.tolist()
-    spread_feature_cols = [c for c in spread_feature_cols_all if c in keep_cols]
-    winner_feature_cols = [c for c in winner_feature_cols_all if c in keep_cols]
+    diff_cols2 = [c for c in diff_cols2 if c in keep_cols]
 
-    print(f"Winner features after variance filter: {len(winner_feature_cols)}")
-    print(f"Spread features after variance filter: {len(spread_feature_cols)}")
+    print(f"Features after variance filter: {len(diff_cols2)}")
 
     train_sorted = train.sort_values("game_dt_et").copy()
+
     if len(train_sorted) < 500:
         split_n = max(1, int(len(train_sorted) * 0.85))
         tr_idx = train_sorted.iloc[:split_n].index
@@ -2639,42 +2400,27 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         cut = train_sorted["game_dt_et"].max() - pd.Timedelta(days=30)
         tr_idx = train_sorted[train_sorted["game_dt_et"] < cut].index
         va_idx = train_sorted[train_sorted["game_dt_et"] >= cut].index
+
         if len(tr_idx) == 0 or len(va_idx) == 0:
             split_n = max(1, int(len(train_sorted) * 0.85))
             tr_idx = train_sorted.iloc[:split_n].index
             va_idx = train_sorted.iloc[split_n:].index
 
-    X_tr_spread = train.loc[tr_idx, spread_feature_cols].copy()
-    X_va_spread = train.loc[va_idx, spread_feature_cols].copy()
-    X_tr_winner = train.loc[tr_idx, winner_feature_cols].copy()
-    X_va_winner = train.loc[va_idx, winner_feature_cols].copy()
-
+    X_tr = train.loc[tr_idx, diff_cols2].copy()
     y_tr_m = train.loc[tr_idx, "y_margin"].clip(-30, 30)
-    y_va_m = train.loc[va_idx, "y_margin"].clip(-30, 30)
     y_tr_w = train.loc[tr_idx, "y_win"]
+    w_tr = season_weights(train.loc[tr_idx, "season"], current_season)
+
+    X_va = train.loc[va_idx, diff_cols2].copy()
+    y_va_m = train.loc[va_idx, "y_margin"].clip(-30, 30)
     y_va_w = train.loc[va_idx, "y_win"]
+    w_va = season_weights(train.loc[va_idx, "season"], current_season)
 
-    recency_tr = np.exp(-((train.loc[tr_idx, "game_dt_et"].max() - train.loc[tr_idx, "game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
-    recency_va = np.exp(-((train.loc[va_idx, "game_dt_et"].max() - train.loc[va_idx, "game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
-    w_tr = season_weights(train.loc[tr_idx, "season"], current_season) * recency_tr.to_numpy()
-    w_va = season_weights(train.loc[va_idx, "season"], current_season) * recency_va.to_numpy()
-    w_tr = np.asarray(w_tr, dtype=float)
-    w_va = np.asarray(w_va, dtype=float)
-
-    tr_weight_summary = (
-        pd.DataFrame({"season": pd.to_numeric(train.loc[tr_idx, "season"], errors="coerce"), "weight": w_tr})
-        .dropna(subset=["season"])
-        .groupby("season", as_index=False)["weight"].mean()
-        .sort_values("season", ascending=False)
-    )
-    if len(tr_weight_summary) > 0:
-        summary_txt = " | ".join(
-            [f"{int(row['season'])}: {float(row['weight']):.3f}" for _, row in tr_weight_summary.iterrows()]
-        )
-        print(f"Training sample weights by season: {summary_txt}")
-
-    if len(X_tr_spread) == 0 or len(X_va_spread) == 0:
+    if len(X_tr) == 0 or len(X_va) == 0:
         raise ValueError("Training/validation split is empty. Check dataset size and split logic.")
+
+    dtrain = xgb.DMatrix(X_tr, label=y_tr_m, weight=w_tr, feature_names=diff_cols2)
+    dvalid = xgb.DMatrix(X_va, label=y_va_m, weight=w_va, feature_names=diff_cols2)
 
     params_reg = {
         "objective": "reg:pseudohubererror",
@@ -2688,6 +2434,20 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         "alpha": 0.1,
         "seed": 42,
     }
+
+    spread_booster = xgb.train(
+        params=params_reg,
+        dtrain=dtrain,
+        num_boost_round=5000,
+        evals=[(dvalid, "valid")],
+        early_stopping_rounds=150,
+        verbose_eval=False,
+    )
+    print(f"✅ XGB Margin best_iter: {spread_booster.best_iteration}")
+
+    dtrain_w = xgb.DMatrix(X_tr, label=y_tr_w, weight=w_tr, feature_names=diff_cols2)
+    dvalid_w = xgb.DMatrix(X_va, label=y_va_w, weight=w_va, feature_names=diff_cols2)
+
     params_clf = {
         "objective": "binary:logistic",
         "eval_metric": "logloss",
@@ -2700,6 +2460,20 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         "alpha": 0.5,
         "seed": 42,
     }
+
+    winner_booster = xgb.train(
+        params=params_clf,
+        dtrain=dtrain_w,
+        num_boost_round=5000,
+        evals=[(dvalid_w, "valid")],
+        early_stopping_rounds=150,
+        verbose_eval=False,
+    )
+    print(f"✅ XGB Win best_iter: {winner_booster.best_iteration}")
+
+    lgb_train = lgb.Dataset(X_tr, label=y_tr_m, weight=w_tr, feature_name=diff_cols2)
+    lgb_valid = lgb.Dataset(X_va, label=y_va_m, weight=w_va, reference=lgb_train, feature_name=diff_cols2)
+
     lgb_params = {
         "objective": "huber",
         "alpha": 0.9,
@@ -2715,37 +2489,12 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         "verbose": -1,
         "seed": 42,
     }
+
     lgb_callbacks = [
         lgb.early_stopping(100, verbose=False),
         lgb.log_evaluation(period=-1),
     ]
 
-    dtrain = xgb.DMatrix(X_tr_spread, label=y_tr_m, weight=w_tr, feature_names=spread_feature_cols)
-    dvalid = xgb.DMatrix(X_va_spread, label=y_va_m, weight=w_va, feature_names=spread_feature_cols)
-    spread_booster = xgb.train(
-        params=params_reg,
-        dtrain=dtrain,
-        num_boost_round=5000,
-        evals=[(dvalid, "valid")],
-        early_stopping_rounds=150,
-        verbose_eval=False,
-    )
-    print(f"✅ XGB Raw Margin best_iter: {spread_booster.best_iteration}")
-
-    dtrain_w = xgb.DMatrix(X_tr_winner, label=y_tr_w, weight=w_tr, feature_names=winner_feature_cols)
-    dvalid_w = xgb.DMatrix(X_va_winner, label=y_va_w, weight=w_va, feature_names=winner_feature_cols)
-    winner_booster = xgb.train(
-        params=params_clf,
-        dtrain=dtrain_w,
-        num_boost_round=5000,
-        evals=[(dvalid_w, "valid")],
-        early_stopping_rounds=150,
-        verbose_eval=False,
-    )
-    print(f"✅ XGB Win best_iter: {winner_booster.best_iteration}")
-
-    lgb_train = lgb.Dataset(X_tr_spread, label=y_tr_m, weight=w_tr, feature_name=spread_feature_cols)
-    lgb_valid = lgb.Dataset(X_va_spread, label=y_va_m, weight=w_va, reference=lgb_train, feature_name=spread_feature_cols)
     lgb_spread = lgb.train(
         lgb_params,
         lgb_train,
@@ -2753,48 +2502,7 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         valid_sets=[lgb_valid],
         callbacks=lgb_callbacks,
     )
-    print(f"✅ LGB Raw Margin best_iter: {lgb_spread.best_iteration}")
-
-    spread_edge_booster = None
-    lgb_spread_edge = None
-    market_train = train.loc[tr_idx].copy()
-    market_valid = train.loc[va_idx].copy()
-    market_train = market_train[market_train["vegas_spread_home"].notna()].copy()
-    market_valid = market_valid[market_valid["vegas_spread_home"].notna()].copy()
-    if len(market_train) >= 75 and len(market_valid) >= 20:
-        X_tr_edge = market_train[spread_feature_cols].copy()
-        X_va_edge = market_valid[spread_feature_cols].copy()
-        y_tr_edge = (market_train["actual_home_margin"] - _market_implied_home_margin(market_train["vegas_spread_home"])).clip(-25, 25)
-        y_va_edge = (market_valid["actual_home_margin"] - _market_implied_home_margin(market_valid["vegas_spread_home"])).clip(-25, 25)
-        recency_tr_edge = np.exp(-((market_train["game_dt_et"].max() - market_train["game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
-        recency_va_edge = np.exp(-((market_valid["game_dt_et"].max() - market_valid["game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
-        w_tr_edge = season_weights(market_train["season"], current_season) * recency_tr_edge.to_numpy()
-        w_va_edge = season_weights(market_valid["season"], current_season) * recency_va_edge.to_numpy()
-
-        dtrain_edge = xgb.DMatrix(X_tr_edge, label=y_tr_edge, weight=w_tr_edge, feature_names=spread_feature_cols)
-        dvalid_edge = xgb.DMatrix(X_va_edge, label=y_va_edge, weight=w_va_edge, feature_names=spread_feature_cols)
-        spread_edge_booster = xgb.train(
-            params=params_reg,
-            dtrain=dtrain_edge,
-            num_boost_round=4000,
-            evals=[(dvalid_edge, "valid")],
-            early_stopping_rounds=125,
-            verbose_eval=False,
-        )
-        print(f"✅ XGB Market Edge best_iter: {spread_edge_booster.best_iteration}")
-
-        lgb_train_edge = lgb.Dataset(X_tr_edge, label=y_tr_edge, weight=w_tr_edge, feature_name=spread_feature_cols)
-        lgb_valid_edge = lgb.Dataset(X_va_edge, label=y_va_edge, weight=w_va_edge, reference=lgb_train_edge, feature_name=spread_feature_cols)
-        lgb_spread_edge = lgb.train(
-            lgb_params,
-            lgb_train_edge,
-            num_boost_round=2500,
-            valid_sets=[lgb_valid_edge],
-            callbacks=lgb_callbacks,
-        )
-        print(f"✅ LGB Market Edge best_iter: {lgb_spread_edge.best_iteration}")
-    else:
-        print(f"⚠️ Market spread history is sparse ({len(market_train)} train / {len(market_valid)} valid rows). Using raw-margin fallback model only.")
+    print(f"✅ LGB Margin best_iter: {lgb_spread.best_iteration}")
 
     raw_va_w = winner_booster.predict(
         dvalid_w,
@@ -2804,60 +2512,15 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
     iso.fit(raw_va_w, y_va_w.values)
     print("✅ Isotonic calibration fitted")
 
-    raw_pred_ab_xgb = spread_booster.predict(dvalid, iteration_range=(0, spread_booster.best_iteration + 1))
-    raw_pred_ab_lgb = lgb_spread.predict(X_va_spread.values)
-    raw_pred_ab = 0.75 * raw_pred_ab_xgb + 0.25 * raw_pred_ab_lgb
-    teamA_is_home_va = (pd.to_numeric(train.loc[va_idx, "teamA_id"], errors="coerce") == pd.to_numeric(train.loc[va_idx, "home_id"], errors="coerce")).to_numpy()
-    raw_pred_home = np.where(teamA_is_home_va, raw_pred_ab, -raw_pred_ab)
-    actual_home_margin_va = np.where(teamA_is_home_va, y_va_m.to_numpy(), -y_va_m.to_numpy())
-    raw_mae = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va)))
-    raw_w3 = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va) <= 3.0))
-    raw_w5 = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va) <= 5.0))
-    print(f"Spread validation (raw fallback): MAE={raw_mae:.3f} | within3={raw_w3:.3%} | within5={raw_w5:.3%}")
-
-    if spread_edge_booster is not None and lgb_spread_edge is not None and len(market_valid) > 0:
-        X_va_edge = market_valid[spread_feature_cols].copy()
-        dvalid_edge_eval = xgb.DMatrix(X_va_edge, feature_names=spread_feature_cols)
-        edge_pred_xgb = spread_edge_booster.predict(dvalid_edge_eval, iteration_range=(0, spread_edge_booster.best_iteration + 1))
-        edge_pred_lgb = lgb_spread_edge.predict(X_va_edge.values)
-        market_margin_base = _market_implied_home_margin(market_valid["vegas_spread_home"]).to_numpy(dtype=float)
-        market_margin = market_margin_base + (0.75 * edge_pred_xgb + 0.25 * edge_pred_lgb)
-        edge_pred_home = (1.0 - MARKET_BLEND) * market_margin + MARKET_BLEND * market_margin_base
-        actual_home_margin_edge = market_valid["actual_home_margin"].to_numpy()
-        edge_mae = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge)))
-        edge_w3 = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge) <= 3.0))
-        edge_w5 = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge) <= 5.0))
-        print(f"Spread validation (market-aware): MAE={edge_mae:.3f} | within3={edge_w3:.3%} | within5={edge_w5:.3%}")
-
-        cover = actual_home_margin_edge + market_valid["vegas_spread_home"].to_numpy()
-        pred_edge = edge_pred_home + market_valid["vegas_spread_home"].to_numpy()
-        ats_mask = np.abs(pred_edge) > 1.0
-        if ats_mask.any():
-            ats_wins = np.where(pred_edge[ats_mask] > 0, cover[ats_mask] > 0, cover[ats_mask] < 0)
-            print(f"ATS validation (market-aware, |edge|>1): {float(np.mean(ats_wins)):.3%} on {int(ats_mask.sum())} games")
-        else:
-            print("ATS validation (market-aware, |edge|>1): n/a")
-
-    diff_cols2 = winner_feature_cols
-    feature_cols = spread_feature_cols
-    return spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp, diff_cols2, feature_cols
+    feature_cols = diff_cols2
+    return spread_booster, winner_booster, lgb_spread, iso, imp, diff_cols2, feature_cols
 
 
-def save_models(spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp, model_dir: str):
+def save_models(spread_booster, winner_booster, lgb_spread, iso, imp, model_dir: str):
     import pickle
     spread_booster.save_model(os.path.join(model_dir, "spread_booster.json"))
-    if spread_edge_booster is not None:
-        spread_edge_booster.save_model(os.path.join(model_dir, "spread_edge_booster.json"))
-    else:
-        with contextlib.suppress(OSError):
-            os.remove(os.path.join(model_dir, "spread_edge_booster.json"))
     winner_booster.save_model(os.path.join(model_dir, "winner_booster.json"))
     lgb_spread.save_model(os.path.join(model_dir, "lgb_spread.txt"))
-    if lgb_spread_edge is not None:
-        lgb_spread_edge.save_model(os.path.join(model_dir, "lgb_spread_edge.txt"))
-    else:
-        with contextlib.suppress(OSError):
-            os.remove(os.path.join(model_dir, "lgb_spread_edge.txt"))
     with open(os.path.join(model_dir, "iso_calibrator.pkl"), "wb") as f:
         pickle.dump(iso, f)
     with open(os.path.join(model_dir, "imputer.pkl"), "wb") as f:
@@ -2871,18 +2534,10 @@ def load_models(model_dir: str):
     spread_booster = xgb.Booster()
     spread_booster.load_model(os.path.join(model_dir, "spread_booster.json"))
 
-    spread_edge_booster = None
-    spread_edge_path = os.path.join(model_dir, "spread_edge_booster.json")
-    if os.path.exists(spread_edge_path):
-        spread_edge_booster = xgb.Booster()
-        spread_edge_booster.load_model(spread_edge_path)
-
     winner_booster = xgb.Booster()
     winner_booster.load_model(os.path.join(model_dir, "winner_booster.json"))
 
     lgb_spread = lgb.Booster(model_file=os.path.join(model_dir, "lgb_spread.txt"))
-    lgb_edge_path = os.path.join(model_dir, "lgb_spread_edge.txt")
-    lgb_spread_edge = lgb.Booster(model_file=lgb_edge_path) if os.path.exists(lgb_edge_path) else None
 
     with open(os.path.join(model_dir, "iso_calibrator.pkl"), "rb") as f:
         iso = pickle.load(f)
@@ -2891,7 +2546,7 @@ def load_models(model_dir: str):
         imp = pickle.load(f)
 
     print("✅ Models loaded from disk")
-    return spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp
+    return spread_booster, winner_booster, lgb_spread, iso, imp
 
 
 
@@ -3627,7 +3282,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     - Data refresh: every RETRAIN_DATA_HOURS
     - Model refit: every RETRAIN_MODEL_DAYS
     """
-    global team_snaps, roll_cols, spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp
+    global team_snaps, roll_cols, spread_booster, winner_booster, lgb_spread, iso, imp
     global diff_cols, diff_cols2, feature_cols, dataset_all, schedule_cur, elo_snap, cur2
     global team_box_hist
 
@@ -3680,7 +3335,6 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     except Exception:
         schedule_hist = schedule_cur.copy()
     current_training_sig = _training_input_signature(TEAM_BOX_DIR, SCHEDULE_DIR)
-    dataset_cache_sig = _training_dataset_cache_signature(current_training_sig, CURRENT_SEASON)
     print(f"  team_box rows: {len(tb_hist):,}  |  schedule rows: {len(schedule_cur):,}")
 
     print("Building rolling snapshots + Elo...")
@@ -3703,40 +3357,32 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
     if need_model:
         print(f"Full model retrain triggered (last: {meta.get('last_model_fit', 'never')})")
-        dataset_all = _load_training_dataset_cache(dataset_cache_sig)
-        if dataset_all is not None and len(dataset_all) > 0:
-            print(f"Loaded engineered training dataset cache ({len(dataset_all):,} rows)")
-        else:
-            print("Building training dataset...")
-            dataset_all = build_game_dataset_from_team_box(
-                team_box=tb_hist,
-                schedule_df=schedule_hist,
-                window=ROLL_WINDOW,
-                elo_df=elo_snap,
-            )
-            dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
-            _save_training_dataset_cache(dataset_all, dataset_cache_sig)
-            print(f"Saved engineered training dataset cache ({len(dataset_all):,} rows)")
+        print("Building training dataset...")
 
+        dataset_all = build_game_dataset_from_team_box(
+            team_box=tb_hist,
+            schedule_df=schedule_hist,
+            window=ROLL_WINDOW,
+            elo_df=elo_snap,
+        )
         dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
         training_rows = int(len(dataset_all))
         injury_cols_in_dataset = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in dataset_all.columns]
         print(f"  Training rows: {training_rows:,}")
         print(f"  Injury columns in dataset: {injury_cols_in_dataset if injury_cols_in_dataset else 'none'}")
 
-        spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp, diff_cols2, feature_cols = train_models(dataset_all, CURRENT_SEASON)
+        spread_booster, winner_booster, lgb_spread, iso, imp, diff_cols2, feature_cols =             train_models(dataset_all, CURRENT_SEASON)
 
         diff_cols = [c for c in diff_cols2 if not c.endswith("__na")]
 
-        save_models(spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp, MODEL_DIR)
-        spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp = load_models(MODEL_DIR)
+        save_models(spread_booster, winner_booster, lgb_spread, iso, imp, MODEL_DIR)
+        spread_booster, winner_booster, lgb_spread, iso, imp = load_models(MODEL_DIR)
         injury_cols_in_features = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in list(feature_cols or [])]
         meta["last_model_fit"] = now_str
         meta["feature_cols"] = feature_cols
         meta["training_input_signature"] = current_training_sig
         meta["last_training_rows"] = training_rows
         meta["injury_feature_cols"] = injury_cols_in_features
-        meta["market_edge_model_version"] = MARKET_EDGE_MODEL_VERSION
         meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
         for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE", "FILTERED_BOARD_CACHE", "_BRACKET_MATCHUP_CACHE"]:
@@ -3754,20 +3400,13 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         print(f"Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
         meta["last_model_refresh_action"] = "skipped"
         try:
-            spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp = load_models(MODEL_DIR)
+            spread_booster, winner_booster, lgb_spread, iso, imp = load_models(MODEL_DIR)
             meta_cols = meta.get("feature_cols", [])
             diff_cols2 = meta_cols
             diff_cols = [c for c in meta_cols if not c.endswith("__na")]
             feature_cols = meta_cols
             injury_cols_in_features = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in list(feature_cols or [])]
             meta["injury_feature_cols"] = injury_cols_in_features
-            if int(meta.get("market_edge_model_version", 0) or 0) < MARKET_EDGE_MODEL_VERSION:
-                spread_edge_booster = None
-                lgb_spread_edge = None
-                meta["market_edge_model_status"] = "disabled_stale_retrain_required"
-                print("Market edge models were trained with an older spread convention and have been disabled. Run Force Retrain to refresh them.")
-            else:
-                meta["market_edge_model_status"] = "ready"
             _save_metadata(meta)
         except Exception as e:
             print(f"Could not load saved models ({e}). Triggering fresh model train...")
@@ -3802,7 +3441,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 def make_xgb_matrix(pregame: pd.DataFrame, booster, imp_ref=None) -> xgb.DMatrix:
     """Builds an XGBoost DMatrix matching the booster's feature names."""
     fnames = list(booster.feature_names)
-    base_cols = [c for c in fnames if not c.endswith("__na")]
+    base_diff = [c for c in fnames if (c.startswith("diff_") or c == "home_court_A") and not c.endswith("__na")]
     na_cols   = [c for c in fnames if c.endswith("__na")]
 
     X = pregame.copy()
@@ -3816,7 +3455,7 @@ def make_xgb_matrix(pregame: pd.DataFrame, booster, imp_ref=None) -> xgb.DMatrix
             X["home_court_A"] = np.where(neutral, 0.0, np.where(teamA_is_home, 1.0, -1.0))
         else:
             X["home_court_A"] = np.where(neutral, 0.0, 0.0)
-    for c in base_cols:
+    for c in base_diff:
         if c not in X.columns:
             X[c] = np.nan
 
@@ -3828,8 +3467,8 @@ def make_xgb_matrix(pregame: pd.DataFrame, booster, imp_ref=None) -> xgb.DMatrix
                 flags[nc] = X[bc].isna().astype("int8")
         X = pd.concat([X, flags], axis=1)
 
-    if imp_ref is not None and base_cols:
-        imp_cols = list(getattr(imp_ref, "feature_names_in_", base_cols))
+    if imp_ref is not None and base_diff:
+        imp_cols = list(getattr(imp_ref, "feature_names_in_", base_diff))
         for c in imp_cols:
             if c not in X.columns:
                 X[c] = np.nan
@@ -3853,9 +3492,6 @@ def predict_slate(
     spread_booster, winner_booster, lgb_spread,
     iso, imp, feature_cols,
     ensemble_weight_lgb: float = 0.25,    # blend weight for LGB margin
-    spread_edge_booster=None,
-    lgb_spread_edge=None,
-    market_blend: float = MARKET_BLEND,
 ) -> pd.DataFrame:
     """
     Runs ensemble prediction on a pregame DataFrame.
@@ -3888,7 +3524,7 @@ def predict_slate(
     X_lgb = model_pregame.reindex(columns=lgb_fnames or fnames, fill_value=0.0)
     lgb_margin = lgb_spread.predict(X_lgb.values)
 
-    # Ensemble raw TeamA margin fallback
+    # Ensemble margin: weighted blend
     pred_margin_ab = (1 - ensemble_weight_lgb) * xgb_margin + ensemble_weight_lgb * lgb_margin
 
     raw_pA = winner_booster.predict(dcur_winner, iteration_range=(0, winner_booster.best_iteration + 1))
@@ -3896,40 +3532,8 @@ def predict_slate(
 
     # Home/Away conversion
     teamA_is_home = (model_pregame["teamA_id"].astype(int) == model_pregame["home_id"].astype(int)).values
-    pred_margin_home_raw = np.where(teamA_is_home, pred_margin_ab, -pred_margin_ab).astype(float)
+    pred_margin_home = np.where(teamA_is_home, pred_margin_ab, -pred_margin_ab).astype(float)
     p_home_win_raw   = np.where(teamA_is_home, pred_pA, 1 - pred_pA).astype(float)
-
-    pred_margin_home = pred_margin_home_raw.copy()
-    vegas_spread_src = model_pregame.get("vegas_spread_home")
-    if vegas_spread_src is None:
-        vegas_spread_src = model_pregame.get("rw_spread_home")
-    if vegas_spread_src is None:
-        vegas_spread_home = pd.Series(np.nan, index=model_pregame.index, dtype=float)
-    else:
-        vegas_spread_home = pd.Series(
-            pd.to_numeric(vegas_spread_src, errors="coerce"),
-            index=model_pregame.index,
-            dtype=float,
-        )
-    market_implied_home_margin = _market_implied_home_margin(vegas_spread_home)
-    has_market_spread = vegas_spread_home.notna().to_numpy()
-    pred_edge_home = np.full(len(model_pregame), np.nan, dtype=float)
-    pred_margin_home_market = np.full(len(model_pregame), np.nan, dtype=float)
-
-    if spread_edge_booster is not None and lgb_spread_edge is not None and has_market_spread.any():
-        dcur_edge = make_xgb_matrix(model_pregame, spread_edge_booster, imp)
-        xgb_edge = spread_edge_booster.predict(dcur_edge, iteration_range=(0, spread_edge_booster.best_iteration + 1))
-        lgb_edge_fnames = list(lgb_spread_edge.feature_name()) if hasattr(lgb_spread_edge, "feature_name") else list(spread_edge_booster.feature_names)
-        X_lgb_edge = model_pregame.reindex(columns=lgb_edge_fnames or list(spread_edge_booster.feature_names), fill_value=0.0)
-        lgb_edge = lgb_spread_edge.predict(X_lgb_edge.values)
-        pred_edge_home = ((1 - ensemble_weight_lgb) * xgb_edge + ensemble_weight_lgb * lgb_edge).astype(float)
-        market_margin_home = market_implied_home_margin.to_numpy(dtype=float) + pred_edge_home
-        pred_margin_home_market = market_margin_home.copy()
-        pred_margin_home = np.where(
-            has_market_spread,
-            (1.0 - market_blend) * market_margin_home + market_blend * market_implied_home_margin.to_numpy(dtype=float),
-            pred_margin_home_raw,
-        )
 
     # Clip for display (never show 0% / 100%)
     EPS = 0.02
@@ -3958,41 +3562,19 @@ def predict_slate(
     spread_pick = np.where(pred_margin_home >= 0, model_pregame["home_team"].values, model_pregame["away_team"].values)
 
     model_line = np.where(
-        np.abs(pred_margin_home) < 0.05,
-        "PK",
-        np.where(
-            pred_margin_home > 0,
-            model_pregame["home_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
-            model_pregame["away_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
-        )
+        pred_margin_home >= 0,
+        model_pregame["home_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
+        model_pregame["away_team"].values + " -" + np.abs(pred_margin_home).round(1).astype(str),
     )
-    ml_spread_disagree = (winner_pick != spread_pick) & (np.abs(pred_margin_home) >= 0.05)
-    if DEV_MODE and np.any(ml_spread_disagree):
-        try:
-            _dashboard_log(
-                "pred_sign_debug",
-                status="ml_spread_disagree",
-                games=int(np.sum(ml_spread_disagree)),
-                samples=model_pregame.loc[ml_spread_disagree, ["home_team", "away_team"]].head(5).to_dict("records"),
-            )
-        except Exception:
-            pass
 
     return model_pregame.assign(
         pred_margin_home=pred_margin_home,
-        pred_margin_home_raw=pred_margin_home_raw,
-        pred_edge_home=pred_edge_home,
-        vegas_spread_home=vegas_spread_home.to_numpy(dtype=float),
-        market_implied_home_margin=market_implied_home_margin.to_numpy(dtype=float),
-        pred_margin_home_market=pred_margin_home_market,
-        has_market_spread=has_market_spread.astype(int),
         p_home_win=p_home_win,
         p_home_win_raw=p_home_win_raw,
         winner_pick=winner_pick,
         pick_conf=pick_conf,
         spread_pick=spread_pick,
         model_line_text=model_line,
-        ml_spread_disagree=ml_spread_disagree.astype(int),
     ).copy()
 
 
@@ -4005,7 +3587,6 @@ def build_board_for_date(
     schedule_df, team_snaps, roll_cols,
     spread_booster, winner_booster, lgb_spread,
     iso, imp, feature_cols,
-    spread_edge_booster=None, lgb_spread_edge=None,
     elo_snap=None,
     verbose=False,
 ) -> pd.DataFrame:
@@ -4025,15 +3606,11 @@ def build_board_for_date(
 
     pregame = normalize_board_for_downstream(pregame)
     pregame = attach_injury_features_to_board(pregame, date_et, INJURY_DIR)
-    pregame = _attach_rotowire_to_board(pregame, date_et)
-    pregame = _add_hybrid_spread_features(pregame)
     pregame = normalize_board_for_downstream(pregame)
 
     board = predict_slate(
         pregame, spread_booster, winner_booster, lgb_spread,
-        iso, imp, feature_cols,
-        spread_edge_booster=spread_edge_booster,
-        lgb_spread_edge=lgb_spread_edge,
+        iso, imp, feature_cols
     )
 
     board = normalize_board_for_downstream(board)
@@ -4103,12 +3680,7 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     """Attaches Rotowire odds to board with home/away flip protection."""
     outb = board.copy()
     rw_cols = ["rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total", "rw_missing_reason"]
-    prior_rw_cols = [c for c in outb.columns if str(c).endswith("_rw")]
-    prior_rw_cols += [
-        "vegas_spread_home", "has_market_spread", "market_abs_spread", "market_home_fav",
-        "vegas_total", "has_market_total",
-    ]
-    outb = outb.drop(columns=[c for c in (rw_cols + prior_rw_cols) if c in outb.columns], errors="ignore")
+    outb = outb.drop(columns=[c for c in rw_cols if c in outb.columns], errors="ignore")
 
     mkt = load_rotowire_all_for_date(slate_date_et, ROTOWIRE_DIR)
     debug_date_key = str(pd.Timestamp(slate_date_et).date())
@@ -4156,7 +3728,7 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     m = m.drop_duplicates("k_game", keep="last")
 
     merged = b.merge(
-        m[["k_game","rw_spread_home","rw_home_ml","rw_away_ml","rw_total","k_home","k_away"]],
+        m[["k_game","rw_spread_home","rw_home_ml","rw_away_ml","rw_total","k_home","k_away","home_id","away_id"]],
         on="k_game", how="left", suffixes=("", "_rw")
     )
     merged["_rw_id_exact_match"] = False
@@ -4270,7 +3842,7 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
         "board_after_attach": debug_after.to_dict("records"),
     }
 
-    merged = merged.drop(columns=["k_away","k_home","k_game","k_home_rw","k_away_rw","home_id_rw","away_id_rw","_rw_id_exact_match"], errors="ignore")
+    merged = merged.drop(columns=["k_away","k_home","k_game","k_home_rw","k_away_rw","_rw_id_exact_match"], errors="ignore")
     has_rw = _normalize_bool_mask(
         merged[["rw_spread_home","rw_home_ml","rw_away_ml","rw_total"]].notna().any(axis=1),
         label="has_rw_final",
@@ -5552,13 +5124,13 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
 
         rg = rg.dropna(subset=["vegas_spread_home", "pred_margin_home", "home_margin_actual"])
         if len(rg) > 0:
-            rg["edge"] = rg["pred_margin_home"] + rg["vegas_spread_home"]
+            rg["edge"] = rg["pred_margin_home"] - rg["vegas_spread_home"]
             rg["pick"] = np.where(rg["edge"] > 0, "HOME",
                            np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
             rg = rg[rg["pick"] != "NO_BET"]
 
             if len(rg) > 0:
-                rg["cover_margin"] = rg["home_margin_actual"] + rg["vegas_spread_home"]
+                rg["cover_margin"] = rg["home_margin_actual"] - rg["vegas_spread_home"]
 
                 # HOME pick wins if actual home margin > vegas spread
                 # AWAY pick wins if actual home margin < vegas spread
@@ -5737,7 +5309,7 @@ def _compute_confidence_band_detailed(board: pd.DataFrame) -> list:
         pm = pd.to_numeric(g["pred_margin_home"], errors="coerce")
         rw = pd.to_numeric(g["rw_spread_home"], errors="coerce")
         hma = g["home_score"] - g["away_score"]
-        edge = pm + rw
+        edge = pm - rw
         cover = hma + rw
         ats_valid = pm.notna() & rw.notna() & hma.notna() & edge.ne(0) & cover.ne(0)
         g.loc[ats_valid, "ats_correct"] = np.where(
@@ -5910,12 +5482,12 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
         rg = rg.dropna(subset=["vegas_spread_home", "pred_margin_home", "home_margin_actual"])
 
         if len(rg):
-            rg["edge"] = rg["pred_margin_home"] + rg["vegas_spread_home"]
+            rg["edge"] = rg["pred_margin_home"] - rg["vegas_spread_home"]
             rg["pick"] = np.where(rg["edge"] > 0, "HOME", np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
             rg = rg[rg["pick"] != "NO_BET"]
 
             if len(rg):
-                rg["cover_margin"] = rg["home_margin_actual"] + rg["vegas_spread_home"]
+                rg["cover_margin"] = rg["home_margin_actual"] - rg["vegas_spread_home"]
                 pushes = rg["cover_margin"] == 0
                 rg = rg[~pushes].copy()
 
@@ -5995,8 +5567,6 @@ def build_or_update_season_accuracy_cache():
                     iso=iso,
                     imp=imp,
                     feature_cols=feature_cols,
-                    spread_edge_booster=spread_edge_booster if "spread_edge_booster" in globals() else None,
-                    lgb_spread_edge=lgb_spread_edge if "lgb_spread_edge" in globals() else None,
                     elo_snap=elo_snap,
                     verbose=False,
                 )
@@ -6067,7 +5637,6 @@ BOARD_CACHE = {}
 HC_FILTER_CACHE = {}
 MATCHUP_SNAPSHOT_CACHE = {}
 FILTERED_BOARD_CACHE = {}
-BRACKET_COMPLETED_LOOKUP_CACHE = {}
 DASHBOARD_RUN_LOG = []
 DASHBOARD_LOG_PATH = os.path.join(BASE_DIR, "dashboard_runtime_log.jsonl")
 STARTUP_DIAGNOSTICS = {}
@@ -6209,13 +5778,11 @@ def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
         iso=iso,
         imp=imp,
         feature_cols=feature_cols,
-        spread_edge_booster=spread_edge_booster if "spread_edge_booster" in globals() else None,
-        lgb_spread_edge=lgb_spread_edge if "lgb_spread_edge" in globals() else None,
         elo_snap=elo_snap,
     )
     if _needs_injury_refresh(board):
         board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
-    if board is not None and len(board) > 0 and "rw_spread_home" not in board.columns:
+    if board is not None and len(board) > 0:
         board = _attach_rotowire_to_board(board, date_et)
     BOARD_CACHE[key] = board.copy() if board is not None else pd.DataFrame()
     if len(BOARD_CACHE) > 12:
@@ -6347,8 +5914,6 @@ def _collect_startup_diagnostics():
 
 def _emit_startup_diagnostics():
     global _STARTUP_DIAGNOSTICS_EMITTED, STARTUP_DIAGNOSTICS
-    if not DEV_MODE:
-        return
     if _STARTUP_DIAGNOSTICS_EMITTED:
         return
     STARTUP_DIAGNOSTICS = _collect_startup_diagnostics()
@@ -6804,6 +6369,12 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
         b["Model Spread"] = ""
         b["Pred_vs_Final"] = ""
 
+    if {"winner_pick", "Pred_vs_Final"}.issubset(b.columns):
+        b["winner_pick"] = [
+            f"<span style='color:#2ECC71;font-weight:800;'>{txt}</span>" if res == "W" else txt
+            for txt, res in zip(b["winner_pick"], b["Pred_vs_Final"])
+        ]
+
     finals = []
     if all(c in b.columns for c in ["home_score", "away_score"]):
         hs = pd.to_numeric(b["home_score"], errors="coerce")
@@ -6829,23 +6400,6 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
         finals = [""] * len(b)
 
     b["Final"] = finals
-
-    if {"winner_pick", "home_team", "away_team", "home_score", "away_score"}.issubset(b.columns):
-        hs_pick = pd.to_numeric(b["home_score"], errors="coerce")
-        aw_pick = pd.to_numeric(b["away_score"], errors="coerce")
-        real_final_mask_pick = _real_final_mask(b)
-        actual_winner = np.where(
-            real_final_mask_pick & hs_pick.notna() & aw_pick.notna(),
-            np.where(hs_pick >= aw_pick, b["home_team"].astype(str), b["away_team"].astype(str)),
-            "",
-        )
-        winner_pick_canon = b["winner_pick"].astype(str).map(canonical_team)
-        actual_winner_canon = pd.Series(actual_winner, index=b.index).astype(str).map(canonical_team)
-        ml_correct = actual_winner_canon.ne("") & winner_pick_canon.eq(actual_winner_canon)
-        b["winner_pick"] = [
-            f"<span style='color:#2ECC71;font-weight:800;'>{txt}</span>" if ok else txt
-            for txt, ok in zip(b["winner_pick"], ml_correct)
-        ]
 
     if show_inj.value and "home_injury_impact" in b.columns:
         b["home_injury_impact"] = pd.to_numeric(b["home_injury_impact"], errors="coerce").map(
@@ -7702,8 +7256,6 @@ def render_matchup(_=None):
                     iso=iso,
                     imp=imp,
                     feature_cols=feature_cols,
-                    spread_edge_booster=spread_edge_booster if "spread_edge_booster" in globals() else None,
-                    lgb_spread_edge=lgb_spread_edge if "lgb_spread_edge" in globals() else None,
                     elo_snap=elo_snap,
                 )
                 if board is not None and len(board) > 0:
@@ -8016,7 +7568,6 @@ BRACKET_SHEET_SCHEMA = {
             "region": ("Bracket Region", "Region"),
             "region_code": ("Region Code",),
             "round_name": ("Round",),
-            "winner_raw": ("Winner",),
         },
     },
     "First_Four": {
@@ -8070,27 +7621,20 @@ def _bracket_lock_state_signature() -> list:
         bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
     except Exception:
         return []
-    if errors:
+    if errors or "First_Four" not in bracket_data:
         return []
-    rows = []
-    for sheet_name in ["First_Four", "First_Round"]:
-        df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
-        if df is None or len(df) == 0 or "winner_raw" not in df.columns:
-            continue
-        df["winner_raw"] = df["winner_raw"].map(_clean_bracket_text)
-        df["game_key"] = df.get("game_key", pd.Series("", index=df.index)).astype(str).str.strip()
-        df = df[df["winner_raw"].astype(str).str.strip().ne("")].copy()
-        if len(df) == 0:
-            continue
-        rows.extend([
-            {
-                "sheet": sheet_name,
-                "game_key": str(row.get("game_key", "")).strip(),
-                "winner": str(row.get("winner_raw", "")).strip(),
-            }
-            for _, row in df.sort_values("game_key").iterrows()
-        ])
-    return rows
+    ff = bracket_data["First_Four"].copy()
+    if ff is None or len(ff) == 0 or "winner_raw" not in ff.columns:
+        return []
+    ff["winner_raw"] = ff["winner_raw"].map(_clean_bracket_text)
+    ff["game_key"] = ff.get("game_key", pd.Series("", index=ff.index)).astype(str).str.strip()
+    ff = ff[ff["winner_raw"].astype(str).str.strip().ne("")].copy()
+    if len(ff) == 0:
+        return []
+    return [
+        {"game_key": str(row.get("game_key", "")).strip(), "winner": str(row.get("winner_raw", "")).strip()}
+        for _, row in ff.sort_values("game_key").iterrows()
+    ]
 
 
 def _normalize_bracket_key(x) -> str:
@@ -8599,7 +8143,7 @@ def _predict_neutral_matchup(team_a: dict, team_b: dict, asof_date) -> dict:
     return _orient_neutral_matchup_result(_BRACKET_MATCHUP_CACHE[key], team_a, team_b)
 
 
-def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date, completed_lookup: dict = None) -> tuple:
+def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date) -> tuple:
     ff = bracket_data["First_Four"].copy()
     fr = bracket_data["First_Round"].copy()
     structure = bracket_data["Structure"].copy()
@@ -8617,8 +8161,6 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date, comple
         winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
         winner = None
         pred = None
-        locked_row = _lookup_completed_bracket_winner("First_Four", team_a["team_name"], team_b["team_name"], completed_lookup or {})
-        locked_result = False
         if winner_raw:
             winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
             if winner is None:
@@ -8630,9 +8172,6 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date, comple
                     f"First Four workbook winner does not match participants for {row.get('game_key', '')}: "
                     f"{winner_raw} vs {row.get('team1_raw', '')} / {row.get('team2_raw', '')}"
                 )
-        elif locked_row is not None:
-            winner = team_a if _bracket_team_canon(team_a["team_name"]) == _bracket_team_canon(locked_row.get("winner_team", "")) else team_b
-            locked_result = True
         else:
             pred = _predict_neutral_matchup(team_a, team_b, asof_date)
             winner = team_a if np.random.random() < pred["p_team_a_win"] else team_b
@@ -8662,8 +8201,6 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date, comple
             "pred_margin": (
                 pred["pred_margin_team_a"] if winner["team_id"] == team_a["team_id"] else -pred["pred_margin_team_a"]
             ) if pred is not None else np.nan,
-            "locked_result": bool(locked_result or bool(winner_raw)),
-            "result_source": "completed_game" if locked_result else ("workbook_lock" if winner_raw else "simulated"),
         })
 
         dest_key = row.get("feeds_into_slot_norm", "")
@@ -8817,8 +8354,8 @@ def _record_advancement_slot(store: dict, team: dict, round_name: str) -> None:
         store[tid][round_name] += 1
 
 
-def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, completed_lookup: dict = None) -> tuple:
-    bracket_ff, first_four_df = _resolve_first_four(bracket_data, team_lookup, asof_date, completed_lookup=completed_lookup)
+def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date) -> tuple:
+    bracket_ff, first_four_df = _resolve_first_four(bracket_data, team_lookup, asof_date)
     structure_df = bracket_ff["Structure"].copy()
     games = _initial_bracket_games(bracket_ff, team_lookup)
     edges, node_meta = _structure_destinations(structure_df)
@@ -8860,30 +8397,8 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, com
             game = games[key]
             if game.get("team1") is None or game.get("team2") is None:
                 continue
-            round_bucket = _normalize_round_name(game.get("round_name", ""))
-            locked_row = _lookup_completed_bracket_winner(
-                round_bucket,
-                game["team1"]["team_name"],
-                game["team2"]["team_name"],
-                completed_lookup or {},
-            )
-            locked_result = False
-            pred = None
-            if locked_row is not None:
-                winner_key = _bracket_team_canon(locked_row.get("winner_team", ""))
-                if winner_key == _bracket_team_canon(game["team1"]["team_name"]):
-                    winner = game["team1"]
-                elif winner_key == _bracket_team_canon(game["team2"]["team_name"]):
-                    winner = game["team2"]
-                else:
-                    raise ValueError(
-                        f"Completed bracket result winner mismatch for {game.get('game_key', key)}: "
-                        f"{locked_row.get('winner_team', '')} not in simulated participants."
-                    )
-                locked_result = True
-            else:
-                pred = _predict_neutral_matchup(game["team1"], game["team2"], asof_date)
-                winner = game["team1"] if np.random.random() < pred["p_team_a_win"] else game["team2"]
+            pred = _predict_neutral_matchup(game["team1"], game["team2"], asof_date)
+            winner = game["team1"] if np.random.random() < pred["p_team_a_win"] else game["team2"]
             loser = game["team2"] if winner["team_id"] == game["team1"]["team_id"] else game["team1"]
             next_round = _next_advancement_bucket(game.get("round_name", ""))
             if next_round:
@@ -8909,14 +8424,8 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, com
                 "loser_id": int(loser["team_id"]),
                 "loser_seed": str(loser.get("seed", "") or ""),
                 "loser_region": str(loser.get("region", "") or ""),
-                "win_prob": pred["p_team_a_win"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
-                    pred["p_team_b_win"] if pred is not None else np.nan
-                ),
-                "proj_margin": pred["pred_margin_team_a"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
-                    -pred["pred_margin_team_a"] if pred is not None else np.nan
-                ),
-                "locked_result": bool(locked_result),
-                "result_source": "completed_game" if locked_result else "simulated",
+                "win_prob": pred["p_team_a_win"] if winner["team_id"] == game["team1"]["team_id"] else pred["p_team_b_win"],
+                "proj_margin": pred["pred_margin_team_a"] if winner["team_id"] == game["team1"]["team_id"] else -pred["pred_margin_team_a"],
             })
             for edge in edges.get(key, []):
                 dest = games[edge["dest_game"]]
@@ -8959,72 +8468,18 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, com
     return pd.DataFrame(list(advancement.values())), latest_run
 
 
-def _simulate_bracket_many(bracket_data: dict, team_lookup: dict, asof_date, sim_n: int, completed_lookup: dict = None) -> tuple:
+def _simulate_bracket_many(bracket_data: dict, team_lookup: dict, asof_date, sim_n: int) -> tuple:
     all_adv = []
     latest_run = pd.DataFrame()
     for _ in range(int(sim_n)):
-        adv_df, latest_run = _simulate_bracket_once(bracket_data, team_lookup, asof_date, completed_lookup=completed_lookup)
+        adv_df, latest_run = _simulate_bracket_once(bracket_data, team_lookup, asof_date)
         all_adv.append(adv_df)
     if not all_adv:
         return pd.DataFrame(), latest_run
     return pd.concat(all_adv, ignore_index=True, sort=False), latest_run
 
 
-def _apply_completed_bracket_advancement_locks(summary_df: pd.DataFrame, completed_games: pd.DataFrame, sim_n: int) -> pd.DataFrame:
-    if summary_df is None or len(summary_df) == 0 or completed_games is None or len(completed_games) == 0:
-        return summary_df
-
-    out = summary_df.copy()
-    out["team_id"] = pd.to_numeric(out.get("team_id"), errors="coerce")
-
-    later_cols_map = {
-        "First_Four": ["First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"],
-        "First_Round": ["Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"],
-        "Second_Round": ["Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"],
-        "Sweet_16": ["Elite_8", "Final_Four", "Championship", "Champion"],
-        "Elite_8": ["Final_Four", "Championship", "Champion"],
-        "Final_Four": ["Championship", "Champion"],
-        "Championship": ["Champion"],
-    }
-
-    cg = completed_games.copy()
-    cg["winner_id"] = pd.to_numeric(cg.get("winner_id"), errors="coerce")
-    cg["loser_id"] = pd.to_numeric(cg.get("loser_id"), errors="coerce")
-    cg["round_bucket"] = cg.get("round_bucket", pd.Series("", index=cg.index)).fillna("").astype(str)
-
-    for _, row in cg.iterrows():
-        round_bucket = str(row.get("round_bucket", "") or "").strip()
-        later_cols = later_cols_map.get(round_bucket, [])
-        if not later_cols:
-            continue
-
-        winner_id = row.get("winner_id")
-        loser_id = row.get("loser_id")
-
-        if pd.notna(winner_id):
-            win_mask = out["team_id"].eq(float(winner_id))
-            if win_mask.any():
-                next_col = later_cols[0]
-                if next_col in out.columns:
-                    out.loc[win_mask, next_col] = int(sim_n)
-                next_pct = f"{next_col}_Pct"
-                if next_pct in out.columns:
-                    out.loc[win_mask, next_pct] = 100.0
-
-        if pd.notna(loser_id):
-            lose_mask = out["team_id"].eq(float(loser_id))
-            if lose_mask.any():
-                for col in later_cols:
-                    if col in out.columns:
-                        out.loc[lose_mask, col] = 0
-                    pct_col = f"{col}_Pct"
-                    if pct_col in out.columns:
-                        out.loc[lose_mask, pct_col] = 0.0
-
-    return out
-
-
-def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int, completed_games: pd.DataFrame = None) -> pd.DataFrame:
+def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int) -> pd.DataFrame:
     if adv_df is None or len(adv_df) == 0:
         return pd.DataFrame()
     value_cols = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
@@ -9048,62 +8503,19 @@ def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int, completed_g
     for col in value_cols:
         summary[f"{col}_Pct"] = (100.0 * summary[col] / float(sim_n)).round(1)
     summary["Finalist_Pct"] = summary["Championship_Pct"]
-    summary = _apply_completed_bracket_advancement_locks(summary, completed_games, sim_n)
     return summary.sort_values(
         ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct", "Elite_8_Pct"],
         ascending=False,
     ).reset_index(drop=True)
 
 
-def _completed_results_runtime_signature(asof_date=None) -> dict:
-    asof_txt = str(pd.Timestamp(asof_date).date()) if asof_date is not None else ""
-    out = {
-        "asof_date": asof_txt,
-        "last_date": str(pd.Timestamp(LAST_DATE).date()) if "LAST_DATE" in globals() and LAST_DATE is not None else "",
-        "last_board_rows": int(len(LAST_BOARD)) if "LAST_BOARD" in globals() and LAST_BOARD is not None else 0,
-        "last_board_finals": 0,
-        "schedule_rows": int(len(schedule_cur)) if "schedule_cur" in globals() and schedule_cur is not None else 0,
-        "schedule_completed": 0,
-        "workbook_locks": _bracket_lock_state_signature(),
-    }
-    try:
-        if "LAST_BOARD" in globals() and LAST_BOARD is not None and len(LAST_BOARD) > 0:
-            out["last_board_finals"] = int(_real_final_mask(LAST_BOARD).sum())
-    except Exception:
-        out["last_board_finals"] = 0
-    try:
-        if "schedule_cur" in globals() and schedule_cur is not None and len(schedule_cur) > 0:
-            s = normalize_board_for_downstream(schedule_cur.copy())
-            completed = pd.Series(False, index=s.index)
-            completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
-            completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
-            hs = pd.to_numeric(s.get("home_score"), errors="coerce")
-            aw = pd.to_numeric(s.get("away_score"), errors="coerce")
-            completed |= hs.notna() & aw.notna() & ~(hs.eq(0) & aw.eq(0))
-            out["schedule_completed"] = int(completed.sum())
-    except Exception:
-        out["schedule_completed"] = 0
-    return out
-
-
-def _bracket_cache_signature(sim_n: int, asof_date, completed_games: pd.DataFrame = None) -> dict:
+def _bracket_cache_signature(sim_n: int, asof_date) -> dict:
     meta = _load_metadata()
     return {
         "workbook": _bracket_file_signature(_get_bracket_workbook_path()),
         "sim_n": int(sim_n),
         "asof_date": str(pd.Timestamp(asof_date).date()),
         "lock_state": _bracket_lock_state_signature(),
-        "completed_game_locks": [
-            {
-                "round_bucket": str(row.get("round_bucket", "") or ""),
-                "winner_id": int(row.get("winner_id")) if pd.notna(row.get("winner_id")) else None,
-                "pair": list(tuple(sorted([
-                    _bracket_team_canon(row.get("home_team", "")),
-                    _bracket_team_canon(row.get("away_team", "")),
-                ]))),
-            }
-            for _, row in completed_games.iterrows()
-        ] if completed_games is not None and len(completed_games) > 0 else [],
         "last_model_fit": meta.get("last_model_fit", ""),
         "feature_cols_n": len(meta.get("feature_cols", feature_cols if "feature_cols" in globals() else [])),
     }
@@ -9186,19 +8598,18 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
 
 
 BRACKET_BUCKETS = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
-BRACKET_COMPLETED_SOURCE_DEBUG = {}
 
 
-def _completed_workbook_round_locks(sheet_name: str, round_bucket: str, result_source: str) -> pd.DataFrame:
+def _completed_first_four_from_workbook() -> pd.DataFrame:
     try:
         bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
     except Exception:
         return pd.DataFrame()
 
-    if errors or sheet_name not in bracket_data:
+    if errors or "First_Four" not in bracket_data:
         return pd.DataFrame()
 
-    ff = bracket_data[sheet_name].copy()
+    ff = bracket_data["First_Four"].copy()
     if ff is None or len(ff) == 0 or "winner_raw" not in ff.columns:
         return pd.DataFrame()
 
@@ -9248,183 +8659,73 @@ def _completed_workbook_round_locks(sheet_name: str, round_bucket: str, result_s
             "loser_id": loser_id,
             "winner_team": winner_team_name,
             "loser_team": loser_team_name,
-            "round_bucket": round_bucket,
+            "round_bucket": "First_Four",
             "status_type_completed": True,
             "status_type_state": "post",
             "status_type_name": "WORKBOOK_LOCKED_WINNER",
             "status_type_short_detail": "Workbook Winner",
             "game_dt_et": pd.NaT,
-            "result_source": result_source,
         })
 
-    out = pd.DataFrame(rows)
-    BRACKET_COMPLETED_SOURCE_DEBUG[result_source] = {
-        "source": result_source,
-        "rows": int(len(ff)),
-        "completed_rows": int(len(out)),
-        "tournament_rows": int(len(out)),
-        "first_round_rows": int(len(out)) if round_bucket == "First_Round" else 0,
-        "first_four_rows": int(len(out)) if round_bucket == "First_Four" else 0,
-        "final_rows": int(len(out)),
-    }
-    return out
+    return pd.DataFrame(rows)
 
 
-def _completed_first_four_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("First_Four", "First_Four", "workbook_first_four")
-
-
-def _completed_first_round_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("First_Round", "First_Round", "workbook_first_round")
-
-
-def _extract_completed_tournament_games_from_frame(df: pd.DataFrame, debug_key: str = "") -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        if debug_key:
-            BRACKET_COMPLETED_SOURCE_DEBUG[debug_key] = {
-                "source": debug_key,
-                "rows": 0,
-                "completed_rows": 0,
-                "tournament_rows": 0,
-                "first_round_rows": 0,
-                "first_four_rows": 0,
-                "final_rows": 0,
-            }
-        return pd.DataFrame()
-
-    s = normalize_board_for_downstream(df.copy())
-    s = _coerce_schedule_tournament_flags(s, debug_key=debug_key or "bracket_accuracy_source")
-    source_stats = {
-        "source": str(debug_key or "completed_source"),
-        "rows": int(len(s)),
-        "completed_rows": 0,
-        "tournament_rows": 0,
-        "first_round_rows": 0,
-        "first_four_rows": 0,
-        "final_rows": 0,
-    }
-    if "season" in s.columns:
-        s["season"] = pd.to_numeric(s["season"], errors="coerce")
-        s = s[s["season"].fillna(CURRENT_SEASON).eq(CURRENT_SEASON)].copy()
-        source_stats["rows"] = int(len(s))
-
-    completed = pd.Series(False, index=s.index)
-    completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
-    completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
-    home_score = pd.to_numeric(s.get("home_score"), errors="coerce")
-    away_score = pd.to_numeric(s.get("away_score"), errors="coerce")
-    completed |= home_score.notna() & away_score.notna() & ~(home_score.eq(0) & away_score.eq(0))
-    source_stats["completed_rows"] = int(completed.sum())
-
-    text_blob = (
-        s.get("status_type_short_detail", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("status_type_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("notes", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("game_note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("game_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("event_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("season_type", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("round_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("round", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("tournament_round", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("tourney_round", pd.Series("", index=s.index)).astype(str).fillna("")
-    )
-    s["round_bucket"] = text_blob.map(_normalize_round_name)
-
-    tourney = s.get("is_ncaa_tourney", pd.Series(0, index=s.index))
-    tourney = pd.to_numeric(tourney, errors="coerce").fillna(0).astype(int).eq(1)
-    source_stats["tournament_rows"] = int(tourney.sum())
-    source_stats["first_round_rows"] = int((tourney & completed & s["round_bucket"].eq("First_Round")).sum())
-    source_stats["first_four_rows"] = int((tourney & completed & s["round_bucket"].eq("First_Four")).sum())
-    s = s[tourney & completed].copy()
-    if len(s) == 0:
-        if debug_key:
-            BRACKET_COMPLETED_SOURCE_DEBUG[debug_key] = source_stats
-        return pd.DataFrame()
-
-    s["home_id"] = pd.to_numeric(s.get("home_id"), errors="coerce")
-    s["away_id"] = pd.to_numeric(s.get("away_id"), errors="coerce")
-    s["home_score"] = pd.to_numeric(s.get("home_score"), errors="coerce")
-    s["away_score"] = pd.to_numeric(s.get("away_score"), errors="coerce")
-    s = s.dropna(subset=["home_id", "away_id", "home_score", "away_score"]).copy()
-    if len(s) == 0:
-        return pd.DataFrame()
-
-    s["home_id"] = s["home_id"].astype(int)
-    s["away_id"] = s["away_id"].astype(int)
-    s["winner_id"] = np.where(s["home_score"] >= s["away_score"], s["home_id"], s["away_id"]).astype(int)
-    s["loser_id"] = np.where(s["home_score"] >= s["away_score"], s["away_id"], s["home_id"]).astype(int)
-    s["winner_team"] = np.where(s["home_score"] >= s["away_score"], s["home_team"], s["away_team"])
-    s["loser_team"] = np.where(s["home_score"] >= s["away_score"], s["away_team"], s["home_team"])
-    s["game_dt_et"] = pd.to_datetime(s.get("game_dt_et"), errors="coerce")
-    s["result_source"] = str(debug_key or "completed_source")
-    source_stats["final_rows"] = int(len(s))
-    if debug_key:
-        BRACKET_COMPLETED_SOURCE_DEBUG[debug_key] = source_stats
-    return s[[
-        "game_id", "home_id", "away_id", "home_team", "away_team",
-        "winner_id", "loser_id", "winner_team", "loser_team",
-        "round_bucket", "status_type_completed", "status_type_state",
-        "status_type_name", "status_type_short_detail", "game_dt_et", "result_source"
-    ]].copy()
-
-
-def _completed_tournament_games_for_accuracy(asof_date=None) -> pd.DataFrame:
-    global BRACKET_COMPLETED_SOURCE_DEBUG
-    BRACKET_COMPLETED_SOURCE_DEBUG = {}
+def _completed_tournament_games_for_accuracy() -> pd.DataFrame:
     frames = []
 
     if "schedule_cur" in globals() and schedule_cur is not None and len(schedule_cur) > 0:
-        sched_games = _extract_completed_tournament_games_from_frame(schedule_cur, debug_key="bracket_accuracy_schedule")
-        if len(sched_games) > 0:
-            frames.append(sched_games)
+        s = normalize_board_for_downstream(schedule_cur.copy())
+        s = _coerce_schedule_tournament_flags(s, debug_key="bracket_accuracy_schedule")
+        if "season" in s.columns:
+            s["season"] = pd.to_numeric(s["season"], errors="coerce")
+            s = s[s["season"].fillna(CURRENT_SEASON).eq(CURRENT_SEASON)].copy()
 
-    seen_board_dates = set()
-    candidate_board_dates = []
-    if asof_date is not None:
-        candidate_board_dates.append(pd.Timestamp(asof_date).date())
-        candidate_board_dates.append((pd.Timestamp(asof_date) - pd.Timedelta(days=1)).date())
-    if "LAST_DATE" in globals() and LAST_DATE is not None:
-        candidate_board_dates.append(pd.Timestamp(LAST_DATE).date())
+        completed = pd.Series(False, index=s.index)
+        completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+        completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
+        home_score = pd.to_numeric(s.get("home_score"), errors="coerce")
+        away_score = pd.to_numeric(s.get("away_score"), errors="coerce")
+        completed |= home_score.notna() & away_score.notna() & ~(home_score.eq(0) & away_score.eq(0))
 
-    if "LAST_BOARD" in globals() and LAST_BOARD is not None and len(LAST_BOARD) > 0:
-        live_label = f"bracket_accuracy_live_board_{pd.Timestamp(LAST_DATE).date()}" if "LAST_DATE" in globals() and LAST_DATE is not None else "bracket_accuracy_live_board"
-        live_games = _extract_completed_tournament_games_from_frame(LAST_BOARD, debug_key=live_label)
-        if len(live_games) > 0:
-            frames.append(live_games)
+        text_blob = (
+            s.get("status_type_short_detail", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("status_type_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("notes", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("game_note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("game_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
+            s.get("event_name", pd.Series("", index=s.index)).astype(str).fillna("")
+        )
+        s["round_bucket"] = text_blob.map(_normalize_round_name)
 
-    for board_date in candidate_board_dates:
-        if board_date is None:
-            continue
-        board_date = pd.Timestamp(board_date).date()
-        if board_date in seen_board_dates:
-            continue
-        seen_board_dates.add(board_date)
-        try:
-            if "LAST_DATE" in globals() and LAST_DATE is not None and "LAST_BOARD" in globals() and LAST_BOARD is not None and len(LAST_BOARD) > 0:
-                if pd.Timestamp(LAST_DATE).date() == board_date:
-                    board_df = LAST_BOARD.copy()
-                else:
-                    board_df, _ = _get_board_for_date_cached(board_date, force_rebuild=False)
-            else:
-                board_df, _ = _get_board_for_date_cached(board_date, force_rebuild=False)
-            board_games = _extract_completed_tournament_games_from_frame(
-                board_df,
-                debug_key=f"bracket_accuracy_board_{board_date.isoformat()}",
-            )
-            if len(board_games) > 0:
-                frames.append(board_games)
-        except Exception:
-            pass
+        tourney = s.get("is_ncaa_tourney", pd.Series(0, index=s.index))
+        tourney = pd.to_numeric(tourney, errors="coerce").fillna(0).astype(int).eq(1)
+        s = s[tourney & completed].copy()
+        if len(s):
+            s["home_id"] = pd.to_numeric(s.get("home_id"), errors="coerce")
+            s["away_id"] = pd.to_numeric(s.get("away_id"), errors="coerce")
+            s["home_score"] = pd.to_numeric(s.get("home_score"), errors="coerce")
+            s["away_score"] = pd.to_numeric(s.get("away_score"), errors="coerce")
+            s = s.dropna(subset=["home_id", "away_id", "home_score", "away_score"]).copy()
+            if len(s):
+                s["home_id"] = s["home_id"].astype(int)
+                s["away_id"] = s["away_id"].astype(int)
+                s["winner_id"] = np.where(s["home_score"] >= s["away_score"], s["home_id"], s["away_id"]).astype(int)
+                s["loser_id"] = np.where(s["home_score"] >= s["away_score"], s["away_id"], s["home_id"]).astype(int)
+                s["winner_team"] = np.where(s["home_score"] >= s["away_score"], s["home_team"], s["away_team"])
+                s["loser_team"] = np.where(s["home_score"] >= s["away_score"], s["away_team"], s["home_team"])
+                s["game_dt_et"] = pd.to_datetime(s.get("game_dt_et"), errors="coerce")
+                frames.append(s[[
+                    "game_id", "home_id", "away_id", "home_team", "away_team",
+                    "winner_id", "loser_id", "winner_team", "loser_team",
+                    "round_bucket", "status_type_completed", "status_type_state",
+                    "status_type_name", "status_type_short_detail", "game_dt_et"
+                ]].copy())
 
     workbook_ff = _completed_first_four_from_workbook()
     if workbook_ff is not None and len(workbook_ff) > 0:
         frames.append(workbook_ff.copy())
-    workbook_fr = _completed_first_round_from_workbook()
-    if workbook_fr is not None and len(workbook_fr) > 0:
-        frames.append(workbook_fr.copy())
 
     if not frames:
         return pd.DataFrame()
@@ -9438,120 +8739,6 @@ def _completed_tournament_games_for_accuracy(asof_date=None) -> pd.DataFrame:
     )
     out = out.drop(columns=["winner_key", "loser_key"], errors="ignore")
     return out.reset_index(drop=True)
-
-
-def _completed_tournament_lock_lookup(asof_date=None) -> tuple:
-    cache_key = json.dumps(_completed_results_runtime_signature(asof_date), sort_keys=True, default=str)
-    cached = BRACKET_COMPLETED_LOOKUP_CACHE.get(cache_key)
-    if cached is not None:
-        lookup_cached, locks_cached = cached
-        return dict(lookup_cached), locks_cached.copy()
-
-    completed_games = _completed_tournament_games_for_accuracy(asof_date=asof_date)
-    if completed_games is None or len(completed_games) == 0:
-        return {}, pd.DataFrame()
-
-    locks = completed_games.copy()
-    locks["game_dt_et"] = pd.to_datetime(locks.get("game_dt_et"), errors="coerce")
-    if asof_date is not None:
-        asof_ts = pd.Timestamp(asof_date).normalize()
-        locks = locks[locks["game_dt_et"].isna() | (locks["game_dt_et"].dt.normalize() <= asof_ts)].copy()
-    if len(locks) == 0:
-        return {}, pd.DataFrame()
-
-    locks["round_bucket"] = locks.get("round_bucket", pd.Series("", index=locks.index)).astype(str).fillna("")
-    locks["team_pair_key"] = locks.apply(
-        lambda r: tuple(sorted([
-            _bracket_team_canon(r.get("home_team", "")),
-            _bracket_team_canon(r.get("away_team", "")),
-        ])),
-        axis=1,
-    )
-    locks["winner_key"] = locks.get("winner_team", pd.Series("", index=locks.index)).map(_bracket_team_canon)
-    locks = locks.sort_values(["game_dt_et", "winner_team", "loser_team"], na_position="last")
-    locks = locks.drop_duplicates(subset=["round_bucket", "team_pair_key"], keep="last").reset_index(drop=True)
-
-    lookup = {}
-    for _, row in locks.iterrows():
-        lookup[(str(row.get("round_bucket", "") or ""), tuple(row.get("team_pair_key", ())))] = row.to_dict()
-    BRACKET_COMPLETED_LOOKUP_CACHE.clear()
-    BRACKET_COMPLETED_LOOKUP_CACHE[cache_key] = (dict(lookup), locks.copy())
-    return lookup, locks
-
-
-def _lookup_completed_bracket_winner(round_bucket: str, team_a_name: str, team_b_name: str, completed_lookup: dict):
-    if not completed_lookup:
-        return None
-    pair_key = tuple(sorted([
-        _bracket_team_canon(team_a_name),
-        _bracket_team_canon(team_b_name),
-    ]))
-    exact = completed_lookup.get((str(round_bucket or ""), pair_key))
-    if exact is not None:
-        return exact
-    pair_matches = [row for (rb, pk), row in completed_lookup.items() if pk == pair_key]
-    if len(pair_matches) == 1:
-        return pair_matches[0]
-    return None
-
-
-def _completed_lock_debug_summary(asof_date, completed_games: pd.DataFrame, completed_lookup: dict) -> dict:
-    out = {
-        "asof_date": str(pd.Timestamp(asof_date).date()) if asof_date is not None else "",
-        "completed_games_detected": 0,
-        "lookup_rows": 0,
-        "round_buckets_found": "none",
-        "example_locked_pairs": "none",
-        "blank_round_rows": 0,
-        "first_round_count": 0,
-        "first_round_examples": "none",
-        "sources": "none",
-        "source_details": "none",
-        "first_round_sources": "none",
-    }
-    if completed_games is None or len(completed_games) == 0:
-        return out
-
-    cg = completed_games.copy()
-    cg["round_bucket"] = cg.get("round_bucket", pd.Series("", index=cg.index)).fillna("").astype(str)
-    out["completed_games_detected"] = int(len(cg))
-    out["lookup_rows"] = int(len(completed_lookup or {}))
-    out["blank_round_rows"] = int(cg["round_bucket"].str.strip().eq("").sum())
-
-    bucket_counts = cg["round_bucket"].replace("", "(blank)").value_counts()
-    if len(bucket_counts):
-        out["round_buckets_found"] = " | ".join([f"{idx}: {int(val)}" for idx, val in bucket_counts.head(8).items()])
-
-    sample = cg.head(5).copy()
-    if len(sample):
-        out["example_locked_pairs"] = " | ".join([
-            f"{str(r.get('round_bucket', '') or '(blank)')}: {str(r.get('away_team', '') or '').strip()} vs {str(r.get('home_team', '') or '').strip()} -> {str(r.get('winner_team', '') or '').strip()}"
-            for _, r in sample.iterrows()
-        ])
-
-    first_round = cg[cg["round_bucket"].eq("First_Round")].copy()
-    out["first_round_count"] = int(len(first_round))
-    if len(first_round):
-        out["first_round_examples"] = " | ".join([
-            f"{str(r.get('away_team', '') or '').strip()} vs {str(r.get('home_team', '') or '').strip()} -> {str(r.get('winner_team', '') or '').strip()}"
-            for _, r in first_round.head(5).iterrows()
-        ])
-
-    if "result_source" in cg.columns:
-        src_counts = cg["result_source"].fillna("").astype(str).replace("", "(unknown)").value_counts()
-        if len(src_counts):
-            out["sources"] = " | ".join([f"{idx}: {int(val)}" for idx, val in src_counts.items()])
-
-    src_debug = globals().get("BRACKET_COMPLETED_SOURCE_DEBUG", {}) or {}
-    if src_debug:
-        out["source_details"] = " | ".join([
-            f"{name}: rows={int(meta.get('rows', 0))}, completed={int(meta.get('completed_rows', 0))}, tourney={int(meta.get('tournament_rows', 0))}, first_round={int(meta.get('first_round_rows', 0))}, final={int(meta.get('final_rows', 0))}"
-            for name, meta in src_debug.items()
-        ])
-        first_round_sources = [name for name, meta in src_debug.items() if int(meta.get("first_round_rows", 0)) > 0]
-        if first_round_sources:
-            out["first_round_sources"] = " | ".join(first_round_sources)
-    return out
 
 
 def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame) -> dict:
@@ -9904,31 +9091,7 @@ def run_bracket_simulation(_=None, force_run: bool = True):
 
     normalized_data = dict(bracket_data)
     normalized_data["Bracket_Games"] = bracket_games
-    completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
-    lock_debug = _completed_lock_debug_summary(asof_date, completed_games, completed_lookup)
-    round_counts = {}
-    source_counts = {}
-    if completed_games is not None and len(completed_games) > 0:
-        round_counts = (
-            completed_games.get("round_bucket", pd.Series("", index=completed_games.index))
-            .fillna("")
-            .astype(str)
-            .value_counts()
-            .to_dict()
-        )
-        if "result_source" in completed_games.columns:
-            source_counts = (
-                completed_games["result_source"]
-                .fillna("")
-                .astype(str)
-                .replace("", "(unknown)")
-                .value_counts()
-                .to_dict()
-            )
-    first_round_locked = int(round_counts.get("First_Round", 0))
-    first_four_locked = int(round_counts.get("First_Four", 0))
-    source_summary = " | ".join([f"{k}: {int(v)}" for k, v in source_counts.items()]) if source_counts else "none"
-    signature = _bracket_cache_signature(sim_n, asof_date, completed_games=completed_games)
+    signature = _bracket_cache_signature(sim_n, asof_date)
 
     payload = None
     if not force_run:
@@ -9945,29 +9108,11 @@ def run_bracket_simulation(_=None, force_run: bool = True):
                 extra = "<br>" + "<br>".join(info_msgs)
             warnings = _validate_bracket_summary(payload.get("summary_df"))
             warn_html = _warning_html("Bracket validation", warnings)
-            cached_run = payload.get("latest_run_df", pd.DataFrame())
-            locked_count = 0
-            if cached_run is not None and len(cached_run) > 0 and "locked_result" in cached_run.columns:
-                locked_count = int(pd.to_numeric(cached_run["locked_result"], errors="coerce").fillna(0).astype(int).sum())
-            warning_line = "<br>WARNING: No First Round games locked" if first_round_locked == 0 else ""
             bracket_status_html.value = (
                 f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#bbb;'>"
-                f"Loaded cached bracket simulation for {signature['asof_date']} ({sim_n} sims).<br>"
-                f"Locked games: <b>{locked_count}</b> (First Round: <b>{first_round_locked}</b> | First Four: <b>{first_four_locked}</b>)<br>"
-                f"Result sources: {source_summary}"
-                f"{warning_line}{extra}</div>"
+                f"Loaded cached bracket simulation for {signature['asof_date']} ({sim_n} sims).{extra}</div>"
                 + warn_html
             )
-            # Verbose debug kept for later if needed:
-            # f"As-of date: <b>{lock_debug['asof_date']}</b><br>"
-            # f"Result sources: {lock_debug['sources']}<br>"
-            # f"Source details: {lock_debug['source_details']}<br>"
-            # f"Round buckets found: {lock_debug['round_buckets_found']}<br>"
-            # f"First_Round games detected: <b>{lock_debug['first_round_count']}</b><br>"
-            # f"First_Round supplied by: {lock_debug['first_round_sources']}<br>"
-            # f"Example First_Round locked pairs: {lock_debug['first_round_examples']}<br>"
-            # f"Blank round rows: <b>{lock_debug['blank_round_rows']}</b><br>"
-            # f"Example locked pairs: {lock_debug['example_locked_pairs']}"
             _render_bracket_results(payload.get("summary_df"), payload.get("latest_run_df"))
             _dashboard_log(
                 "bracket_sim",
@@ -9980,8 +9125,8 @@ def run_bracket_simulation(_=None, force_run: bool = True):
             return
 
     try:
-        adv_df, latest_run_df = _simulate_bracket_many(normalized_data, team_lookup, asof_date, sim_n, completed_lookup=completed_lookup)
-        summary_df = _summarize_bracket_simulations(adv_df, sim_n, completed_games=completed_games)
+        adv_df, latest_run_df = _simulate_bracket_many(normalized_data, team_lookup, asof_date, sim_n)
+        summary_df = _summarize_bracket_simulations(adv_df, sim_n)
         _save_cached_bracket_sim(signature, summary_df, latest_run_df)
     except Exception as e:
         bracket_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Bracket simulation failed: {e}</div>"
@@ -9994,28 +9139,12 @@ def run_bracket_simulation(_=None, force_run: bool = True):
         extra = "<br>" + "<br>".join(info_msgs)
     warnings = _validate_bracket_summary(summary_df)
     warn_html = _warning_html("Bracket validation", warnings)
-    locked_count = 0
-    if latest_run_df is not None and len(latest_run_df) > 0 and "locked_result" in latest_run_df.columns:
-        locked_count = int(pd.to_numeric(latest_run_df["locked_result"], errors="coerce").fillna(0).astype(int).sum())
-    warning_line = "<br>WARNING: No First Round games locked" if first_round_locked == 0 else ""
     bracket_status_html.value = (
         f"<div style='background:#111;border-left:4px solid #2ECC71;padding:10px;color:#bbb;'>"
-        f"Completed bracket simulation for {pd.Timestamp(asof_date).date()} ({sim_n} sims).<br>"
-        f"Locked games: <b>{locked_count}</b> (First Round: <b>{first_round_locked}</b> | First Four: <b>{first_four_locked}</b>)<br>"
-        f"Result sources: {source_summary}"
-        f"{warning_line}{extra}</div>"
+        f"Completed bracket simulation for {pd.Timestamp(asof_date).date()} with {sim_n} runs.<br>"
+        f"Saved to: {BRACKET_OUTPUT_DIR}{extra}</div>"
         + warn_html
     )
-    # Verbose debug kept for later if needed:
-    # f"As-of date: <b>{lock_debug['asof_date']}</b><br>"
-    # f"Result sources: {lock_debug['sources']}<br>"
-    # f"Source details: {lock_debug['source_details']}<br>"
-    # f"Round buckets found: {lock_debug['round_buckets_found']}<br>"
-    # f"First_Round games detected: <b>{lock_debug['first_round_count']}</b><br>"
-    # f"First_Round supplied by: {lock_debug['first_round_sources']}<br>"
-    # f"Example First_Round locked pairs: {lock_debug['first_round_examples']}<br>"
-    # f"Blank round rows: <b>{lock_debug['blank_round_rows']}</b><br>"
-    # f"Example locked pairs: {lock_debug['example_locked_pairs']}<br>"
     _render_bracket_results(summary_df, latest_run_df)
     _dashboard_log(
         "bracket_sim",
@@ -10228,7 +9357,7 @@ def _safe_ats_vs_rotowire(g: pd.DataFrame) -> dict:
         return {"ats_games": 0, "ats_acc": np.nan, "pushes": 0}
 
     x["hma"] = x["hs"] - x["as"]
-    x["edge"] = x["pred_margin_home"] + x["rw_spread_home"]
+    x["edge"] = x["pred_margin_home"] - x["rw_spread_home"]
     x = x[x["edge"].abs() > 0]
 
     if len(x) == 0:
