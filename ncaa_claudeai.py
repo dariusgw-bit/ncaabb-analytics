@@ -2613,20 +2613,21 @@ def _print_sample_weight_debug(
         .sort_values("season")
     )
 
-    print(f"{label.title()} season weight summary:")
+    lines = [f"{label.title()} season weight summary:"]
     for _, row in season_summary.iterrows():
-        print(
+        lines.append(
             f"{int(row['season'])}: rows={int(row['rows'])} "
             f"raw_mean={float(row['raw_mean']):.4f} raw_min={float(row['raw_min']):.4f} raw_max={float(row['raw_max']):.4f} "
             f"final_mean={float(row['final_mean']):.4f} final_min={float(row['final_min']):.4f} final_max={float(row['final_max']):.4f}"
         )
         if int(row["zero_rows"]) >= int(row["rows"]):
-            print(f"WARNING: season {int(row['season'])} has all-zero sample weights")
+            lines.append(f"WARNING: season {int(row['season'])} has all-zero sample weights")
 
     global_min = float(final_w.min()) if len(final_w) else float("nan")
     global_max = float(final_w.max()) if len(final_w) else float("nan")
     zero_rows = int(np.isclose(final_w.fillna(0.0), 0.0).sum()) if len(final_w) else 0
-    print(f"Global weights: min={global_min:.4f} max={global_max:.4f} zero_rows={zero_rows}")
+    lines.append(f"Global weights: min={global_min:.4f} max={global_max:.4f} zero_rows={zero_rows}")
+    print("\n".join(lines))
 
 
 def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON):
@@ -2682,8 +2683,13 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
     spread_feature_cols = [c for c in spread_feature_cols_all if c in keep_cols]
     winner_feature_cols = [c for c in winner_feature_cols_all if c in keep_cols]
 
-    print(f"Winner features after variance filter: {len(winner_feature_cols)}")
-    print(f"Spread features after variance filter: {len(spread_feature_cols)}")
+    print(
+        "\n".join([
+            "MODEL FEATURES",
+            f"Winner features after variance filter: {len(winner_feature_cols)}",
+            f"Spread features after variance filter: {len(spread_feature_cols)}",
+        ])
+    )
 
     train_sorted = train.sort_values("game_dt_et").copy()
     if len(train_sorted) < 500:
@@ -2777,7 +2783,6 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         early_stopping_rounds=150,
         verbose_eval=False,
     )
-    print(f"✅ XGB Raw Margin best_iter: {spread_booster.best_iteration}")
 
     dtrain_w = xgb.DMatrix(X_tr_winner, label=y_tr_w, weight=w_tr, feature_names=winner_feature_cols)
     dvalid_w = xgb.DMatrix(X_va_winner, label=y_va_w, weight=w_va, feature_names=winner_feature_cols)
@@ -2789,7 +2794,6 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         early_stopping_rounds=150,
         verbose_eval=False,
     )
-    print(f"✅ XGB Win best_iter: {winner_booster.best_iteration}")
 
     lgb_train = lgb.Dataset(X_tr_spread, label=y_tr_m, weight=w_tr, feature_name=spread_feature_cols)
     lgb_valid = lgb.Dataset(X_va_spread, label=y_va_m, weight=w_va, reference=lgb_train, feature_name=spread_feature_cols)
@@ -2800,7 +2804,6 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         valid_sets=[lgb_valid],
         callbacks=lgb_callbacks,
     )
-    print(f"✅ LGB Raw Margin best_iter: {lgb_spread.best_iteration}")
 
     spread_edge_booster = None
     lgb_spread_edge = None
@@ -2832,7 +2835,6 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
             early_stopping_rounds=125,
             verbose_eval=False,
         )
-        print(f"✅ XGB Market Edge best_iter: {spread_edge_booster.best_iteration}")
 
         lgb_train_edge = lgb.Dataset(X_tr_edge, label=y_tr_edge, weight=w_tr_edge, feature_name=spread_feature_cols)
         lgb_valid_edge = lgb.Dataset(X_va_edge, label=y_va_edge, weight=w_va_edge, reference=lgb_train_edge, feature_name=spread_feature_cols)
@@ -2843,9 +2845,26 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
             valid_sets=[lgb_valid_edge],
             callbacks=lgb_callbacks,
         )
-        print(f"✅ LGB Market Edge best_iter: {lgb_spread_edge.best_iteration}")
+        print(
+            "\n".join([
+                "MODEL FIT STATUS",
+                f"✅ XGB Raw Margin best_iter: {spread_booster.best_iteration}",
+                f"✅ XGB Win best_iter: {winner_booster.best_iteration}",
+                f"✅ LGB Raw Margin best_iter: {lgb_spread.best_iteration}",
+                f"✅ XGB Market Edge best_iter: {spread_edge_booster.best_iteration}",
+                f"✅ LGB Market Edge best_iter: {lgb_spread_edge.best_iteration}",
+            ])
+        )
     else:
-        print(f"⚠️ Market spread history is sparse ({len(market_train)} train / {len(market_valid)} valid rows). Using raw-margin fallback model only.")
+        print(
+            "\n".join([
+                "MODEL FIT STATUS",
+                f"✅ XGB Raw Margin best_iter: {spread_booster.best_iteration}",
+                f"✅ XGB Win best_iter: {winner_booster.best_iteration}",
+                f"✅ LGB Raw Margin best_iter: {lgb_spread.best_iteration}",
+                f"⚠️ Market spread history is sparse ({len(market_train)} train / {len(market_valid)} valid rows). Using raw-margin fallback model only.",
+            ])
+        )
 
     raw_va_w = winner_booster.predict(
         dvalid_w,
@@ -2853,7 +2872,6 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
     )
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(raw_va_w, y_va_w.values)
-    print("✅ Isotonic calibration fitted")
 
     raw_pred_ab_xgb = spread_booster.predict(dvalid, iteration_range=(0, spread_booster.best_iteration + 1))
     raw_pred_ab_lgb = lgb_spread.predict(X_va_spread.values)
@@ -2864,7 +2882,11 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
     raw_mae = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va)))
     raw_w3 = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va) <= 3.0))
     raw_w5 = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va) <= 5.0))
-    print(f"Spread validation (raw fallback): MAE={raw_mae:.3f} | within3={raw_w3:.3%} | within5={raw_w5:.3%}")
+    eval_lines = [
+        "MODEL EVAL",
+        "✅ Isotonic calibration fitted",
+        f"Spread validation (raw fallback): MAE={raw_mae:.3f} | within3={raw_w3:.3%} | within5={raw_w5:.3%}",
+    ]
 
     if spread_edge_booster is not None and lgb_spread_edge is not None and len(market_valid) > 0:
         X_va_edge = market_valid[spread_feature_cols].copy()
@@ -2878,16 +2900,18 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         edge_mae = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge)))
         edge_w3 = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge) <= 3.0))
         edge_w5 = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge) <= 5.0))
-        print(f"Spread validation (market-aware): MAE={edge_mae:.3f} | within3={edge_w3:.3%} | within5={edge_w5:.3%}")
+        eval_lines.append(f"Spread validation (market-aware): MAE={edge_mae:.3f} | within3={edge_w3:.3%} | within5={edge_w5:.3%}")
 
         cover = actual_home_margin_edge + market_valid["vegas_spread_home"].to_numpy()
         pred_edge = edge_pred_home + market_valid["vegas_spread_home"].to_numpy()
         ats_mask = np.abs(pred_edge) > 1.0
         if ats_mask.any():
             ats_wins = np.where(pred_edge[ats_mask] > 0, cover[ats_mask] > 0, cover[ats_mask] < 0)
-            print(f"ATS validation (market-aware, |edge|>1): {float(np.mean(ats_wins)):.3%} on {int(ats_mask.sum())} games")
+            eval_lines.append(f"ATS validation (market-aware, |edge|>1): {float(np.mean(ats_wins)):.3%} on {int(ats_mask.sum())} games")
         else:
-            print("ATS validation (market-aware, |edge|>1): n/a")
+            eval_lines.append("ATS validation (market-aware, |edge|>1): n/a")
+
+    print("\n".join(eval_lines))
 
     diff_cols2 = winner_feature_cols
     feature_cols = spread_feature_cols
@@ -3684,7 +3708,12 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
 
     meta = _load_metadata()
     now_str = datetime.utcnow().isoformat()
-    print(f"Starting retrain check: force_data={bool(force_data)}, force_model={bool(force_model)}")
+    print(
+        "\n".join([
+            "RETRAIN CHECK",
+            f"force_data={bool(force_data)} | force_model={bool(force_model)}",
+        ])
+    )
     _dashboard_log("retrain_check", status="start", force_data=bool(force_data), force_model=bool(force_model))
 
     need_data = force_data or _hours_since(meta.get("last_data_refresh")) >= RETRAIN_DATA_HOURS
@@ -3694,7 +3723,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     injury_cols_in_features = []
 
     if need_data:
-        print(f"Data refresh triggered (last: {meta.get('last_data_refresh', 'never')})")
+        print(f"DATA REFRESH\nTriggered (last: {meta.get('last_data_refresh', 'never')})")
 
         run_hoopr_refresh(
             raw_dir=RAW_DIR,
@@ -3719,10 +3748,9 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         meta["last_data_refresh_action"] = "executed"
         _save_metadata(meta)
     else:
-        print(f"Data refresh skipped (last: {meta.get('last_data_refresh', 'never')})")
+        print(f"DATA REFRESH\nSkipped (last: {meta.get('last_data_refresh', 'never')})")
         meta["last_data_refresh_action"] = "skipped"
 
-    print("Loading team box history...")
     team_box_hist = load_team_box_history(TEAM_BOX_DIR, HIST_SEASONS)
     tb_hist = team_box_hist.copy()
     schedule_cur = load_schedule(SCHEDULE_DIR, CURRENT_SEASON)
@@ -3732,9 +3760,13 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         schedule_hist = schedule_cur.copy()
     current_training_sig = _training_input_signature(TEAM_BOX_DIR, SCHEDULE_DIR)
     dataset_cache_sig = _training_dataset_cache_signature(current_training_sig, CURRENT_SEASON)
-    print(f"  team_box rows: {len(tb_hist):,}  |  schedule rows: {len(schedule_cur):,}")
-
-    print("Building rolling snapshots + Elo...")
+    print(
+        "\n".join([
+            "DATA LOAD",
+            f"team_box rows: {len(tb_hist):,} | schedule rows: {len(schedule_cur):,}",
+            "Building rolling snapshots + Elo...",
+        ])
+    )
     team_snaps, roll_cols = build_team_rolling_snapshots(tb_hist, window=ROLL_WINDOW)
     elo_snap = compute_elo_ratings(tb_hist)
     if "_refresh_matchup_team_options" in globals():
@@ -3753,12 +3785,15 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             need_model = False
 
     if need_model:
-        print(f"Full model retrain triggered (last: {meta.get('last_model_fit', 'never')})")
+        retrain_lines = [
+            "MODEL RETRAIN",
+            f"Triggered (last: {meta.get('last_model_fit', 'never')})",
+        ]
         dataset_all = _load_training_dataset_cache(dataset_cache_sig)
         if dataset_all is not None and len(dataset_all) > 0:
-            print(f"Loaded engineered training dataset cache ({len(dataset_all):,} rows)")
+            retrain_lines.append(f"Loaded engineered training dataset cache ({len(dataset_all):,} rows)")
         else:
-            print("Building training dataset...")
+            retrain_lines.append("Building training dataset...")
             dataset_all = build_game_dataset_from_team_box(
                 team_box=tb_hist,
                 schedule_df=schedule_hist,
@@ -3767,13 +3802,14 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             )
             dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
             _save_training_dataset_cache(dataset_all, dataset_cache_sig)
-            print(f"Saved engineered training dataset cache ({len(dataset_all):,} rows)")
+            retrain_lines.append(f"Saved engineered training dataset cache ({len(dataset_all):,} rows)")
 
         dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
         training_rows = int(len(dataset_all))
         injury_cols_in_dataset = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in dataset_all.columns]
-        print(f"  Training rows: {training_rows:,}")
-        print(f"  Injury columns in dataset: {injury_cols_in_dataset if injury_cols_in_dataset else 'none'}")
+        retrain_lines.append(f"Training rows: {training_rows:,}")
+        retrain_lines.append(f"Injury columns in dataset: {injury_cols_in_dataset if injury_cols_in_dataset else 'none'}")
+        print("\n".join(retrain_lines))
 
         spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp, diff_cols2, feature_cols = train_models(dataset_all, CURRENT_SEASON)
 
@@ -3800,9 +3836,9 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             globals()["HC_REPORT_CACHE"] = None
         if "HC_REPORT_DATE" in globals():
             globals()["HC_REPORT_DATE"] = None
-        print("Model retrain complete")
+        print("MODEL STATUS\nModel retrain complete")
     else:
-        print(f"Model is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
+        print(f"MODEL STATUS\nModel is fresh (last fit: {meta.get('last_model_fit', 'never')}). Loading from disk.")
         meta["last_model_refresh_action"] = "skipped"
         try:
             spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp = load_models(MODEL_DIR)
@@ -3816,7 +3852,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
                 spread_edge_booster = None
                 lgb_spread_edge = None
                 meta["market_edge_model_status"] = "disabled_stale_retrain_required"
-                print("Market edge models were trained with an older spread convention and have been disabled. Run Force Retrain to refresh them.")
+                print("MODEL STATUS\nMarket edge models were trained with an older spread convention and have been disabled. Run Force Retrain to refresh them.")
             else:
                 meta["market_edge_model_status"] = "ready"
             _save_metadata(meta)
@@ -3834,7 +3870,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         data_refresh=meta.get("last_data_refresh_action", "unknown"),
         model_refresh=meta.get("last_model_refresh_action", "unknown"),
     )
-    print("Scheduler complete. All globals ready.")
+    print("RETRAIN COMPLETE\nScheduler complete. All globals ready.")
     return {
         "data_refresh_action": meta.get("last_data_refresh_action", "unknown"),
         "model_refresh_action": meta.get("last_model_refresh_action", "unknown"),
