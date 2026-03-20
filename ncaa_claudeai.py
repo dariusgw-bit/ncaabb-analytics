@@ -6711,6 +6711,38 @@ def _real_final_mask(df: pd.DataFrame) -> pd.Series:
 
 def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     b = board.copy()
+    winner_col = next((c for c in ["winner_team", "winner"] if c in b.columns), None)
+    winner_raw = (
+        b[winner_col].fillna("").astype(str).str.strip()
+        if winner_col is not None else
+        pd.Series("", index=b.index, dtype=object)
+    )
+    game_dt_series = pd.to_datetime(
+        b.get("game_dt_et", b.get("game_date_time", pd.Series(pd.NaT, index=b.index))),
+        errors="coerce",
+    )
+    if getattr(game_dt_series.dt, "tz", None) is not None:
+        game_dt_series = game_dt_series.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    today_et = pd.Timestamp.now(tz="America/New_York").date()
+    row_game_date = game_dt_series.dt.date
+    is_future_game = row_game_date.gt(today_et).fillna(False)
+    hs_base = pd.to_numeric(b.get("home_score", pd.Series(np.nan, index=b.index)), errors="coerce")
+    aw_base = pd.to_numeric(b.get("away_score", pd.Series(np.nan, index=b.index)), errors="coerce")
+    completed_by_score = hs_base.notna() & aw_base.notna() & ~(hs_base.eq(0) & aw_base.eq(0))
+    status_completed_mask = _coerce_bool_series(b.get("status_type_completed", False), b.index)
+    state_completed_mask = b.get("status_type_state", pd.Series("", index=b.index)).astype(str).str.strip().str.lower().isin({"post", "postgame", "final"})
+    detail_completed_mask = b.get("status_type_short_detail", pd.Series("", index=b.index)).astype(str).str.strip().str.lower().str.contains("final", na=False)
+    completed_by_winner = winner_raw.ne("") & (status_completed_mask | state_completed_mask | detail_completed_mask)
+    completed_mask = (~is_future_game) & (completed_by_score | completed_by_winner)
+    actual_winner_series = pd.Series(
+        np.where(
+            (~is_future_game) & completed_by_score,
+            np.where(hs_base >= aw_base, b["home_team"].astype(str), b["away_team"].astype(str)),
+            np.where((~is_future_game) & completed_by_winner, winner_raw, ""),
+        ),
+        index=b.index,
+        dtype=object,
+    )
 
     for col in ["pick_conf", "p_home_win"]:
         if col in b.columns:
@@ -6761,22 +6793,27 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     # Model Spread + Pred_vs_Final
     if "pred_margin_home" in b.columns:
         pm = pd.to_numeric(b["pred_margin_home"], errors="coerce")
-        hs = pd.to_numeric(b.get("home_score", pd.Series(np.nan, index=b.index)), errors="coerce")
-        aw = pd.to_numeric(b.get("away_score", pd.Series(np.nan, index=b.index)), errors="coerce")
-        real_final_mask = _real_final_mask(b)
-        actual_margin = (hs - aw).where(real_final_mask, np.nan)
+        actual_margin = (hs_base - aw_base).where((~is_future_game) & completed_by_score, np.nan)
 
-        def _pred_vs_final_spread(pred_margin, actual_margin):
-            if pd.isna(pred_margin) or pd.isna(actual_margin):
+        def _pred_vs_final_spread(pred_margin, actual_margin, actual_winner, home_team, away_team):
+            if pd.isna(pred_margin):
                 return ""
-            if float(pred_margin) == 0 or float(actual_margin) == 0:
+            if pd.notna(actual_margin):
+                if float(pred_margin) == 0 or float(actual_margin) == 0:
+                    return "P"
+                return "W" if ((pred_margin > 0 and actual_margin > pred_margin) or
+                               (pred_margin < 0 and actual_margin < pred_margin)) else "L"
+            actual_key = canonical_team(actual_winner)
+            if not actual_key:
+                return ""
+            if abs(float(pred_margin)) < 1e-9:
                 return "P"
-            return "W" if ((pred_margin > 0 and actual_margin > pred_margin) or
-                           (pred_margin < 0 and actual_margin < pred_margin)) else "L"
+            pred_winner_key = canonical_team(home_team if float(pred_margin) > 0 else away_team)
+            return "W" if pred_winner_key == actual_key else "L"
 
         b["Pred_vs_Final"] = [
-            _pred_vs_final_spread(p, a)
-            for p, a in zip(pm, actual_margin)
+            _pred_vs_final_spread(p, a, w, ht, at)
+            for p, a, w, ht, at in zip(pm, actual_margin, actual_winner_series, b["home_team"], b["away_team"])
         ]
 
         model_txt = []
@@ -6806,9 +6843,9 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
 
     finals = []
     if all(c in b.columns for c in ["home_score", "away_score"]):
-        hs = pd.to_numeric(b["home_score"], errors="coerce")
-        aw = pd.to_numeric(b["away_score"], errors="coerce")
-        real_final_mask = _real_final_mask(b)
+        hs = hs_base.copy()
+        aw = aw_base.copy()
+        real_final_mask = (~is_future_game) & completed_by_score
 
         for ht, at, h, a, is_final in zip(b["home_team"], b["away_team"], hs, aw, real_final_mask):
             if not is_final or pd.isna(h) or pd.isna(a):
@@ -6830,18 +6867,10 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
 
     b["Final"] = finals
 
-    if {"winner_pick", "home_team", "away_team", "home_score", "away_score"}.issubset(b.columns):
-        hs_pick = pd.to_numeric(b["home_score"], errors="coerce")
-        aw_pick = pd.to_numeric(b["away_score"], errors="coerce")
-        real_final_mask_pick = _real_final_mask(b)
-        actual_winner = np.where(
-            real_final_mask_pick & hs_pick.notna() & aw_pick.notna(),
-            np.where(hs_pick >= aw_pick, b["home_team"].astype(str), b["away_team"].astype(str)),
-            "",
-        )
+    if {"winner_pick", "home_team", "away_team"}.issubset(b.columns):
         winner_pick_canon = b["winner_pick"].astype(str).map(canonical_team)
-        actual_winner_canon = pd.Series(actual_winner, index=b.index).astype(str).map(canonical_team)
-        ml_correct = actual_winner_canon.ne("") & winner_pick_canon.eq(actual_winner_canon)
+        actual_winner_canon = actual_winner_series.astype(str).map(canonical_team)
+        ml_correct = completed_mask & actual_winner_canon.ne("") & winner_pick_canon.eq(actual_winner_canon)
         b["winner_pick"] = [
             f"<span style='color:#2ECC71;font-weight:800;'>{txt}</span>" if ok else txt
             for txt, ok in zip(b["winner_pick"], ml_correct)
@@ -7531,7 +7560,7 @@ bracket_acc_status_html = widgets.HTML()
 bracket_acc_out = widgets.Output()
 
 
-def render_matchup(_=None):
+def _legacy_render_matchup(_=None):
     with matchup_out:
         clear_output(wait=True)
 
@@ -10085,13 +10114,41 @@ def force_retrain_clicked(_=None):
         display(HTML("<div style='color:#9FD89F; padding:6px 0;'>Force retrain flow finished.</div>"))
     _dashboard_log("force_retrain", status="completed", selected_date=str(date_picker.value))
 
-refresh_btn.on_click(lambda _: refresh(force_rebuild=True))
-retrain_btn.on_click(force_retrain_clicked)
-open_dashboard_btn.on_click(open_dashboard_clicked)
+
+def predictions_refresh_clicked(_=None):
+    import html
+    import traceback
+
+    with out:
+        clear_output(wait=True)
+        display(HTML("<div style='color:#AAA; padding:8px;'>Predictions refresh clicked</div>"))
+    try:
+        refresh(force_rebuild=True)
+    except Exception as e:
+        tb = traceback.format_exc()
+        _dashboard_log("predictions_refresh", status="error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
+        with out:
+            clear_output(wait=True)
+            display(HTML(
+                "<div style='color:#ffb4b4; padding:8px;'>"
+                f"Predictions refresh failed: {html.escape(str(e))}</div>"
+                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
+            ))
+
+
+def _rebind_button_click(button, handler):
+    if hasattr(button, "_click_handlers") and hasattr(button._click_handlers, "callbacks"):
+        button._click_handlers.callbacks = []
+    button.on_click(handler)
+
+
+_rebind_button_click(refresh_btn, predictions_refresh_clicked)
+_rebind_button_click(retrain_btn, force_retrain_clicked)
+_rebind_button_click(open_dashboard_btn, open_dashboard_clicked)
+_rebind_button_click(compare_btn, render_matchup)
+_rebind_button_click(run_bracket_btn, lambda _: run_bracket_simulation(force_run=True))
+_rebind_button_click(refresh_bracket_acc_btn, _render_bracket_accuracy)
 date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
-compare_btn.on_click(render_matchup)
-run_bracket_btn.on_click(lambda _: run_bracket_simulation(force_run=True))
-refresh_bracket_acc_btn.on_click(_render_bracket_accuracy)
 
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
