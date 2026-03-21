@@ -4033,7 +4033,7 @@ def predict_slate(
     tournament_mode_applied = np.zeros(len(model_pregame), dtype=int)
     if tournament_mode_enabled and tournament_neutral.any():
         tournament_mask = tournament_neutral.to_numpy(dtype=bool)
-        abs_margin = np.abs(pred_margin_home).astype(float)
+        abs_margin = np.abs(pred_margin_home_raw).astype(float)
         damp_scale = np.where(
             abs_margin >= 20.0, TOURNEY_SPREAD_DAMP_STRONG,
             np.where(
@@ -4041,12 +4041,9 @@ def predict_slate(
                 np.where(abs_margin >= 8.0, TOURNEY_SPREAD_DAMP_LIGHT, TOURNEY_SPREAD_DAMP_SMALL)
             )
         ).astype(float)
-        target_margin = np.where(has_market_spread, market_implied_home_margin.to_numpy(dtype=float), 0.0).astype(float)
-        damped_margin = np.where(
-            has_market_spread,
-            target_margin + damp_scale * (pred_margin_home - target_margin),
-            pred_margin_home * damp_scale,
-        ).astype(float)
+        # Tournament Mode removes market influence from the displayed spread and
+        # instead dampens the raw model margin toward zero for neutral-site games.
+        damped_margin = (pred_margin_home_raw * damp_scale).astype(float)
         pred_margin_home = np.where(tournament_mask, damped_margin, pred_margin_home).astype(float)
         tournament_mode_applied = tournament_mask.astype(int)
 
@@ -4140,6 +4137,11 @@ def build_board_for_date(
         return pd.DataFrame()
 
     pregame = normalize_board_for_downstream(pregame)
+    pregame = _attach_schedule_tournament_context(
+        pregame, schedule_df, date_et,
+        debug_key=f"pregame_context_{pd.Timestamp(date_et).date()}",
+    )
+    pregame = _coerce_schedule_tournament_flags(pregame, debug_key=f"pregame_board_{pd.Timestamp(date_et).date()}")
     pregame = attach_injury_features_to_board(pregame, date_et, INJURY_DIR)
     pregame = _attach_rotowire_to_board(pregame, date_et)
     pregame = _add_hybrid_spread_features(pregame)
@@ -6277,7 +6279,16 @@ def _models_ready() -> bool:
 
 
 def _board_cache_key(date_et) -> tuple:
-    return (str(pd.Timestamp(date_et).date()), _dashboard_runtime_signature())
+    tournament_mode_on = False
+    try:
+        tournament_mode_on = bool(tournament_mode.value)
+    except Exception:
+        tournament_mode_on = False
+    return (
+        str(pd.Timestamp(date_et).date()),
+        tournament_mode_on,
+        _dashboard_runtime_signature(),
+    )
 
 
 def _filter_cache_key(date_et) -> tuple:
@@ -8153,6 +8164,7 @@ BRACKET_TEAM_ALIASES = {
 }
 
 BRACKET_REQUIRED_SHEETS = ("First_Round", "First_Four", "Structure")
+BRACKET_OPTIONAL_SHEETS = ("Second_Round",)
 BRACKET_SHEET_SCHEMA = {
     "First_Round": {
         "required": {
@@ -8161,6 +8173,22 @@ BRACKET_SHEET_SCHEMA = {
             "team2_raw": ("Team B", "Team2", "Home_Team"),
         },
         "optional": {
+            "game_number": ("Game Number",),
+            "seed1": ("Seed A", "Seed1", "Away_Seed"),
+            "seed2": ("Seed B", "Seed2", "Home_Seed"),
+            "region": ("Bracket Region", "Region"),
+            "region_code": ("Region Code",),
+            "round_name": ("Round",),
+            "winner_raw": ("Winner",),
+        },
+    },
+    "Second_Round": {
+        "required": {
+            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
+        },
+        "optional": {
+            "team1_raw": ("Team A", "Team1", "Away_Team"),
+            "team2_raw": ("Team B", "Team2", "Home_Team"),
             "game_number": ("Game Number",),
             "seed1": ("Seed A", "Seed1", "Away_Seed"),
             "seed2": ("Seed B", "Seed2", "Home_Seed"),
@@ -8205,6 +8233,23 @@ def _get_bracket_workbook_path() -> str:
     return os.environ.get("NCAABB_BRACKET_PATH", BRACKET_WORKBOOK_PATH)
 
 
+def _resolve_bracket_sheet_names(sheets_dict: dict) -> dict:
+    if not isinstance(sheets_dict, dict):
+        return {}
+    raw_map = {str(k): v for k, v in sheets_dict.items()}
+    key_map = {_normalize_bracket_key(k): k for k in raw_map.keys()}
+    resolved = {}
+    for sheet_name in list(BRACKET_REQUIRED_SHEETS) + list(BRACKET_OPTIONAL_SHEETS):
+        direct = raw_map.get(sheet_name)
+        if direct is not None:
+            resolved[sheet_name] = direct
+            continue
+        alt_key = _normalize_bracket_key(sheet_name)
+        if alt_key in key_map:
+            resolved[sheet_name] = raw_map[key_map[alt_key]]
+    return resolved
+
+
 def _bracket_file_signature(path: str) -> dict:
     if not path or not os.path.exists(path):
         return {}
@@ -8224,7 +8269,7 @@ def _bracket_lock_state_signature() -> list:
     if errors:
         return []
     rows = []
-    for sheet_name in ["First_Four", "First_Round"]:
+    for sheet_name in ["First_Four", "First_Round", "Second_Round"]:
         df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
         if df is None or len(df) == 0 or "winner_raw" not in df.columns:
             continue
@@ -8353,6 +8398,90 @@ def _normalize_bracket_slot_position(value):
     return np.nan
 
 
+def _infer_workbook_slot_participants(bracket_data: dict, game_key_norm: str, team_lookup: dict) -> list:
+    structure = bracket_data.get("Structure", pd.DataFrame())
+    if structure is None or len(structure) == 0:
+        return []
+    dest_key = str(game_key_norm or "").strip()
+    if not dest_key:
+        return []
+
+    participants = []
+    seen_ids = set()
+    incoming = structure.loc[structure.get("dest_game_norm", pd.Series("", index=structure.index)).astype(str).eq(dest_key)].copy()
+    if len(incoming) == 0:
+        return []
+
+    source_frames = []
+    for sheet_name in ["First_Four", "First_Round", "Second_Round"]:
+        df = bracket_data.get(sheet_name, pd.DataFrame())
+        if df is not None and len(df) > 0:
+            source_frames.append(df.copy())
+    if not source_frames:
+        return []
+    source_games = pd.concat(source_frames, ignore_index=True, sort=False)
+    if "game_key_norm" not in source_games.columns:
+        return []
+
+    for _, edge in incoming.iterrows():
+        src_key = str(edge.get("source_game_norm", "") or "").strip()
+        if not src_key:
+            continue
+        src = source_games.loc[source_games["game_key_norm"].astype(str).eq(src_key)].copy()
+        if len(src) == 0:
+            continue
+        row = src.iloc[-1]
+        winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
+        if not winner_raw:
+            continue
+        winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
+        if winner is None:
+            continue
+        tid = int(winner["team_id"])
+        if tid in seen_ids:
+            continue
+        team = dict(winner)
+        raw1 = str(row.get("team1_raw", "") or "").strip()
+        raw2 = str(row.get("team2_raw", "") or "").strip()
+        if _bracket_team_canon(winner_raw) == _bracket_team_canon(raw1) and pd.notna(row.get("seed1")):
+            team["seed"] = str(row.get("seed1")).strip()
+        elif _bracket_team_canon(winner_raw) == _bracket_team_canon(raw2) and pd.notna(row.get("seed2")):
+            team["seed"] = str(row.get("seed2")).strip()
+        if pd.notna(row.get("region")):
+            team["region"] = str(row.get("region") or "").strip()
+        participants.append(team)
+        seen_ids.add(tid)
+    return participants
+
+
+def _collect_second_round_participant_warnings(bracket_data: dict, team_lookup: dict) -> list:
+    sr = bracket_data.get("Second_Round", pd.DataFrame())
+    if sr is None or len(sr) == 0:
+        return []
+
+    warnings = []
+    for _, row in sr.iterrows():
+        game_key = str(row.get("game_key", "") or "").strip()
+        game_key_norm = str(row.get("game_key_norm", "") or "").strip()
+        raw1 = str(row.get("team1_raw", "") or "").strip()
+        raw2 = str(row.get("team2_raw", "") or "").strip()
+        if not raw1 or not raw2:
+            continue
+
+        inferred = _infer_workbook_slot_participants(bracket_data, game_key_norm, team_lookup)
+        if len(inferred) < 2:
+            continue
+
+        workbook_pair = tuple(sorted([_bracket_team_canon(raw1), _bracket_team_canon(raw2)]))
+        inferred_pair = tuple(sorted([_bracket_team_canon(t.get("team_name", "")) for t in inferred[:2]]))
+        if workbook_pair != inferred_pair:
+            warnings.append(
+                f"Second_Round participant mismatch for {game_key}: workbook has {raw1} / {raw2}, "
+                f"upstream winners imply {inferred[0].get('team_name', '')} / {inferred[1].get('team_name', '')}."
+            )
+    return warnings
+
+
 def _normalize_bracket_carry(value: str) -> str:
     txt = str(value or "").strip().lower()
     if txt == "winner":
@@ -8399,13 +8528,22 @@ def _normalize_bracket_sheet(df: pd.DataFrame, sheet_name: str) -> tuple:
     if errors:
         return pd.DataFrame(), info, errors
 
-    if sheet_name in {"First_Round", "First_Four"}:
+    if sheet_name in {"First_Round", "Second_Round", "First_Four"}:
         out["game_key"] = out["game_key"].astype(str).str.strip()
-        out["team1_raw"] = out["team1_raw"].astype(str).str.strip()
-        out["team2_raw"] = out["team2_raw"].astype(str).str.strip()
+        if "team1_raw" not in out.columns:
+            out["team1_raw"] = ""
+        if "team2_raw" not in out.columns:
+            out["team2_raw"] = ""
+        out["team1_raw"] = out["team1_raw"].fillna("").astype(str).str.strip()
+        out["team2_raw"] = out["team2_raw"].fillna("").astype(str).str.strip()
         if "winner_raw" in out.columns:
             out["winner_raw"] = out["winner_raw"].map(_clean_bracket_text)
-        out = out.replace({"": np.nan}).dropna(subset=["game_key", "team1_raw", "team2_raw"]).copy()
+        if sheet_name == "Second_Round":
+            out = out.replace({"": np.nan}).dropna(subset=["game_key"]).copy()
+            out["team1_raw"] = out["team1_raw"].fillna("")
+            out["team2_raw"] = out["team2_raw"].fillna("")
+        else:
+            out = out.replace({"": np.nan}).dropna(subset=["game_key", "team1_raw", "team2_raw"]).copy()
         if "round_name" in out.columns:
             out["round_name"] = out["round_name"].map(_normalize_round_name)
         else:
@@ -8436,6 +8574,7 @@ def _normalize_bracket_sheet(df: pd.DataFrame, sheet_name: str) -> tuple:
 
 
 def _validate_bracket_workbook(sheets_dict: dict) -> tuple:
+    sheets_dict = _resolve_bracket_sheet_names(sheets_dict)
     missing = [s for s in BRACKET_REQUIRED_SHEETS if s not in sheets_dict]
     if missing:
         return None, [], [f"Missing required workbook sheet(s): {', '.join(missing)}"]
@@ -8443,7 +8582,7 @@ def _validate_bracket_workbook(sheets_dict: dict) -> tuple:
     normalized = {}
     info = []
     errors = []
-    for sheet_name in BRACKET_REQUIRED_SHEETS:
+    for sheet_name in list(BRACKET_REQUIRED_SHEETS) + [s for s in BRACKET_OPTIONAL_SHEETS if s in sheets_dict]:
         norm_df, sheet_info, sheet_errors = _normalize_bracket_sheet(sheets_dict[sheet_name], sheet_name)
         info.extend(sheet_info)
         errors.extend(sheet_errors)
@@ -8543,7 +8682,11 @@ def _resolve_bracket_team_lookup_entry(raw_name: str, team_lookup: dict):
 
 
 def _canonicalize_bracket_teams(bracket_data: dict, team_lookup: dict) -> tuple:
-    games = pd.concat([bracket_data["First_Four"], bracket_data["First_Round"]], ignore_index=True, sort=False)
+    game_frames = [bracket_data.get("First_Four", pd.DataFrame()), bracket_data.get("First_Round", pd.DataFrame())]
+    if "Second_Round" in bracket_data:
+        game_frames.append(bracket_data.get("Second_Round", pd.DataFrame()))
+    game_frames = [df for df in game_frames if df is not None and len(df) > 0]
+    games = pd.concat(game_frames, ignore_index=True, sort=False) if game_frames else pd.DataFrame()
     play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
     unresolved = []
     resolved_count = 0
@@ -8575,6 +8718,8 @@ def _canonicalize_bracket_teams(bracket_data: dict, team_lookup: dict) -> tuple:
 
         for col_raw in ["team1_raw", "team2_raw"]:
             raw = str(row.get(col_raw, "")).strip()
+            if not raw:
+                continue
             canon = _bracket_team_canon(raw)
             if exempt_pair_placeholder and _is_bracket_composite_placeholder(raw):
                 continue
@@ -8844,7 +8989,7 @@ def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date, comple
 def _initial_bracket_games(bracket_data: dict, team_lookup: dict) -> dict:
     games = {}
     play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
-    for sheet_name in ["First_Round"]:
+    for sheet_name in ["First_Round", "Second_Round"]:
         df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
         if len(df) == 0:
             continue
@@ -8856,6 +9001,25 @@ def _initial_bracket_games(bracket_data: dict, team_lookup: dict) -> dict:
 
             raw1 = str(row.get("team1_raw", "")).strip()
             raw2 = str(row.get("team2_raw", "")).strip()
+
+            if sheet_name == "Second_Round" and (not raw1 or not raw2):
+                inferred = _infer_workbook_slot_participants(bracket_data, row.get("game_key_norm", ""), team_lookup)
+                if not raw1 and len(inferred) >= 1:
+                    raw1 = str(inferred[0].get("team_name", "") or "").strip()
+                if not raw2 and len(inferred) >= 2:
+                    raw2 = str(inferred[1].get("team_name", "") or "").strip()
+
+            if sheet_name == "Second_Round":
+                game_key_norm = str(row.get("game_key_norm", "")).strip()
+                games[game_key_norm] = {
+                    "game_key": row["game_key"],
+                    "game_key_norm": game_key_norm,
+                    "round_name": row.get("round_name", sheet_name),
+                    "region": str(row.get("region", "") or ""),
+                    "team1": None,
+                    "team2": None,
+                }
+                continue
 
             team1_pending = is_round_of_64 and slot_norm in play_in_slots and _is_bracket_composite_placeholder(raw1)
             team2_pending = is_round_of_64 and slot_norm in play_in_slots and _is_bracket_composite_placeholder(raw2)
@@ -9071,6 +9235,13 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, com
             })
             for edge in edges.get(key, []):
                 dest = games[edge["dest_game"]]
+                winner_id = int(winner["team_id"])
+                team1_existing = dest.get("team1")
+                team2_existing = dest.get("team2")
+                if team1_existing is not None and int(team1_existing.get("team_id")) == winner_id:
+                    continue
+                if team2_existing is not None and int(team2_existing.get("team_id")) == winner_id:
+                    continue
                 if dest.get("team1") is None:
                     dest["team1"] = dict(winner)
                 elif dest.get("team2") is None:
@@ -9332,6 +9503,27 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
             for col in run_view.columns:
                 if run_view[col].dtype == object:
                     run_view[col] = run_view[col].fillna("")
+            run_show_cols = [
+                "game_key",
+                "round_name",
+                "region",
+                "team1_seed",
+                "team1",
+                "team2_seed",
+                "team2",
+                "winner",
+                "winner_team",
+                "loser",
+                "win_prob",
+                "pred_margin",
+                "locked_result",
+                "result_source",
+                "winner_id",
+                "loser_id",
+                "proj_margin",
+            ]
+            run_show_cols = [c for c in run_show_cols if c in run_view.columns]
+            run_view = run_view[run_show_cols].copy()
             display(HTML("<div style='color:#EEE; font-weight:700; margin:14px 0 8px 0;'>Latest Simulated Bracket Run</div>"))
             display(HTML(df_to_html_table(run_view, max_rows=len(run_view))))
 
@@ -9368,6 +9560,12 @@ def _completed_workbook_round_locks(sheet_name: str, round_bucket: str, result_s
         team1_raw = str(row.get("team1_raw", "")).strip()
         team2_raw = str(row.get("team2_raw", "")).strip()
         winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
+        if round_bucket == "Second_Round" and (not team1_raw or not team2_raw):
+            inferred = _infer_workbook_slot_participants(bracket_data, row.get("game_key_norm", ""), team_lookup)
+            if not team1_raw and len(inferred) >= 1:
+                team1_raw = str(inferred[0].get("team_name", "") or "").strip()
+            if not team2_raw and len(inferred) >= 2:
+                team2_raw = str(inferred[1].get("team_name", "") or "").strip()
         team1_key = _bracket_team_canon(team1_raw)
         team2_key = _bracket_team_canon(team2_raw)
         winner_key = _bracket_team_canon(winner_raw)
@@ -9427,6 +9625,10 @@ def _completed_first_four_from_workbook() -> pd.DataFrame:
 
 def _completed_first_round_from_workbook() -> pd.DataFrame:
     return _completed_workbook_round_locks("First_Round", "First_Round", "workbook_first_round")
+
+
+def _completed_second_round_from_workbook() -> pd.DataFrame:
+    return _completed_workbook_round_locks("Second_Round", "Second_Round", "workbook_second_round")
 
 
 def _extract_completed_tournament_games_from_frame(df: pd.DataFrame, debug_key: str = "") -> pd.DataFrame:
@@ -9576,6 +9778,9 @@ def _completed_tournament_games_for_accuracy(asof_date=None) -> pd.DataFrame:
     workbook_fr = _completed_first_round_from_workbook()
     if workbook_fr is not None and len(workbook_fr) > 0:
         frames.append(workbook_fr.copy())
+    workbook_sr = _completed_second_round_from_workbook()
+    if workbook_sr is not None and len(workbook_sr) > 0:
+        frames.append(workbook_sr.copy())
 
     if not frames:
         return pd.DataFrame()
@@ -10028,6 +10233,7 @@ def run_bracket_simulation(_=None, force_run: bool = True):
 
     normalized_data = dict(bracket_data)
     normalized_data["Bracket_Games"] = bracket_games
+    info_msgs.extend(_collect_second_round_participant_warnings(normalized_data, team_lookup))
     completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
     lock_debug = _completed_lock_debug_summary(asof_date, completed_games, completed_lookup)
     round_counts = {}
