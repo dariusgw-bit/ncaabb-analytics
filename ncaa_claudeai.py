@@ -9227,6 +9227,9 @@ def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, com
                 "win_prob": pred["p_team_a_win"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
                     pred["p_team_b_win"] if pred is not None else np.nan
                 ),
+                "pred_margin": pred["pred_margin_team_a"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
+                    -pred["pred_margin_team_a"] if pred is not None else np.nan
+                ),
                 "proj_margin": pred["pred_margin_team_a"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
                     -pred["pred_margin_team_a"] if pred is not None else np.nan
                 ),
@@ -9477,6 +9480,14 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
     )
     for col in [c for c in ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in champs.columns]:
         champs[col] = champs[col].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
+    champs = champs.rename(columns={
+        "team": "Team",
+        "seed": "Seed",
+        "region": "Region",
+        "Champion_Pct": "Champion",
+        "Finalist_Pct": "Finalist",
+        "Final_Four_Pct": "Final Four",
+    })
     bracket_summary_html.value = (
         "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Champion Probability Summary</div>"
         + df_to_html_table(champs, max_rows=len(champs))
@@ -9494,6 +9505,18 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
     )
     for col in [c for c in show_cols if c.endswith("_Pct")]:
         adv_view[col] = adv_view[col].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
+    adv_view = adv_view.rename(columns={
+        "team": "Team",
+        "seed": "Seed",
+        "region": "Region",
+        "First_Round_Pct": "1st Round",
+        "Second_Round_Pct": "2nd Round",
+        "Sweet_16_Pct": "Sweet 16",
+        "Elite_8_Pct": "Elite 8",
+        "Final_Four_Pct": "Final Four",
+        "Finalist_Pct": "Finalist",
+        "Champion_Pct": "Champion",
+    })
     with bracket_out:
         clear_output(wait=True)
         display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Round Advancement Probabilities</div>"))
@@ -9512,18 +9535,27 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
                 "team2_seed",
                 "team2",
                 "winner",
-                "winner_team",
-                "loser",
                 "win_prob",
-                "pred_margin",
                 "locked_result",
                 "result_source",
-                "winner_id",
-                "loser_id",
                 "proj_margin",
             ]
             run_show_cols = [c for c in run_show_cols if c in run_view.columns]
             run_view = run_view[run_show_cols].copy()
+            run_view = run_view.rename(columns={
+                "game_key": "Game",
+                "round_name": "Round",
+                "region": "Region",
+                "team1_seed": "Seed 1",
+                "team1": "Team 1",
+                "team2_seed": "Seed 2",
+                "team2": "Team 2",
+                "winner": "Winner",
+                "win_prob": "Win Prob",
+                "locked_result": "Locked",
+                "result_source": "Source",
+                "proj_margin": "Proj Margin",
+            })
             display(HTML("<div style='color:#EEE; font-weight:700; margin:14px 0 8px 0;'>Latest Simulated Bracket Run</div>"))
             display(HTML(df_to_html_table(run_view, max_rows=len(run_view))))
 
@@ -10102,7 +10134,7 @@ def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.D
     return report
 
 
-def _render_bracket_accuracy():
+def _render_bracket_accuracy(_=None):
     bracket_acc_status_html.value = ""
     with bracket_acc_out:
         clear_output(wait=True)
@@ -10110,7 +10142,8 @@ def _render_bracket_accuracy():
 
     sim_n = int(bracket_sim_n.value)
     asof_date = bracket_asof_date.value or date_picker.value
-    signature = _bracket_cache_signature(sim_n, asof_date)
+    completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
+    signature = _bracket_cache_signature(sim_n, asof_date, completed_games=completed_games)
 
     payload = None
     try:
@@ -10131,6 +10164,12 @@ def _render_bracket_accuracy():
         bracket_acc_status_html.value = f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#CCC;'>{note}</div>"
     else:
         bracket_acc_status_html.value = ""
+
+    if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
+        with bracket_acc_out:
+            clear_output(wait=True)
+            display(HTML("<div style='color:#AAA; padding:8px;'>Run the Bracket Sim tab first to populate accuracy checks.</div>"))
+        return
 
     integrity = report.get("integrity_counts", {})
     calib = report.get("calibration", {})
@@ -10174,16 +10213,33 @@ def _render_bracket_accuracy():
 
         buckets = calib.get("buckets", pd.DataFrame())
         if buckets is not None and len(buckets) > 0:
+            buckets = buckets.rename(columns={
+                "bucket": "Bucket",
+                "AvgPred": "Avg Pred",
+                "WinRate": "Win Rate",
+            })
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Calibration Buckets</div>"))
             display(HTML(df_to_html_table(buckets, max_rows=len(buckets))))
 
         misses = calib.get("biggest_misses", pd.DataFrame())
         if misses is not None and len(misses) > 0:
+            misses = misses.rename(columns={
+                "away_team": "Away",
+                "home_team": "Home",
+                "winner_team": "Winner",
+            })
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Biggest Misses / Upsets</div>"))
             display(HTML(df_to_html_table(misses, max_rows=min(len(misses), 20))))
 
         actual_vs_sim = calib.get("actual_vs_sim", pd.DataFrame())
         if actual_vs_sim is not None and len(actual_vs_sim) > 0:
+            actual_vs_sim = actual_vs_sim.rename(columns={
+                "away_team": "Away",
+                "home_team": "Home",
+                "winner_team": "Winner",
+                "Pred Home Win%": "Pred Home",
+                "Pred Winner Win%": "Pred Winner",
+            })
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Actual Winners vs Simulated Win Probabilities</div>"))
             display(HTML(df_to_html_table(actual_vs_sim, max_rows=min(len(actual_vs_sim), 30))))
 
