@@ -231,7 +231,7 @@ def _training_dataset_cache_signature(training_input_signature: str, current_sea
     return {
         "training_input_signature": str(training_input_signature or ""),
         "current_season": int(current_season),
-        "pipeline_version": 1,
+        "pipeline_version": 2,
     }
 
 
@@ -2288,6 +2288,12 @@ def _num_or_nan(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df.get(col, pd.Series(np.nan, index=df.index)), errors="coerce")
 
 
+def _safe_rate(numer, denom, scale: float = 1.0) -> pd.Series:
+    numer_s = pd.to_numeric(numer, errors="coerce")
+    denom_s = pd.to_numeric(denom, errors="coerce").replace(0, np.nan)
+    return scale * numer_s / denom_s
+
+
 def _market_implied_home_margin(spread_home) -> pd.Series:
     """
     Convert sportsbook home spread convention into home-minus-away margin convention.
@@ -2394,6 +2400,94 @@ def _add_hybrid_spread_features(df: pd.DataFrame) -> pd.DataFrame:
             def_eff_a = 100.0 * _num_or_nan(out, pa_a) / possA.replace(0, np.nan)
             def_eff_b = 100.0 * _num_or_nan(out, pa_b) / possB.replace(0, np.nan)
             out["def_eff_diff"] = def_eff_a - def_eff_b
+
+        fga_a = _first_existing_team_col(out, ["r10_mean_field_goals_attempted_TA", "r10_mean_field_goals_attempted_A"])
+        fga_b = _first_existing_team_col(out, ["r10_mean_field_goals_attempted_TB", "r10_mean_field_goals_attempted_B"])
+        fgm_a = _first_existing_team_col(out, ["r10_mean_field_goals_made_TA", "r10_mean_field_goals_made_A"])
+        fgm_b = _first_existing_team_col(out, ["r10_mean_field_goals_made_TB", "r10_mean_field_goals_made_B"])
+        tpa_a = _first_existing_team_col(out, ["r10_mean_three_point_field_goals_attempted_TA", "r10_mean_three_point_field_goals_attempted_A"])
+        tpa_b = _first_existing_team_col(out, ["r10_mean_three_point_field_goals_attempted_TB", "r10_mean_three_point_field_goals_attempted_B"])
+        tpm_a = _first_existing_team_col(out, ["r10_mean_three_point_field_goals_made_TA", "r10_mean_three_point_field_goals_made_A"])
+        tpm_b = _first_existing_team_col(out, ["r10_mean_three_point_field_goals_made_TB", "r10_mean_three_point_field_goals_made_B"])
+        fta_a = _first_existing_team_col(out, ["r10_mean_free_throws_attempted_TA", "r10_mean_free_throws_attempted_A"])
+        fta_b = _first_existing_team_col(out, ["r10_mean_free_throws_attempted_TB", "r10_mean_free_throws_attempted_B"])
+        tov_a = _first_existing_team_col(out, ["r10_mean_turnovers_TA", "r10_mean_team_turnovers_A", "r10_mean_turnovers_A"])
+        tov_b = _first_existing_team_col(out, ["r10_mean_turnovers_TB", "r10_mean_team_turnovers_B", "r10_mean_turnovers_B"])
+        ast_a = _first_existing_team_col(out, ["r10_mean_assists_TA", "r10_mean_assists_A"])
+        ast_b = _first_existing_team_col(out, ["r10_mean_assists_TB", "r10_mean_assists_B"])
+        orb_a = _first_existing_team_col(out, ["r10_mean_offensive_rebounds_TA", "r10_mean_offensive_rebounds_A"])
+        orb_b = _first_existing_team_col(out, ["r10_mean_offensive_rebounds_TB", "r10_mean_offensive_rebounds_B"])
+        drb_a = _first_existing_team_col(out, ["r10_mean_defensive_rebounds_TA", "r10_mean_defensive_rebounds_A"])
+        drb_b = _first_existing_team_col(out, ["r10_mean_defensive_rebounds_TB", "r10_mean_defensive_rebounds_B"])
+        stl_a = _first_existing_team_col(out, ["r10_mean_steals_TA", "r10_mean_steals_A"])
+        stl_b = _first_existing_team_col(out, ["r10_mean_steals_TB", "r10_mean_steals_B"])
+        blk_a = _first_existing_team_col(out, ["r10_mean_blocks_TA", "r10_mean_blocks_A"])
+        blk_b = _first_existing_team_col(out, ["r10_mean_blocks_TB", "r10_mean_blocks_B"])
+
+        if all([fga_a, fga_b, fgm_a, fgm_b, tpm_a, tpm_b]):
+            efg_a = _safe_rate(_num_or_nan(out, fgm_a) + 0.5 * _num_or_nan(out, tpm_a), _num_or_nan(out, fga_a))
+            efg_b = _safe_rate(_num_or_nan(out, fgm_b) + 0.5 * _num_or_nan(out, tpm_b), _num_or_nan(out, fga_b))
+            out["shooting_efficiency_diff"] = efg_a - efg_b
+
+        if all([pf_a, pf_b, fga_a, fga_b, fta_a, fta_b]):
+            ts_a = _safe_rate(_num_or_nan(out, pf_a), 2.0 * (_num_or_nan(out, fga_a) + 0.44 * _num_or_nan(out, fta_a)))
+            ts_b = _safe_rate(_num_or_nan(out, pf_b), 2.0 * (_num_or_nan(out, fga_b) + 0.44 * _num_or_nan(out, fta_b)))
+            out["true_shooting_diff"] = ts_a - ts_b
+
+        if all([tpa_a, tpa_b, fga_a, fga_b]):
+            tpa_rate_a = _safe_rate(_num_or_nan(out, tpa_a), _num_or_nan(out, fga_a))
+            tpa_rate_b = _safe_rate(_num_or_nan(out, tpa_b), _num_or_nan(out, fga_b))
+            out["three_point_rate_diff"] = tpa_rate_a - tpa_rate_b
+
+        if all([fta_a, fta_b, fga_a, fga_b]):
+            ft_rate_a = _safe_rate(_num_or_nan(out, fta_a), _num_or_nan(out, fga_a))
+            ft_rate_b = _safe_rate(_num_or_nan(out, fta_b), _num_or_nan(out, fga_b))
+            out["free_throw_rate_diff"] = ft_rate_a - ft_rate_b
+
+        if all([tov_a, tov_b]):
+            tov_rate_a = _safe_rate(_num_or_nan(out, tov_a), possA)
+            tov_rate_b = _safe_rate(_num_or_nan(out, tov_b), possB)
+            out["turnover_rate_diff"] = tov_rate_a - tov_rate_b
+
+        if all([ast_a, ast_b, fgm_a, fgm_b]):
+            ast_rate_a = _safe_rate(_num_or_nan(out, ast_a), _num_or_nan(out, fgm_a))
+            ast_rate_b = _safe_rate(_num_or_nan(out, ast_b), _num_or_nan(out, fgm_b))
+            out["assist_rate_diff"] = ast_rate_a - ast_rate_b
+
+        if all([orb_a, orb_b, drb_a, drb_b]):
+            orb_rate_a = _safe_rate(_num_or_nan(out, orb_a), _num_or_nan(out, orb_a) + _num_or_nan(out, drb_b))
+            orb_rate_b = _safe_rate(_num_or_nan(out, orb_b), _num_or_nan(out, orb_b) + _num_or_nan(out, drb_a))
+            drb_rate_a = _safe_rate(_num_or_nan(out, drb_a), _num_or_nan(out, drb_a) + _num_or_nan(out, orb_b))
+            drb_rate_b = _safe_rate(_num_or_nan(out, drb_b), _num_or_nan(out, drb_b) + _num_or_nan(out, orb_a))
+            out["off_rebound_rate_diff"] = orb_rate_a - orb_rate_b
+            out["def_rebound_rate_diff"] = drb_rate_a - drb_rate_b
+
+        if all([stl_a, stl_b]):
+            stl_rate_a = _safe_rate(_num_or_nan(out, stl_a), possA)
+            stl_rate_b = _safe_rate(_num_or_nan(out, stl_b), possB)
+            out["steal_rate_diff"] = stl_rate_a - stl_rate_b
+
+        if all([blk_a, blk_b]):
+            blk_rate_a = _safe_rate(_num_or_nan(out, blk_a), possA)
+            blk_rate_b = _safe_rate(_num_or_nan(out, blk_b), possB)
+            out["block_rate_diff"] = blk_rate_a - blk_rate_b
+
+        if "off_eff_diff" in out.columns and "def_eff_diff" in out.columns:
+            out["matchup_off_edge"] = 0.5 * out["off_eff_diff"] - 0.5 * out["def_eff_diff"]
+            out["efficiency_matchup_edge"] = out["off_eff_diff"] - out["def_eff_diff"]
+
+        if all([pf_a, pf_b, pa_a, pa_b]):
+            out["opponent_adjusted_scoring_edge"] = (
+                (_num_or_nan(out, pf_a) - _num_or_nan(out, pa_b)) -
+                (_num_or_nan(out, pf_b) - _num_or_nan(out, pa_a))
+            )
+
+        if "three_point_rate_diff" in out.columns and "free_throw_rate_diff" in out.columns and "turnover_rate_diff" in out.columns:
+            out["shot_profile_edge"] = (
+                0.8 * _num_or_nan(out, "three_point_rate_diff") +
+                0.6 * _num_or_nan(out, "free_throw_rate_diff") -
+                0.8 * _num_or_nan(out, "turnover_rate_diff")
+            )
 
     return out
 
@@ -2593,6 +2687,10 @@ def build_game_dataset_from_team_box(
             "trend_total_rebounds", "trend_offensive_rebounds", "trend_turnovers", "trend_steals", "trend_blocks",
             "volatility_point_diff", "volatility_points_for", "volatility_points_against",
             "blowout_tendency_diff", "pace_diff", "off_eff_diff", "def_eff_diff",
+            "shooting_efficiency_diff", "true_shooting_diff", "three_point_rate_diff", "free_throw_rate_diff",
+            "turnover_rate_diff", "assist_rate_diff", "off_rebound_rate_diff", "def_rebound_rate_diff",
+            "steal_rate_diff", "block_rate_diff", "matchup_off_edge", "efficiency_matchup_edge",
+            "opponent_adjusted_scoring_edge", "shot_profile_edge",
         ] if c in merged.columns
     ]
 
@@ -2847,6 +2945,80 @@ def _walk_forward_threshold_tuning(
     }
 
 
+def _fit_winner_isotonic_oof(
+    X: pd.DataFrame,
+    y: pd.Series,
+    weights,
+    dates: pd.Series,
+    params: dict,
+    feature_names: list[str],
+    num_boost_round: int = 2500,
+    early_stopping_rounds: int = 100,
+    min_train_rows: int = 4000,
+    n_folds: int = 4,
+):
+    empty_iso = IsotonicRegression(out_of_bounds="clip")
+    work = pd.DataFrame({
+        "y": pd.to_numeric(y, errors="coerce"),
+        "w": pd.to_numeric(pd.Series(weights).reset_index(drop=True), errors="coerce"),
+        "game_dt_et": pd.to_datetime(pd.Series(dates).reset_index(drop=True), errors="coerce"),
+    })
+    X_work = X.reset_index(drop=True).copy()
+    valid = work["y"].notna() & work["game_dt_et"].notna()
+    if valid.sum() < max(min_train_rows + 500, 2000):
+        return None, "holdout_fallback"
+
+    X_work = X_work.loc[valid].reset_index(drop=True)
+    work = work.loc[valid].reset_index(drop=True)
+    unique_days = work["game_dt_et"].dt.floor("D").drop_duplicates().tolist()
+    if len(unique_days) < n_folds + 2:
+        return None, "holdout_fallback"
+
+    day_chunks = [list(chunk) for chunk in np.array_split(unique_days, n_folds + 1) if len(chunk) > 0]
+    preds = pd.Series(np.nan, index=work.index, dtype=float)
+
+    for fold_idx in range(1, len(day_chunks)):
+        fold_train_days = {d for chunk in day_chunks[:fold_idx] for d in chunk}
+        fold_valid_days = set(day_chunks[fold_idx])
+        fold_train_mask = work["game_dt_et"].dt.floor("D").isin(fold_train_days)
+        fold_valid_mask = work["game_dt_et"].dt.floor("D").isin(fold_valid_days)
+        if int(fold_train_mask.sum()) < int(min_train_rows) or int(fold_valid_mask.sum()) < 100:
+            continue
+
+        dtrain_fold = xgb.DMatrix(
+            X_work.loc[fold_train_mask, feature_names],
+            label=work.loc[fold_train_mask, "y"],
+            weight=work.loc[fold_train_mask, "w"],
+            feature_names=feature_names,
+        )
+        dvalid_fold = xgb.DMatrix(
+            X_work.loc[fold_valid_mask, feature_names],
+            label=work.loc[fold_valid_mask, "y"],
+            weight=work.loc[fold_valid_mask, "w"],
+            feature_names=feature_names,
+        )
+        booster_fold = xgb.train(
+            params=params,
+            dtrain=dtrain_fold,
+            num_boost_round=num_boost_round,
+            evals=[(dvalid_fold, "valid")],
+            early_stopping_rounds=early_stopping_rounds,
+            verbose_eval=False,
+        )
+        preds.loc[fold_valid_mask] = booster_fold.predict(
+            dvalid_fold,
+            iteration_range=(0, booster_fold.best_iteration + 1),
+        )
+
+    oof_mask = preds.notna() & work["y"].notna()
+    if int(oof_mask.sum()) < 500 or work.loc[oof_mask, "y"].nunique() < 2:
+        return None, "holdout_fallback"
+
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(preds.loc[oof_mask].to_numpy(), work.loc[oof_mask, "y"].to_numpy())
+    return iso, f"oof_{int(oof_mask.sum())}_rows"
+
+
 def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON):
     global ATS_EDGE_THRESHOLD
     """
@@ -2875,6 +3047,10 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
             "trend_total_rebounds", "trend_offensive_rebounds", "trend_turnovers", "trend_steals", "trend_blocks",
             "volatility_point_diff", "volatility_points_for", "volatility_points_against",
             "blowout_tendency_diff", "pace_diff", "off_eff_diff", "def_eff_diff",
+            "shooting_efficiency_diff", "true_shooting_diff", "three_point_rate_diff", "free_throw_rate_diff",
+            "turnover_rate_diff", "assist_rate_diff", "off_rebound_rate_diff", "def_rebound_rate_diff",
+            "steal_rate_diff", "block_rate_diff", "matchup_off_edge", "efficiency_matchup_edge",
+            "opponent_adjusted_scoring_edge", "shot_profile_edge",
             "vegas_spread_home", "has_market_spread", "market_abs_spread", "market_home_fav",
             "vegas_total", "has_market_total",
         ]
@@ -3088,8 +3264,25 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         dvalid_w,
         iteration_range=(0, winner_booster.best_iteration + 1)
     )
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(raw_va_w, y_va_w.values)
+    recency_train_all = np.exp(-((train["game_dt_et"].max() - train["game_dt_et"]).dt.days.fillna(0).clip(lower=0)) / 120.0)
+    season_w_train_all = season_weights(train["season"], current_season)
+    w_train_all = np.asarray(season_w_train_all * recency_train_all.to_numpy(), dtype=float)
+    iso, calibration_source = _fit_winner_isotonic_oof(
+        X=train[winner_feature_cols].copy(),
+        y=train["y_win"].copy(),
+        weights=w_train_all,
+        dates=train["game_dt_et"].copy(),
+        params=params_clf,
+        feature_names=winner_feature_cols,
+        num_boost_round=2500,
+        early_stopping_rounds=100,
+        min_train_rows=4000,
+        n_folds=4,
+    )
+    if iso is None:
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(raw_va_w, y_va_w.values)
+        calibration_source = "single_holdout_fallback"
 
     raw_pred_ab_xgb = spread_booster.predict(dvalid, iteration_range=(0, spread_booster.best_iteration + 1))
     raw_pred_ab_lgb = lgb_spread.predict(X_va_spread.values)
@@ -3102,7 +3295,7 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
     raw_w5 = float(np.mean(np.abs(raw_pred_home - actual_home_margin_va) <= 5.0))
     eval_lines = [
         "MODEL EVAL",
-        "Isotonic calibration fitted",
+        f"Isotonic calibration fitted ({calibration_source})",
         f"Spread validation (raw fallback): MAE={raw_mae:.3f} | within3={raw_w3:.3%} | within5={raw_w5:.3%}",
     ]
 
@@ -7573,6 +7766,12 @@ def open_dashboard_clicked(_=None):
 def refresh(_=None, force_rebuild=False):
     global LAST_BOARD, LAST_DATE, SEASON_ACC, SEASON_ACC_DATE
 
+    if force_rebuild:
+        FILTERED_BOARD_CACHE.clear()
+        HC_FILTER_CACHE.clear()
+        if LAST_DATE == date_picker.value:
+            LAST_BOARD = None
+
     # build season snapshot once only
     if SEASON_ACC is None:
         try:
@@ -11203,6 +11402,8 @@ def predictions_refresh_clicked(_=None):
     import html
     import traceback
 
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
     with out:
         clear_output(wait=True)
         display(HTML("<div style='color:#AAA; padding:8px;'>Predictions refresh clicked</div>"))
