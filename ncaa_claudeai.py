@@ -137,6 +137,9 @@ TOURNEY_SPREAD_DAMP_MEDIUM = 0.45
 TOURNEY_SPREAD_DAMP_LIGHT  = 0.62
 TOURNEY_SPREAD_DAMP_SMALL  = 0.82
 MARKET_EDGE_MODEL_VERSION = 2
+ATS_EDGE_CANDIDATES = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+ATS_EDGE_MIN_GAMES = 40
+ATS_EDGE_THRESHOLD = 1.0
 
 for d in [RAW_DIR, ROTOWIRE_DIR, INJURY_DIR, MODEL_DIR, TEAM_BOX_DIR, SCHEDULE_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -2621,9 +2624,9 @@ def _print_sample_weight_debug(
     final_weights,
     label: str = "training",
 ):
-    seasons = pd.to_numeric(season_series, errors="coerce")
-    raw_w = pd.to_numeric(pd.Series(raw_weights), errors="coerce")
-    final_w = pd.to_numeric(pd.Series(final_weights), errors="coerce")
+    seasons = pd.to_numeric(pd.Series(season_series).reset_index(drop=True), errors="coerce")
+    raw_w = pd.to_numeric(pd.Series(raw_weights).reset_index(drop=True), errors="coerce")
+    final_w = pd.to_numeric(pd.Series(final_weights).reset_index(drop=True), errors="coerce")
     dbg = pd.DataFrame({
         "season": seasons,
         "raw_weight": raw_w,
@@ -2667,7 +2670,185 @@ def _print_sample_weight_debug(
     print("\n".join(lines))
 
 
+def _get_ats_edge_threshold(default: float = ATS_EDGE_THRESHOLD) -> float:
+    try:
+        return float(globals().get("ATS_EDGE_THRESHOLD", default))
+    except Exception:
+        return float(default)
+
+
+def _wilson_lower_bound(wins: int, total: int, z: float = 1.0) -> float:
+    if total <= 0:
+        return float("-inf")
+    p = float(wins) / float(total)
+    denom = 1.0 + (z * z) / total
+    center = p + (z * z) / (2.0 * total)
+    adj = z * np.sqrt((p * (1.0 - p) + (z * z) / (4.0 * total)) / total)
+    return float((center - adj) / denom)
+
+
+def _build_ats_backtest_frame(
+    pred_margin_home,
+    actual_home_margin,
+    vegas_spread_home,
+    game_dt=None,
+) -> pd.DataFrame:
+    backtest = pd.DataFrame({
+        "pred_margin_home": pd.to_numeric(pd.Series(pred_margin_home).reset_index(drop=True), errors="coerce"),
+        "actual_home_margin": pd.to_numeric(pd.Series(actual_home_margin).reset_index(drop=True), errors="coerce"),
+        "vegas_spread_home": pd.to_numeric(pd.Series(vegas_spread_home).reset_index(drop=True), errors="coerce"),
+    })
+    if game_dt is not None:
+        backtest["game_dt_et"] = pd.to_datetime(pd.Series(game_dt).reset_index(drop=True), errors="coerce")
+    else:
+        backtest["game_dt_et"] = pd.NaT
+
+    backtest = backtest.dropna(subset=["pred_margin_home", "actual_home_margin", "vegas_spread_home"]).copy()
+    if len(backtest) == 0:
+        return backtest
+
+    backtest["edge"] = backtest["pred_margin_home"] + backtest["vegas_spread_home"]
+    backtest["cover_margin"] = backtest["actual_home_margin"] + backtest["vegas_spread_home"]
+    backtest = backtest[backtest["cover_margin"] != 0].copy()
+    if len(backtest) == 0:
+        return backtest
+
+    backtest["abs_edge"] = backtest["edge"].abs()
+    backtest["ats_win"] = np.where(backtest["edge"] > 0, backtest["cover_margin"] > 0, backtest["cover_margin"] < 0).astype(int)
+    return backtest.reset_index(drop=True)
+
+
+def _summarize_ats_threshold(backtest: pd.DataFrame, threshold: float) -> dict:
+    threshold = float(threshold)
+    if backtest is None or len(backtest) == 0:
+        return {
+            "threshold": threshold,
+            "games": 0,
+            "wins": 0,
+            "ats_acc": np.nan,
+            "lower_bound": float("-inf"),
+            "avg_abs_edge": np.nan,
+        }
+
+    sample = backtest[backtest["abs_edge"] >= threshold].copy()
+    total = int(len(sample))
+    if total == 0:
+        return {
+            "threshold": threshold,
+            "games": 0,
+            "wins": 0,
+            "ats_acc": np.nan,
+            "lower_bound": float("-inf"),
+            "avg_abs_edge": np.nan,
+        }
+
+    wins = int(pd.to_numeric(sample["ats_win"], errors="coerce").fillna(0).sum())
+    acc = float(wins / total)
+    return {
+        "threshold": threshold,
+        "games": total,
+        "wins": wins,
+        "ats_acc": acc,
+        "lower_bound": _wilson_lower_bound(wins, total, z=1.0),
+        "avg_abs_edge": float(pd.to_numeric(sample["abs_edge"], errors="coerce").mean()),
+    }
+
+
+def _select_best_ats_threshold(
+    backtest: pd.DataFrame,
+    thresholds=None,
+    min_games: int = ATS_EDGE_MIN_GAMES,
+) -> tuple[float, list[dict]]:
+    thresholds = [float(t) for t in (thresholds or ATS_EDGE_CANDIDATES)]
+    summaries = [_summarize_ats_threshold(backtest, t) for t in thresholds]
+    eligible = [s for s in summaries if s["games"] >= int(min_games)]
+    if not eligible:
+        eligible = [s for s in summaries if s["games"] > 0]
+    if not eligible:
+        return float(_get_ats_edge_threshold()), summaries
+
+    best = max(
+        eligible,
+        key=lambda s: (
+            float(s["lower_bound"]),
+            float(s["ats_acc"]) if pd.notna(s["ats_acc"]) else float("-inf"),
+            int(s["games"]),
+            float(s["threshold"]),
+        ),
+    )
+    return float(best["threshold"]), summaries
+
+
+def _walk_forward_threshold_tuning(
+    backtest: pd.DataFrame,
+    thresholds=None,
+    min_games: int = ATS_EDGE_MIN_GAMES,
+) -> dict:
+    thresholds = [float(t) for t in (thresholds or ATS_EDGE_CANDIDATES)]
+    empty = {
+        "selected_threshold": float(_get_ats_edge_threshold()),
+        "selected_summary": _summarize_ats_threshold(backtest, _get_ats_edge_threshold()),
+        "candidate_summaries": [_summarize_ats_threshold(backtest, t) for t in thresholds],
+        "folds": [],
+        "walk_forward_acc": np.nan,
+        "walk_forward_games": 0,
+    }
+    if backtest is None or len(backtest) < max(20, int(min_games)):
+        return empty
+
+    work = backtest.copy()
+    if "game_dt_et" not in work.columns or work["game_dt_et"].isna().all():
+        return empty
+
+    work["game_day"] = pd.to_datetime(work["game_dt_et"], errors="coerce").dt.floor("D")
+    work = work.dropna(subset=["game_day"]).sort_values("game_day").reset_index(drop=True)
+    unique_days = work["game_day"].drop_duplicates().tolist()
+    if len(unique_days) < 6:
+        return empty
+
+    n_chunks = min(5, len(unique_days))
+    day_chunks = [list(chunk) for chunk in np.array_split(unique_days, n_chunks) if len(chunk) > 0]
+    if len(day_chunks) < 3:
+        return empty
+
+    fold_rows = []
+    wf_wins = 0
+    wf_games = 0
+    for i in range(1, len(day_chunks)):
+        tune_days = {d for chunk in day_chunks[:i] for d in chunk}
+        test_days = set(day_chunks[i])
+        tune_df = work[work["game_day"].isin(tune_days)].copy()
+        test_df = work[work["game_day"].isin(test_days)].copy()
+        if len(test_df) == 0:
+            continue
+
+        chosen_threshold, _ = _select_best_ats_threshold(tune_df, thresholds=thresholds, min_games=min_games)
+        test_summary = _summarize_ats_threshold(test_df, chosen_threshold)
+        if test_summary["games"] > 0:
+            wf_wins += int(test_summary["wins"])
+            wf_games += int(test_summary["games"])
+        fold_rows.append({
+            "fold": int(i),
+            "threshold": float(chosen_threshold),
+            "games": int(test_summary["games"]),
+            "wins": int(test_summary["wins"]),
+            "ats_acc": test_summary["ats_acc"],
+        })
+
+    selected_threshold, candidate_summaries = _select_best_ats_threshold(work, thresholds=thresholds, min_games=min_games)
+    selected_summary = _summarize_ats_threshold(work, selected_threshold)
+    return {
+        "selected_threshold": float(selected_threshold),
+        "selected_summary": selected_summary,
+        "candidate_summaries": candidate_summaries,
+        "folds": fold_rows,
+        "walk_forward_acc": (float(wf_wins / wf_games) if wf_games > 0 else np.nan),
+        "walk_forward_games": int(wf_games),
+    }
+
+
 def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON):
+    global ATS_EDGE_THRESHOLD
     """
     Trains:
       1. Raw margin regression fallback (existing path, improved features)
@@ -2937,16 +3118,81 @@ def train_models(dataset_all: pd.DataFrame, current_season: int = CURRENT_SEASON
         edge_mae = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge)))
         edge_w3 = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge) <= 3.0))
         edge_w5 = float(np.mean(np.abs(edge_pred_home - actual_home_margin_edge) <= 5.0))
+        raw_pred_home_series = pd.Series(raw_pred_home, index=va_idx, dtype=float)
+        raw_market_pred_home = raw_pred_home_series.reindex(market_valid.index).to_numpy(dtype=float)
+        raw_market_mae = float(np.mean(np.abs(raw_market_pred_home - actual_home_margin_edge)))
+        raw_market_w3 = float(np.mean(np.abs(raw_market_pred_home - actual_home_margin_edge) <= 3.0))
+        raw_market_w5 = float(np.mean(np.abs(raw_market_pred_home - actual_home_margin_edge) <= 5.0))
+
+        eval_lines.append(f"Spread validation (raw on market rows): MAE={raw_market_mae:.3f} | within3={raw_market_w3:.3%} | within5={raw_market_w5:.3%}")
         eval_lines.append(f"Spread validation (market-aware): MAE={edge_mae:.3f} | within3={edge_w3:.3%} | within5={edge_w5:.3%}")
 
         cover = actual_home_margin_edge + market_valid["vegas_spread_home"].to_numpy()
+        raw_pred_edge = raw_market_pred_home + market_valid["vegas_spread_home"].to_numpy()
         pred_edge = edge_pred_home + market_valid["vegas_spread_home"].to_numpy()
+        raw_ats_mask = np.abs(raw_pred_edge) > 1.0
         ats_mask = np.abs(pred_edge) > 1.0
+        raw_ats_rate = np.nan
+        raw_ats_games = 0
+        if raw_ats_mask.any():
+            raw_ats_wins = np.where(raw_pred_edge[raw_ats_mask] > 0, cover[raw_ats_mask] > 0, cover[raw_ats_mask] < 0)
+            raw_ats_rate = float(np.mean(raw_ats_wins))
+            raw_ats_games = int(raw_ats_mask.sum())
+            eval_lines.append(f"ATS validation (raw on market rows, |edge|>1): {raw_ats_rate:.3%} on {raw_ats_games} games")
+        else:
+            eval_lines.append("ATS validation (raw on market rows, |edge|>1): n/a")
         if ats_mask.any():
             ats_wins = np.where(pred_edge[ats_mask] > 0, cover[ats_mask] > 0, cover[ats_mask] < 0)
-            eval_lines.append(f"ATS validation (market-aware, |edge|>1): {float(np.mean(ats_wins)):.3%} on {int(ats_mask.sum())} games")
+            edge_ats_rate = float(np.mean(ats_wins))
+            edge_ats_games = int(ats_mask.sum())
+            eval_lines.append(f"ATS validation (market-aware, |edge|>1): {edge_ats_rate:.3%} on {edge_ats_games} games")
         else:
+            edge_ats_rate = np.nan
+            edge_ats_games = 0
             eval_lines.append("ATS validation (market-aware, |edge|>1): n/a")
+
+        keep_market_edge = (
+            (edge_mae <= raw_market_mae) and
+            (edge_w5 >= raw_market_w5) and
+            (
+                np.isnan(raw_ats_rate) or
+                np.isnan(edge_ats_rate) or
+                (edge_ats_rate >= raw_ats_rate)
+            )
+        )
+        if keep_market_edge:
+            eval_lines.append("Market-edge deployment: enabled (validated improvement over raw spread model)")
+        else:
+            spread_edge_booster = None
+            lgb_spread_edge = None
+            eval_lines.append("Market-edge deployment: disabled (raw spread model validated better)")
+
+        deployed_pred_home = edge_pred_home if keep_market_edge else raw_market_pred_home
+        threshold_tuning = _walk_forward_threshold_tuning(
+            _build_ats_backtest_frame(
+                pred_margin_home=deployed_pred_home,
+                actual_home_margin=actual_home_margin_edge,
+                vegas_spread_home=market_valid["vegas_spread_home"].to_numpy(),
+                game_dt=market_valid["game_dt_et"],
+            ),
+            thresholds=ATS_EDGE_CANDIDATES,
+            min_games=ATS_EDGE_MIN_GAMES,
+        )
+        ATS_EDGE_THRESHOLD = float(threshold_tuning["selected_threshold"])
+        tuned_summary = threshold_tuning["selected_summary"]
+        eval_lines.append(f"ATS tuned edge threshold: {ATS_EDGE_THRESHOLD:.1f}")
+        if int(threshold_tuning["walk_forward_games"]) > 0 and pd.notna(threshold_tuning["walk_forward_acc"]):
+            eval_lines.append(
+                f"Walk-forward ATS (tuned threshold): {float(threshold_tuning['walk_forward_acc']):.3%} on {int(threshold_tuning['walk_forward_games'])} games"
+            )
+        else:
+            eval_lines.append("Walk-forward ATS (tuned threshold): insufficient dated validation windows")
+        if int(tuned_summary["games"]) > 0 and pd.notna(tuned_summary["ats_acc"]):
+            eval_lines.append(
+                f"Full validation ATS (|edge|>={ATS_EDGE_THRESHOLD:.1f}): {float(tuned_summary['ats_acc']):.3%} on {int(tuned_summary['games'])} games"
+            )
+    else:
+        ATS_EDGE_THRESHOLD = float(_get_ats_edge_threshold())
 
     print("\n".join(eval_lines))
 
@@ -3739,7 +3985,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     - Data refresh: every RETRAIN_DATA_HOURS
     - Model refit: every RETRAIN_MODEL_DAYS
     """
-    global team_snaps, roll_cols, spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp
+    global team_snaps, roll_cols, spread_booster, spread_edge_booster, winner_booster, lgb_spread, lgb_spread_edge, iso, imp, ATS_EDGE_THRESHOLD
     global diff_cols, diff_cols2, feature_cols, dataset_all, schedule_cur, elo_snap, cur2
     global team_box_hist
 
@@ -3861,10 +4107,17 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
         meta["last_training_rows"] = training_rows
         meta["injury_feature_cols"] = injury_cols_in_features
         meta["market_edge_model_version"] = MARKET_EDGE_MODEL_VERSION
+        meta["ats_edge_threshold"] = float(_get_ats_edge_threshold())
         meta["last_model_refresh_action"] = "executed"
         _save_metadata(meta)
+        with contextlib.suppress(OSError):
+            os.remove(SEASON_ACC_CACHE_PATH)
         for cache_name in ["BOARD_CACHE", "HC_FILTER_CACHE", "MATCHUP_SNAPSHOT_CACHE", "FILTERED_BOARD_CACHE", "_BRACKET_MATCHUP_CACHE"]:
             globals().get(cache_name, {}).clear()
+        if "SEASON_ACC" in globals():
+            globals()["SEASON_ACC"] = None
+        if "SEASON_ACC_DATE" in globals():
+            globals()["SEASON_ACC_DATE"] = None
         if "LAST_BOARD" in globals():
             globals()["LAST_BOARD"] = None
         if "LAST_DATE" in globals():
@@ -3885,6 +4138,7 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
             feature_cols = meta_cols
             injury_cols_in_features = [c for c in ["diff_injury_impact", "diff_inj_out"] if c in list(feature_cols or [])]
             meta["injury_feature_cols"] = injury_cols_in_features
+            ATS_EDGE_THRESHOLD = float(meta.get("ats_edge_threshold", _get_ats_edge_threshold()))
             if int(meta.get("market_edge_model_version", 0) or 0) < MARKET_EDGE_MODEL_VERSION:
                 spread_edge_booster = None
                 lgb_spread_edge = None
@@ -5698,6 +5952,7 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
     # ATS vs Vegas
     # -------------------------------------------------
     ats_acc, ats_games = np.nan, 0
+    ats_threshold = float(_get_ats_edge_threshold())
     vegas_spread_home = _get_home_vegas_spread(g)
     if vegas_spread_home.notna().any():
         rg = g.copy()
@@ -5708,6 +5963,7 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
         rg = rg.dropna(subset=["vegas_spread_home", "pred_margin_home", "home_margin_actual"])
         if len(rg) > 0:
             rg["edge"] = rg["pred_margin_home"] + rg["vegas_spread_home"]
+            rg = rg[rg["edge"].abs() >= ats_threshold].copy()
             rg["pick"] = np.where(rg["edge"] > 0, "HOME",
                            np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
             rg = rg[rg["pick"] != "NO_BET"]
@@ -5894,7 +6150,7 @@ def _compute_confidence_band_detailed(board: pd.DataFrame) -> list:
         hma = g["home_score"] - g["away_score"]
         edge = pm + rw
         cover = hma + rw
-        ats_valid = pm.notna() & rw.notna() & hma.notna() & edge.ne(0) & cover.ne(0)
+        ats_valid = pm.notna() & rw.notna() & hma.notna() & edge.abs().ge(float(_get_ats_edge_threshold())) & cover.ne(0)
         g.loc[ats_valid, "ats_correct"] = np.where(
             edge[ats_valid] > 0,
             cover[ats_valid] > 0,
@@ -6056,6 +6312,7 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
     # ats vs vegas
     ats_correct = 0
     ats_total = 0
+    ats_threshold = float(_get_ats_edge_threshold())
     vegas_spread_home = _get_home_vegas_spread(g)
     if vegas_spread_home.notna().any() and "pred_margin_home" in g.columns:
         rg = g.copy()
@@ -6066,6 +6323,7 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
 
         if len(rg):
             rg["edge"] = rg["pred_margin_home"] + rg["vegas_spread_home"]
+            rg = rg[rg["edge"].abs() >= ats_threshold].copy()
             rg["pick"] = np.where(rg["edge"] > 0, "HOME", np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
             rg = rg[rg["pick"] != "NO_BET"]
 
@@ -6130,11 +6388,25 @@ def build_or_update_season_accuracy_cache():
         weeks.setdefault(wk, []).append(d)
 
     updated = False
+    week_items = list(weeks.items())
+    total_weeks = len(week_items)
 
-    for wk, dates_in_week in weeks.items():
+    for idx, (wk, dates_in_week) in enumerate(week_items, start=1):
         cached_wk = cache.get(wk, {})
         if wk in cache and required_keys.issubset(set(cached_wk.keys())):
             continue
+
+        progress_msg = f"Season accuracy cache: week {idx}/{total_weeks} ({wk})"
+        print(progress_msg)
+        with contextlib.suppress(Exception):
+            _dashboard_log(
+                "season_accuracy_cache",
+                status="week_start",
+                week=wk,
+                week_index=int(idx),
+                total_weeks=int(total_weeks),
+                dates=len(dates_in_week),
+            )
 
         boards = []
         for d in sorted(dates_in_week):
@@ -6181,7 +6453,17 @@ def build_or_update_season_accuracy_cache():
             }
 
         updated = True
-        print(f"Cached season week: {wk}")
+        done_msg = f"Season accuracy cache complete: week {idx}/{total_weeks} ({wk})"
+        print(done_msg)
+        with contextlib.suppress(Exception):
+            _dashboard_log(
+                "season_accuracy_cache",
+                status="week_complete",
+                week=wk,
+                week_index=int(idx),
+                total_weeks=int(total_weeks),
+                games_graded=int(cache[wk].get("games_graded", 0) or 0),
+            )
 
     if updated:
         _save_season_acc_cache(cache)
@@ -6881,6 +7163,7 @@ def _real_final_mask(df: pd.DataFrame) -> pd.Series:
 
 def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
     b = board.copy()
+    ats_threshold = float(_get_ats_edge_threshold())
     winner_col = next((c for c in ["winner_team", "winner"] if c in b.columns), None)
     winner_raw = (
         b[winner_col].fillna("").astype(str).str.strip()
@@ -6935,6 +7218,41 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
         b["Vegas Spread"] = vt
     else:
         b["Vegas Spread"] = ""
+
+    b["ATS Edge"] = ""
+    b["ATS Pick"] = ""
+    b["ATS Bet"] = ""
+    b["ATS Result"] = ""
+    if {"pred_margin_home", "rw_spread_home", "home_team", "away_team"}.issubset(b.columns):
+        pm_num = pd.to_numeric(b["pred_margin_home"], errors="coerce")
+        sp_num = pd.to_numeric(b["rw_spread_home"], errors="coerce")
+        edge_num = pm_num + sp_num
+        b["ATS Edge"] = edge_num.map(lambda v: "" if pd.isna(v) else f"{float(v):+.1f}")
+        b["ATS Pick"] = [
+            "" if pd.isna(edge) or abs(float(edge)) < ats_threshold else (ht if float(edge) > 0 else at)
+            for edge, ht, at in zip(edge_num, b["home_team"], b["away_team"])
+        ]
+        b["ATS Bet"] = [
+            "" if pd.isna(edge) else ("YES" if abs(float(edge)) >= ats_threshold else "NO")
+            for edge in edge_num
+        ]
+
+        cover_margin = hs_base + sp_num - aw_base
+        ats_result = []
+        for edge, cover, is_complete, is_future in zip(edge_num, cover_margin, completed_mask, is_future_game):
+            if pd.isna(edge) or abs(float(edge)) < ats_threshold:
+                ats_result.append("")
+            elif bool(is_future):
+                ats_result.append("LIVE")
+            elif not bool(is_complete) or pd.isna(cover):
+                ats_result.append("")
+            elif abs(float(cover)) < 1e-9:
+                ats_result.append("P")
+            elif (float(edge) > 0 and float(cover) > 0) or (float(edge) < 0 and float(cover) < 0):
+                ats_result.append("W")
+            else:
+                ats_result.append("L")
+        b["ATS Result"] = ats_result
 
     if all(c in b.columns for c in ["rw_home_ml", "rw_away_ml"]):
         hml = pd.to_numeric(b["rw_home_ml"], errors="coerce")
@@ -7077,7 +7395,7 @@ def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
         "game_dt_et", "away_team", "home_team",
         "pick_conf", "p_home_win",
         "Model Spread", "winner_pick",
-        "Vegas Spread", "Vegas ML",
+        "Vegas Spread", "ATS Edge", "ATS Pick", "ATS Bet", "ATS Result", "Vegas ML",
         "Final", "Pred_vs_Final",
         "rw_total",
         "home_injury_impact", "away_injury_impact",
@@ -9758,7 +10076,7 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
     for col in pct_cols:
         summary_view[col] = pd.to_numeric(summary_view[col], errors="coerce")
 
-    champ_cols = [c for c in ["team", "seed", "region", "Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in summary_view.columns]
+    champ_cols = [c for c in ["team", "seed", "region", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"] if c in summary_view.columns]
     champs = (
         summary_view.sort_values(["Champion_Pct", "Finalist_Pct"], ascending=False, na_position="last")[champ_cols]
         .head(12)
@@ -9770,9 +10088,9 @@ def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFram
         "team": "Team",
         "seed": "Seed",
         "region": "Region",
-        "Champion_Pct": "Champion",
-        "Finalist_Pct": "Finalist",
         "Final_Four_Pct": "Final Four",
+        "Finalist_Pct": "Finalist",
+        "Champion_Pct": "Champion",
     })
     bracket_summary_html.value = (
         "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Champion Probability Summary</div>"
@@ -10908,18 +11226,42 @@ def _rebind_button_click(button, handler):
     button.on_click(handler)
 
 
+def _on_filter_widget_change(change):
+    if change.get("name") != "value":
+        return
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    refresh()
+
+
+def _on_date_change(change):
+    if change.get("name") != "value":
+        return
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    refresh()
+
+
+def _on_tournament_mode_change(change):
+    if change.get("name") != "value":
+        return
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    refresh(force_rebuild=True)
+
+
 _rebind_button_click(refresh_btn, predictions_refresh_clicked)
 _rebind_button_click(retrain_btn, force_retrain_clicked)
 _rebind_button_click(open_dashboard_btn, open_dashboard_clicked)
 _rebind_button_click(compare_btn, render_matchup)
 _rebind_button_click(run_bracket_btn, lambda _: run_bracket_simulation(force_run=True))
 _rebind_button_click(refresh_bracket_acc_btn, _render_bracket_accuracy)
-date_picker.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
+date_picker.observe(_on_date_change, names="value")
 
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
-    widget.observe(lambda ch: refresh() if ch["name"] == "value" else None, names="value")
-tournament_mode.observe(lambda ch: refresh(force_rebuild=True) if ch["name"] == "value" else None, names="value")
+    widget.observe(_on_filter_widget_change, names="value")
+tournament_mode.observe(_on_tournament_mode_change, names="value")
 
 # Layout
 controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn, open_dashboard_btn])
@@ -11053,7 +11395,7 @@ def _safe_ats_vs_rotowire(g: pd.DataFrame) -> dict:
 
     x["hma"] = x["hs"] - x["as"]
     x["edge"] = x["pred_margin_home"] + x["rw_spread_home"]
-    x = x[x["edge"].abs() > 0]
+    x = x[x["edge"].abs() >= float(_get_ats_edge_threshold())]
 
     if len(x) == 0:
         return {"ats_games": 0, "ats_acc": np.nan, "pushes": 0}
