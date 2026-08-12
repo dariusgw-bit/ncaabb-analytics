@@ -122,6 +122,10 @@ TRAINING_DATASET_CACHE_PATH = os.path.join(MODEL_DIR, "engineered_training_datas
 TRAINING_DATASET_CACHE_META_PATH = os.path.join(MODEL_DIR, "engineered_training_dataset_meta.json")
 TEAM_BOX_DIR    = os.path.join(RAW_DIR, "team_box")
 SCHEDULE_DIR    = os.path.join(RAW_DIR, "schedule")
+DERIVED_DIR     = os.path.join(RAW_DIR, "derived")
+HOME_AWAY_RECORDS_DIR = os.path.join(DERIVED_DIR, "home_away_records")
+TEAM_RANKINGS_DIR = os.path.join(DERIVED_DIR, "team_rankings")
+OFFICIAL_RANKINGS_PATH = os.path.join(RAW_DIR, "rankings", "mbb_rankings.parquet")
 
 # Retraining schedule
 RETRAIN_DATA_HOURS   = 24    # re-pull current-season data every 24h
@@ -144,7 +148,7 @@ ATS_EDGE_THRESHOLD = 1.0
 SPREAD_ENSEMBLE_CANDIDATES = [0.0, 0.15, 0.25, 0.35, 0.5]
 MARKET_BLEND_CANDIDATES = [0.0, 0.1, 0.15, 0.25, 0.35, 0.5, 0.65]
 
-for d in [RAW_DIR, ROTOWIRE_DIR, INJURY_DIR, MODEL_DIR, TEAM_BOX_DIR, SCHEDULE_DIR]:
+for d in [RAW_DIR, ROTOWIRE_DIR, INJURY_DIR, MODEL_DIR, TEAM_BOX_DIR, SCHEDULE_DIR, DERIVED_DIR, HOME_AWAY_RECORDS_DIR, TEAM_RANKINGS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 print("Paths configured")
@@ -596,6 +600,29 @@ def add_elo_asof_features(joined: pd.DataFrame, elo_df: pd.DataFrame) -> pd.Data
 
 INJURY_DATE_CACHE = {}
 
+def _get_injury_dir_index(injury_dir: str) -> list:
+    global INJURY_DIR_INDEX_CACHE
+    cached = INJURY_DIR_INDEX_CACHE.get(injury_dir)
+    if cached is not None:
+        return cached
+
+    rows = []
+    try:
+        for entry in os.scandir(injury_dir):
+            if not entry.is_file():
+                continue
+            name = entry.name
+            lower = name.lower()
+            if not (lower.endswith(".xlsx") or lower.endswith(".csv")):
+                continue
+            rows.append((name, entry.path, float(entry.stat().st_mtime)))
+    except OSError:
+        rows = []
+
+    INJURY_DIR_INDEX_CACHE[injury_dir] = rows
+    return rows
+
+
 def find_injury_files_for_date(date_et, injury_dir: str) -> list:
     """
     Finds injury files for a given date.
@@ -610,22 +637,46 @@ def find_injury_files_for_date(date_et, injury_dir: str) -> list:
     so downstream deduping keeps the latest update.
     """
     selected_date = pd.Timestamp(date_et).date()
+    mmdd = f"{selected_date.month:02d}{selected_date.day:02d}"
+    ymd = selected_date.strftime("%Y-%m-%d")
+
+    exact_hits = []
+    suffixes = [""] + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    exts = [".xlsx", ".csv"]
+    exact_names = []
+    for suffix in suffixes:
+        for ext in exts:
+            exact_names.extend([
+                f"college-basketball-injury-report-{mmdd}{suffix}{ext}",
+                f"cbb-injuries-{mmdd}{suffix}{ext}",
+                f"cbb-injuries-{ymd}{suffix}{ext}",
+            ])
+    for name in exact_names:
+        candidate = os.path.join(injury_dir, name)
+        if os.path.exists(candidate):
+            try:
+                exact_hits.append((os.path.getmtime(candidate), candidate))
+            except OSError:
+                exact_hits.append((0.0, candidate))
+    if exact_hits:
+        exact_hits.sort(key=lambda x: (x[0], os.path.basename(x[1]).lower()))
+        return [f for _, f in exact_hits]
 
     def _parse_file_date(basename: str):
         name = str(basename or "").strip()
         m = re.match(r"^college-basketball-injury-report-(\d{4})(?:[a-z])?\.(xlsx|csv)$", name, re.IGNORECASE)
         if m:
-            mmdd = m.group(1)
+            mmdd_local = m.group(1)
             try:
-                return date(selected_date.year, int(mmdd[:2]), int(mmdd[2:]))
+                return date(selected_date.year, int(mmdd_local[:2]), int(mmdd_local[2:]))
             except Exception:
                 return None
 
         m = re.match(r"^cbb-injuries-(\d{4})(?:[a-z])?\.(xlsx|csv)$", name, re.IGNORECASE)
         if m:
-            mmdd = m.group(1)
+            mmdd_local = m.group(1)
             try:
-                return date(selected_date.year, int(mmdd[:2]), int(mmdd[2:]))
+                return date(selected_date.year, int(mmdd_local[:2]), int(mmdd_local[2:]))
             except Exception:
                 return None
 
@@ -639,22 +690,24 @@ def find_injury_files_for_date(date_et, injury_dir: str) -> list:
         return None
 
     candidates = []
-    for f in glob.glob(os.path.join(injury_dir, "*")):
-        bn = os.path.basename(f)
+    for bn, full_path, mtime in _get_injury_dir_index(injury_dir):
         file_date = _parse_file_date(bn)
         if file_date is None or file_date > selected_date:
             continue
-        try:
-            mtime = os.path.getmtime(f)
-        except OSError:
-            mtime = 0.0
-        candidates.append((file_date, mtime, f))
+        candidates.append((file_date, mtime, full_path))
 
     if not candidates:
         return []
 
     exact = [row for row in candidates if row[0] == selected_date]
-    chosen = exact if exact else [row for row in candidates if row[0] == max(r[0] for r in candidates)]
+    if exact:
+        exact.sort(key=lambda x: (x[1], os.path.basename(x[2]).lower()))
+        return [f for _, _, f in exact]
+
+    if _is_past_local_slate(date_et):
+        return []
+
+    chosen = [row for row in candidates if row[0] == max(r[0] for r in candidates)]
     chosen.sort(key=lambda x: (x[1], os.path.basename(x[2]).lower()))
     return [f for _, _, f in chosen]
 
@@ -817,7 +870,7 @@ def _load_injury_impact_for_date(date_et, injury_dir: str) -> pd.DataFrame:
     date_key = str(pd.Timestamp(date_et).date())
     files = find_injury_files_for_date(date_et, injury_dir)
     if not files:
-        INJURY_DATE_CACHE.pop(date_key, None)
+        INJURY_DATE_CACHE[date_key] = {"signature": (), "raw_df": pd.DataFrame(), "impact_df": pd.DataFrame()}
         return pd.DataFrame()
 
     sig = _injury_file_signature(files)
@@ -1148,16 +1201,49 @@ def _parse_rotowire_csv(path: str) -> pd.DataFrame:
 def find_rotowire_files_for_date(date_et, rotowire_dir: str) -> list:
     d = pd.Timestamp(date_et).date()
     mmdd = f"{d.month:02d}{d.day:02d}"
-    pat = re.compile(rf"cbb-odds-rotowire-{mmdd}([a-z]?)\.csv$", re.IGNORECASE)
     hits = []
-    for f in glob.glob(os.path.join(rotowire_dir, "*.csv")):
-        bn = os.path.basename(f)
-        m = pat.search(bn)
-        if m:
-            suffix = (m.group(1) or "").lower()
-            hits.append((suffix, f))
+    suffixes = [""] + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    for suffix in suffixes:
+        candidate = os.path.join(rotowire_dir, f"cbb-odds-rotowire-{mmdd}{suffix}.csv")
+        if os.path.exists(candidate):
+            hits.append((suffix, candidate))
     hits.sort(key=lambda x: (x[0] != "", x[0]))
     return [f for _, f in hits]
+
+
+def _is_past_local_slate(date_et) -> bool:
+    target_date = pd.Timestamp(date_et).date()
+    today_et = pd.Timestamp.now(tz="America/New_York").date()
+    return (not IN_COLAB) and target_date < today_et
+
+
+def _has_exact_rotowire_file_for_date(date_et, rotowire_dir: str) -> bool:
+    d = pd.Timestamp(date_et).date()
+    mmdd = f"{d.month:02d}{d.day:02d}"
+    suffixes = [""] + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    for suffix in suffixes:
+        candidate = os.path.join(rotowire_dir, f"cbb-odds-rotowire-{mmdd}{suffix}.csv")
+        if os.path.exists(candidate):
+            return True
+    return False
+
+
+def _has_exact_injury_file_for_date(date_et, injury_dir: str) -> bool:
+    selected_date = pd.Timestamp(date_et).date()
+    mmdd = f"{selected_date.month:02d}{selected_date.day:02d}"
+    ymd = selected_date.strftime("%Y-%m-%d")
+    suffixes = [""] + [chr(c) for c in range(ord("a"), ord("z") + 1)]
+    exts = [".xlsx", ".csv"]
+    for suffix in suffixes:
+        for ext in exts:
+            for name in [
+                f"college-basketball-injury-report-{mmdd}{suffix}{ext}",
+                f"cbb-injuries-{mmdd}{suffix}{ext}",
+                f"cbb-injuries-{ymd}{suffix}{ext}",
+            ]:
+                if os.path.exists(os.path.join(injury_dir, name)):
+                    return True
+    return False
 
 
 def load_rotowire_all_for_date(date_et, rotowire_dir: str) -> pd.DataFrame:
@@ -1165,7 +1251,7 @@ def load_rotowire_all_for_date(date_et, rotowire_dir: str) -> pd.DataFrame:
     date_key = str(pd.Timestamp(date_et).date())
     files = find_rotowire_files_for_date(date_et, rotowire_dir)
     if not files:
-        ROTOWIRE_DATE_CACHE.pop(date_key, None)
+        ROTOWIRE_DATE_CACHE[date_key] = {"signature": (), "df": pd.DataFrame()}
         return pd.DataFrame()
     sig = _rotowire_file_signature(files)
     cached = ROTOWIRE_DATE_CACHE.get(date_key)
@@ -1975,10 +2061,27 @@ def build_pregame_dataset_for_slate(
     today_et = pd.Timestamp.now(tz="America/New_York").date()
     is_past_date = slate_date_et < today_et
 
+    _set_build_progress(f"Loading schedule slate for {slate_date_et}...")
     slate = _extract_valid_schedule_slate(schedule_df, slate_date_et)
+    _set_build_progress(f"Schedule rows found: {0 if slate is None else len(slate)}")
 
     if is_past_date:
-        if "team_box_hist" in globals() and team_box_hist is not None and len(team_box_hist) > 0:
+        schedule_is_complete = False
+        if slate is not None and len(slate) > 0:
+            try:
+                schedule_is_complete = bool(
+                    {"home_id", "away_id"}.issubset(slate.columns)
+                    and "home_team" in slate.columns
+                    and "away_team" in slate.columns
+                    and pd.to_numeric(slate.get("home_id"), errors="coerce").notna().all()
+                    and pd.to_numeric(slate.get("away_id"), errors="coerce").notna().all()
+                    and (~slate["home_team"].map(_bad_team_name)).all()
+                    and (~slate["away_team"].map(_bad_team_name)).all()
+                )
+            except Exception:
+                schedule_is_complete = False
+
+        if (not schedule_is_complete) and "team_box_hist" in globals() and team_box_hist is not None and len(team_box_hist) > 0:
             tb = team_box_hist.copy()
             if {"game_id", "game_date_time"}.issubset(tb.columns):
                 tb["game_id"] = tb["game_id"].astype(str)
@@ -2124,16 +2227,11 @@ def build_pregame_dataset_for_slate(
     if slate is None or len(slate) == 0:
         return pd.DataFrame()
 
-    snaps = team_snaps.copy()
-    snaps["team_id"] = pd.to_numeric(snaps["team_id"], errors="coerce")
-    snaps["game_dt_et"] = pd.to_datetime(snaps["game_dt_et"], errors="coerce")
-
-    snaps = snaps.dropna(subset=["team_id", "game_dt_et"]).copy()
-    snaps["team_id"] = snaps["team_id"].astype("int64")
-    snaps["game_dt_et"] = snaps["game_dt_et"].astype("datetime64[ns]")
-
-    snaps = snaps.sort_values(["game_dt_et", "team_id"], kind="mergesort").reset_index(drop=True)
-    use_roll_cols = [c for c in roll_cols if c in snaps.columns]
+    _set_build_progress("Preparing rolling team snapshot lookup...")
+    snaps, use_roll_cols = _get_prepared_team_snaps(team_snaps, roll_cols)
+    if len(snaps) == 0:
+        _set_build_progress("No prepared team snapshots available for this slate.")
+        return pd.DataFrame()
 
     def asof_team(team_ids, times, prefix):
         out = pd.DataFrame(index=np.arange(len(team_ids)))
@@ -2185,7 +2283,9 @@ def build_pregame_dataset_for_slate(
 
         return out
 
+    _set_build_progress("Merging home rolling features...")
     home_feats = asof_team(slate["home_id"].values, slate["game_dt_et"].values, "HOME")
+    _set_build_progress("Merging away rolling features...")
     away_feats = asof_team(slate["away_id"].values, slate["game_dt_et"].values, "AWAY")
 
     base_cols = [
@@ -2240,12 +2340,24 @@ def build_pregame_dataset_for_slate(
     if diff_cols_local:
         joined[diff_cols_local] = joined[diff_cols_local].apply(pd.to_numeric, errors="coerce")
 
+    _set_build_progress("Attaching Elo and market context...")
     if elo_snap is not None and len(elo_snap) > 0:
         joined = add_elo_asof_features(joined, elo_snap)
 
     neutral = _coerce_bool_series(joined.get("neutral_site", False), joined.index)
     joined["home_court_A"] = np.where(neutral, 0.0, np.where(teamA_is_home, 1.0, -1.0))
-    joined = attach_rotowire_features_by_row_date(joined, date_col="game_dt_et")
+    if (not _is_past_local_slate(slate_date_et)) or _has_exact_rotowire_file_for_date(slate_date_et, ROTOWIRE_DIR):
+        joined = attach_rotowire_features_by_row_date(joined, date_col="game_dt_et")
+    else:
+        if "rw_spread_home" not in joined.columns:
+            joined["rw_spread_home"] = np.nan
+        if "rw_home_ml" not in joined.columns:
+            joined["rw_home_ml"] = np.nan
+        if "rw_away_ml" not in joined.columns:
+            joined["rw_away_ml"] = np.nan
+        if "rw_total" not in joined.columns:
+            joined["rw_total"] = np.nan
+        joined["rw_missing_reason"] = "No RW odds in file"
     joined = _add_hybrid_spread_features(joined)
 
     if joined.columns.duplicated().any():
@@ -2518,7 +2630,9 @@ def build_game_dataset_from_team_box(
     team_box: pd.DataFrame,
     schedule_df: pd.DataFrame,
     window: int = ROLL_WINDOW,
-    elo_df: pd.DataFrame = None
+    elo_df: pd.DataFrame = None,
+    team_snaps: pd.DataFrame = None,
+    precomputed_roll_cols: list = None,
 ) -> pd.DataFrame:
     """
     Builds the per-game labeled dataset for model training.
@@ -2565,34 +2679,53 @@ def build_game_dataset_from_team_box(
 
     tb = tb.sort_values(["team_id", "game_dt_et"]).copy()
 
-    roll_data = {}
-    for c in num_cols:
-        roll_data[f"r{window}_mean_{c}"] = (
-            tb.groupby("team_id")[c]
-              .rolling(window, min_periods=3).mean()
-              .shift(1).reset_index(level=0, drop=True)
-        )
-        roll_data[f"r3_mean_{c}"] = (
-            tb.groupby("team_id")[c]
-              .rolling(3, min_periods=2).mean()
-              .shift(1).reset_index(level=0, drop=True)
-        )
-        roll_data[f"r{window}_std_{c}"] = (
-            tb.groupby("team_id")[c]
-              .rolling(window, min_periods=3).std()
+    # check_and_retrain() already computed these leakage-safe snapshots for
+    # the prediction board. Reuse them here instead of recalculating 3 rolling
+    # windows for every numeric column a second time.
+    supplied_roll_cols = [
+        c for c in (precomputed_roll_cols or [])
+        if c in (team_snaps.columns if team_snaps is not None else [])
+    ]
+    if team_snaps is not None and len(team_snaps) > 0 and supplied_roll_cols:
+        snap_cols = ["game_id", "team_id"] + supplied_roll_cols
+        snap = team_snaps[snap_cols].copy()
+        snap["game_id"] = snap["game_id"].astype(str)
+        snap["team_id"] = pd.to_numeric(snap["team_id"], errors="coerce")
+        snap = snap.dropna(subset=["game_id", "team_id"])
+        snap["team_id"] = snap["team_id"].astype(int)
+        snap = snap.drop_duplicates(["game_id", "team_id"], keep="last")
+        tb = tb.drop(columns=supplied_roll_cols, errors="ignore")
+        tb = tb.merge(snap, on=["game_id", "team_id"], how="left", sort=False)
+        roll_cols = supplied_roll_cols
+    else:
+        roll_data = {}
+        for c in num_cols:
+            roll_data[f"r{window}_mean_{c}"] = (
+                tb.groupby("team_id")[c]
+                  .rolling(window, min_periods=3).mean()
+                  .shift(1).reset_index(level=0, drop=True)
+            )
+            roll_data[f"r3_mean_{c}"] = (
+                tb.groupby("team_id")[c]
+                  .rolling(3, min_periods=2).mean()
+                  .shift(1).reset_index(level=0, drop=True)
+            )
+            roll_data[f"r{window}_std_{c}"] = (
+                tb.groupby("team_id")[c]
+                  .rolling(window, min_periods=3).std()
+                  .shift(1).reset_index(level=0, drop=True)
+            )
+
+        roll_data[f"r{window}_gp"] = (
+            tb.groupby("team_id")["team_id"]
+              .rolling(window, min_periods=1).count()
               .shift(1).reset_index(level=0, drop=True)
         )
 
-    roll_data[f"r{window}_gp"] = (
-        tb.groupby("team_id")["team_id"]
-          .rolling(window, min_periods=1).count()
-          .shift(1).reset_index(level=0, drop=True)
-    )
+        for k, v in roll_data.items():
+            tb[k] = v
 
-    for k, v in roll_data.items():
-        tb[k] = v
-
-    roll_cols = list(roll_data.keys())
+        roll_cols = list(roll_data.keys())
 
     lo = np.minimum(tb["team_id"], tb["opponent_team_id"])
     hi = np.maximum(tb["team_id"], tb["opponent_team_id"])
@@ -4426,8 +4559,12 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     )
     team_snaps, roll_cols = build_team_rolling_snapshots(tb_hist, window=ROLL_WINDOW)
     elo_snap = compute_elo_ratings(tb_hist)
+    SEASON_VIZ_CACHE.clear()
+    OVERVIEW_VIZ_CACHE.clear()
     if "_refresh_matchup_team_options" in globals():
         _refresh_matchup_team_options()
+    if "_refresh_season_viz_options" in globals():
+        _refresh_season_viz_options(force=True)
 
     if not force_model and need_model:
         saved_training_sig = meta.get("training_input_signature")
@@ -4456,6 +4593,8 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
                 schedule_df=schedule_hist,
                 window=ROLL_WINDOW,
                 elo_df=elo_snap,
+                team_snaps=team_snaps,
+                precomputed_roll_cols=roll_cols,
             )
             dataset_all = dataset_all.sort_values("game_dt_et").reset_index(drop=True)
             _save_training_dataset_cache(dataset_all, dataset_cache_sig)
@@ -4800,6 +4939,7 @@ def build_board_for_date(
     verbose=False,
 ) -> pd.DataFrame:
     """Full pipeline: pregame features predictions actual score backfill injury merge."""
+    _set_build_progress("Preparing slate features...")
     with (suppress_stdout_stderr() if not verbose else contextlib.nullcontext()):
         pregame = build_pregame_dataset_for_slate(
             schedule_df=schedule_df,
@@ -4813,17 +4953,28 @@ def build_board_for_date(
     if pregame is None or len(pregame) == 0:
         return pd.DataFrame()
 
+    _set_build_progress("Normalizing pregame slate...")
     pregame = normalize_board_for_downstream(pregame)
     pregame = _attach_schedule_tournament_context(
         pregame, schedule_df, date_et,
         debug_key=f"pregame_context_{pd.Timestamp(date_et).date()}",
     )
     pregame = _coerce_schedule_tournament_flags(pregame, debug_key=f"pregame_board_{pd.Timestamp(date_et).date()}")
-    pregame = attach_injury_features_to_board(pregame, date_et, INJURY_DIR)
-    pregame = _attach_rotowire_to_board(pregame, date_et)
+    use_optional_inj = (not _is_past_local_slate(date_et)) or _has_exact_injury_file_for_date(date_et, INJURY_DIR)
+    use_optional_rw = (not _is_past_local_slate(date_et)) or _has_exact_rotowire_file_for_date(date_et, ROTOWIRE_DIR)
+    if use_optional_inj:
+        pregame = attach_injury_features_to_board(pregame, date_et, INJURY_DIR)
+    else:
+        for col in ["home_injury_impact", "away_injury_impact", "diff_injury_impact", "home_inj_out", "away_inj_out", "injury_impact_A", "injury_impact_B", "inj_out_A", "inj_out_B", "diff_inj_out"]:
+            pregame[col] = np.nan
+    if use_optional_rw:
+        pregame = _attach_rotowire_to_board(pregame, date_et)
+    else:
+        pregame["rw_missing_reason"] = "No RW odds in file"
     pregame = _add_hybrid_spread_features(pregame)
     pregame = normalize_board_for_downstream(pregame)
 
+    _set_build_progress("Running prediction models...")
     board = predict_slate(
         pregame, spread_booster, winner_booster, lgb_spread,
         iso, imp, feature_cols,
@@ -4831,6 +4982,7 @@ def build_board_for_date(
         lgb_spread_edge=lgb_spread_edge,
     )
 
+    _set_build_progress("Applying schedule context...")
     board = normalize_board_for_downstream(board)
     board = _attach_schedule_tournament_context(
         board, schedule_df, date_et,
@@ -4839,18 +4991,22 @@ def build_board_for_date(
     board = _coerce_schedule_tournament_flags(board, debug_key=f"board_{pd.Timestamp(date_et).date()}")
 
     # first try schedule backfill
+    _set_build_progress("Backfilling schedule scores...")
     board = attach_actual_scores_from_schedule(board, schedule_df, date_et)
     board = normalize_board_for_downstream(board)
 
     # then fill any remaining missing finals from team_box history
     if "team_box_hist" in globals() and team_box_hist is not None and len(team_box_hist) > 0:
+        _set_build_progress("Backfilling team-box scores...")
         board = attach_actual_scores_from_team_box(board, team_box_hist, date_et)
         board = normalize_board_for_downstream(board)
 
     # then patch stale same-day / prior-day finals from ESPN scoreboard data
+    _set_build_progress("Patching final scores...")
     board = attach_espn_scoreboard_finals_patch(board, date_et)
     board = normalize_board_for_downstream(board)
 
+    _set_build_progress("Checking fresh live scores...")
     board = attach_fresh_scores_from_hoopr(board, date_et)
 
     # Attach final scores for completed games
@@ -4880,7 +5036,11 @@ def build_board_for_date(
         )
 
     # Attach injury features
-    board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
+    if use_optional_inj:
+        board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
+    else:
+        for col in ["home_injury_impact", "away_injury_impact", "diff_injury_impact", "home_inj_out", "away_inj_out", "injury_impact_A", "injury_impact_B", "inj_out_A", "inj_out_B", "diff_inj_out"]:
+            board[col] = np.nan
     board = normalize_board_for_downstream(board)
     board = _attach_schedule_tournament_context(
         board, schedule_df, date_et,
@@ -4888,6 +5048,7 @@ def build_board_for_date(
     )
     board = _coerce_schedule_tournament_flags(board, debug_key=f"board_final_{pd.Timestamp(date_et).date()}")
 
+    _set_build_progress("Finalizing board rows...")
     # dedupe
     board = _dedupe_game_rows(board)
 
@@ -5304,18 +5465,16 @@ def attach_actual_scores_from_schedule(board: pd.DataFrame, schedule_df: pd.Data
 # CELL 13C: BACKFILL ACTUAL SCORES FROM TEAM BOX HISTORY
 # ============================================================
 
-def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.DataFrame, slate_date_et) -> pd.DataFrame:
-    """
-    Backfill finals from team_box history using TEAM IDS and nearest-date matching.
-    This avoids exact-date misses caused by timezone/date parsing differences.
-    """
-    if board is None or len(board) == 0:
-        return pd.DataFrame()
-    if team_box_df is None or len(team_box_df) == 0:
-        return board.copy()
+def _get_team_box_game_lookup(team_box_df: pd.DataFrame) -> pd.DataFrame:
+    global TEAM_BOX_GAME_LOOKUP_CACHE
 
-    out = normalize_board_for_downstream(board.copy())
-    target_date = pd.Timestamp(slate_date_et).date()
+    if team_box_df is None or len(team_box_df) == 0:
+        return pd.DataFrame()
+
+    cache_key = (id(team_box_df), int(len(team_box_df)))
+    cached = TEAM_BOX_GAME_LOOKUP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
 
     tb = team_box_df.copy()
     tb["game_id"] = tb["game_id"].astype(str)
@@ -5334,32 +5493,85 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
         "team_id", "opponent_team_id", "team_score", "opponent_team_score"
     ]).copy()
 
+    if len(tb) == 0:
+        return pd.DataFrame()
+
     tb["team_id"] = tb["team_id"].astype("int64")
     tb["opponent_team_id"] = tb["opponent_team_id"].astype("int64")
-
-    # unordered id pair
     tb["id_low"] = np.minimum(tb["team_id"], tb["opponent_team_id"]).astype("int64")
     tb["id_high"] = np.maximum(tb["team_id"], tb["opponent_team_id"]).astype("int64")
-
-    # keep one row per game/team
     tb = tb.sort_values(["game_dt_et", "game_id", "team_id"]).drop_duplicates(
         subset=["game_id", "team_id"], keep="last"
     )
 
-    # two team rows -> one game row
     a = tb[["game_id", "game_dt_et", "game_date_et", "id_low", "id_high", "team_id", "team_score"]].copy()
     b = tb[["game_id", "team_id", "team_score"]].copy()
-
     a = a.rename(columns={"team_id": "team1_id", "team_score": "team1_score"})
     b = b.rename(columns={"team_id": "team2_id", "team_score": "team2_score"})
 
     games = a.merge(b, on="game_id", how="inner")
     games = games[games["team1_id"] != games["team2_id"]].copy()
-
-    # one row per actual game
     games = games.drop_duplicates(subset=["game_id", "id_low", "id_high"], keep="last").copy()
 
-    # keep only games reasonably close to target date
+    TEAM_BOX_GAME_LOOKUP_CACHE[cache_key] = games.copy()
+    if len(TEAM_BOX_GAME_LOOKUP_CACHE) > 3:
+        stale = [k for k in TEAM_BOX_GAME_LOOKUP_CACHE if k != cache_key]
+        for k in stale[:-2]:
+            TEAM_BOX_GAME_LOOKUP_CACHE.pop(k, None)
+    return games.copy()
+
+
+def _get_prepared_team_snaps(team_snaps_df: pd.DataFrame, roll_cols: list) -> tuple[pd.DataFrame, list]:
+    global TEAM_SNAPS_PREP_CACHE
+
+    if team_snaps_df is None or len(team_snaps_df) == 0:
+        return pd.DataFrame(), []
+
+    cache_key = (id(team_snaps_df), int(len(team_snaps_df)), tuple(sorted(str(c) for c in (roll_cols or []))))
+    cached = TEAM_SNAPS_PREP_CACHE.get(cache_key)
+    if cached is not None:
+        snaps_cached, use_roll_cols_cached = cached
+        return snaps_cached.copy(), list(use_roll_cols_cached)
+
+    snaps = team_snaps_df.copy()
+    snaps["team_id"] = pd.to_numeric(snaps.get("team_id"), errors="coerce")
+    snaps["game_dt_et"] = pd.to_datetime(snaps.get("game_dt_et"), errors="coerce")
+    snaps = snaps.dropna(subset=["team_id", "game_dt_et"]).copy()
+    if len(snaps) == 0:
+        TEAM_SNAPS_PREP_CACHE[cache_key] = (pd.DataFrame(), [])
+        return pd.DataFrame(), []
+
+    snaps["team_id"] = snaps["team_id"].astype("int64")
+    snaps["game_dt_et"] = snaps["game_dt_et"].astype("datetime64[ns]")
+    snaps = snaps.sort_values(["game_dt_et", "team_id"], kind="mergesort").reset_index(drop=True)
+    use_roll_cols = [c for c in (roll_cols or []) if c in snaps.columns]
+
+    TEAM_SNAPS_PREP_CACHE[cache_key] = (snaps.copy(), list(use_roll_cols))
+    if len(TEAM_SNAPS_PREP_CACHE) > 3:
+        stale = [k for k in TEAM_SNAPS_PREP_CACHE if k != cache_key]
+        for k in stale[:-2]:
+            TEAM_SNAPS_PREP_CACHE.pop(k, None)
+    return snaps.copy(), list(use_roll_cols)
+
+
+def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.DataFrame, slate_date_et) -> pd.DataFrame:
+    """
+    Backfill finals from team_box history using TEAM IDS and nearest-date matching.
+    This avoids exact-date misses caused by timezone/date parsing differences.
+    """
+    if board is None or len(board) == 0:
+        return pd.DataFrame()
+    if team_box_df is None or len(team_box_df) == 0:
+        return board.copy()
+
+    out = normalize_board_for_downstream(board.copy())
+    target_date = pd.Timestamp(slate_date_et).date()
+
+    games = _get_team_box_game_lookup(team_box_df)
+    if len(games) == 0:
+        return out
+
+    games = games.copy()
     games["date_diff_days"] = (pd.to_datetime(games["game_date_et"]) - pd.Timestamp(target_date)).dt.days.abs()
     games = games[games["date_diff_days"] <= 2].copy()
 
@@ -6078,6 +6290,11 @@ def attach_espn_scoreboard_finals_patch(board: pd.DataFrame, date_et) -> pd.Data
         return pd.DataFrame()
 
     out = normalize_board_for_downstream(board.copy())
+    target_date = pd.Timestamp(date_et).date()
+    today_et = pd.Timestamp.now(tz="America/New_York").date()
+    if (not IN_COLAB) and target_date < today_et:
+        return out
+
     try:
         patch = fetch_mbb_scoreboard_finals_r(date_et)
     except Exception:
@@ -6260,29 +6477,30 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
     if board is None or len(board) == 0:
         return {}
 
+
     g = board.copy()
     g["final_score"] = g.get("final_score", "").astype(str)
-    real_final_mask = _real_final_mask(g)
-    g = g[real_final_mask & g["final_score"].str.strip().ne("")]
+
+    completed = g.get("status_type_completed", pd.Series(False, index=g.index)).astype(str).str.lower().isin(["true", "1", "yes"])
+    state_final = g.get("status_type_state", pd.Series("", index=g.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
+    detail_final = g.get("status_type_short_detail", pd.Series("", index=g.index)).astype(str).str.contains("Final", case=False, na=False)
+    score_present = g["final_score"].str.strip().ne("")
+    real_final_mask = completed | state_final | detail_final | score_present
+    g = g[real_final_mask & score_present].copy()
     if len(g) == 0:
         return {}
 
-    def _extract_pts(s):
-        nums = re.findall(r"(\d+)", str(s))
-        return (float(nums[-2]), float(nums[-1])) if len(nums) >= 2 else (np.nan, np.nan)
 
-    pts = g["final_score"].map(_extract_pts)
-    g["away_pts"] = [p[0] for p in pts]
-    g["home_pts"] = [p[1] for p in pts]
-    g = g.dropna(subset=["away_pts", "home_pts"])
+    score_parts = g["final_score"].astype(str).str.extractall(r"(\d+)").groupby(level=0)[0].agg(list)
+    score_parts = score_parts.reindex(g.index)
+    g["away_pts"] = score_parts.map(lambda vals: float(vals[-2]) if isinstance(vals, list) and len(vals) >= 2 else np.nan)
+    g["home_pts"] = score_parts.map(lambda vals: float(vals[-1]) if isinstance(vals, list) and len(vals) >= 2 else np.nan)
+    g = g.dropna(subset=["away_pts", "home_pts"]).copy()
     if len(g) == 0:
         return {}
 
     g["home_margin_actual"] = g["home_pts"] - g["away_pts"]
 
-    # -------------------------------------------------
-    # Winner accuracy
-    # -------------------------------------------------
     g["actual_winner"] = np.where(
         g["home_pts"] > g["away_pts"], g["home_team"],
         np.where(g["away_pts"] > g["home_pts"], g["away_team"], "PUSH")
@@ -6293,84 +6511,48 @@ def compute_daily_accuracy(board: pd.DataFrame) -> dict:
     if pick_col:
         w = g[g["actual_winner"] != "PUSH"]
         if len(w):
-            winner_acc = float(
-                (w[pick_col].map(canonical_team) == w["actual_winner"].map(canonical_team)).mean()
-            )
+            winner_acc = float((w[pick_col].astype(str) == w["actual_winner"].astype(str)).mean())
 
-    # -------------------------------------------------
-    # TRUE spread accuracy:
-    # predicted spread must actually cover
-    # -------------------------------------------------
     spread_acc = np.nan
-    if "pred_margin_home" in g.columns:
-        pm = pd.to_numeric(g["pred_margin_home"], errors="coerce")
-        am = pd.to_numeric(g["home_margin_actual"], errors="coerce")
-
-        valid = pm.notna() & am.notna()
-        if valid.any():
-            # correct if actual margin beats predicted margin in same direction
-            spread_correct = np.where(
-                pm[valid] > 0,
-                am[valid] > pm[valid],     # home favored by x must win by MORE than x
-                np.where(
-                    pm[valid] < 0,
-                    am[valid] < pm[valid], # away favored by x must win by MORE than x
-                    am[valid] == 0         # PK / exact zero case
-                )
-            )
-            spread_acc = float(np.mean(spread_correct))
-
-    # -------------------------------------------------
-    # Margin MAE
-    # -------------------------------------------------
     margin_mae = np.nan
     within_5 = np.nan
     if "pred_margin_home" in g.columns:
         pm = pd.to_numeric(g["pred_margin_home"], errors="coerce")
         am = pd.to_numeric(g["home_margin_actual"], errors="coerce")
-        v = pm.notna() & am.notna()
-        if v.any():
-            err = (pm[v] - am[v]).abs()
+        valid = pm.notna() & am.notna()
+        if valid.any():
+            spread_correct = np.where(
+                pm[valid] > 0,
+                am[valid] > pm[valid],
+                np.where(pm[valid] < 0, am[valid] < pm[valid], am[valid] == 0)
+            )
+            spread_acc = float(np.mean(spread_correct))
+            err = (pm[valid] - am[valid]).abs()
             margin_mae = float(err.mean())
             within_5 = float((err <= 5).mean())
 
-    # -------------------------------------------------
-    # ATS vs Vegas
-    # -------------------------------------------------
     ats_acc, ats_games = np.nan, 0
-    ats_threshold = float(_get_ats_edge_threshold())
     vegas_spread_home = _get_home_vegas_spread(g)
-    if vegas_spread_home.notna().any():
-        rg = g.copy()
-        rg["vegas_spread_home"] = vegas_spread_home
-        rg["pred_margin_home"] = pd.to_numeric(rg["pred_margin_home"], errors="coerce")
-        rg["home_margin_actual"] = pd.to_numeric(rg["home_margin_actual"], errors="coerce")
-
-        rg = rg.dropna(subset=["vegas_spread_home", "pred_margin_home", "home_margin_actual"])
+    if vegas_spread_home.notna().any() and "pred_margin_home" in g.columns:
+        ats_threshold = float(_get_ats_edge_threshold())
+        rg = pd.DataFrame({
+            "vegas_spread_home": pd.to_numeric(vegas_spread_home, errors="coerce"),
+            "pred_margin_home": pd.to_numeric(g["pred_margin_home"], errors="coerce"),
+            "home_margin_actual": pd.to_numeric(g["home_margin_actual"], errors="coerce"),
+        }, index=g.index).dropna()
         if len(rg) > 0:
             rg["edge"] = rg["pred_margin_home"] + rg["vegas_spread_home"]
             rg = rg[rg["edge"].abs() >= ats_threshold].copy()
-            rg["pick"] = np.where(rg["edge"] > 0, "HOME",
-                           np.where(rg["edge"] < 0, "AWAY", "NO_BET"))
-            rg = rg[rg["pick"] != "NO_BET"]
-
             if len(rg) > 0:
+                rg["pick_home"] = rg["edge"] > 0
                 rg["cover_margin"] = rg["home_margin_actual"] + rg["vegas_spread_home"]
-
-                # HOME pick wins if actual home margin > vegas spread
-                # AWAY pick wins if actual home margin < vegas spread
-                ats_result = np.where(
-                    rg["pick"] == "HOME",
-                    rg["cover_margin"] > 0,
-                    rg["cover_margin"] < 0
-                )
-
-                pushes = rg["cover_margin"] == 0
-                ats_result = ats_result[~pushes]
-
-                if len(ats_result) > 0:
+                non_push = rg["cover_margin"] != 0
+                rg = rg[non_push].copy()
+                if len(rg) > 0:
+                    ats_result = np.where(rg["pick_home"], rg["cover_margin"] > 0, rg["cover_margin"] < 0)
                     ats_acc = float(np.mean(ats_result))
-                    ats_games = int(len(ats_result))
+                    ats_games = int(len(rg))
+
 
     return {
         "games_graded": len(g),
@@ -6741,7 +6923,7 @@ def compute_daily_accuracy_detailed(board: pd.DataFrame) -> dict:
 def build_or_update_season_accuracy_cache():
     """
     Updates weekly cached season accuracy.
-    Only computes weeks not already saved.
+    Rebuilds weeks when exact Rotowire odds files are now available so ATS stats stay current.
     """
     required_keys = {
         "games_graded",
@@ -6779,10 +6961,24 @@ def build_or_update_season_accuracy_cache():
 
     for idx, (wk, dates_in_week) in enumerate(week_items, start=1):
         cached_wk = cache.get(wk, {})
+        exact_rw_dates = int(sum(1 for d in dates_in_week if _has_exact_rotowire_file_for_date(d, ROTOWIRE_DIR)))
+        cached_rw_dates = int(cached_wk.get("rw_exact_dates", -1) or 0)
+        cached_ats_total = int(cached_wk.get("ats_total", 0) or 0)
+        cached_games_graded = int(cached_wk.get("games_graded", 0) or 0)
+
+        should_refresh = True
         if wk in cache and required_keys.issubset(set(cached_wk.keys())):
+            should_refresh = False
+            if exact_rw_dates > 0 and cached_games_graded > 0:
+                if cached_rw_dates != exact_rw_dates or cached_ats_total == 0:
+                    should_refresh = True
+
+        if not should_refresh:
             continue
 
         progress_msg = f"Season accuracy cache: week {idx}/{total_weeks} ({wk})"
+        if exact_rw_dates > 0:
+            progress_msg += f" | exact RW dates: {exact_rw_dates}"
         print(progress_msg)
         with contextlib.suppress(Exception):
             _dashboard_log(
@@ -6792,6 +6988,13 @@ def build_or_update_season_accuracy_cache():
                 week_index=int(idx),
                 total_weeks=int(total_weeks),
                 dates=len(dates_in_week),
+                exact_rw_dates=exact_rw_dates,
+                cached_ats_total=cached_ats_total,
+                refresh_reason=(
+                    "missing_or_incomplete_cache"
+                    if not (wk in cache and required_keys.issubset(set(cached_wk.keys())))
+                    else "rotowire_exact_dates_available"
+                ),
             )
 
         boards = []
@@ -6827,6 +7030,7 @@ def build_or_update_season_accuracy_cache():
             )
             cache[wk] = compute_daily_accuracy_detailed(week_board)
             cache[wk]["confidence_bands"] = _compute_confidence_band_detailed(week_board)
+            cache[wk]["rw_exact_dates"] = exact_rw_dates
         else:
             cache[wk] = {
                 "games_graded": 0,
@@ -6836,6 +7040,7 @@ def build_or_update_season_accuracy_cache():
                 "within5_correct": 0, "within5_total": 0,
                 "ats_correct": 0, "ats_total": 0,
                 "confidence_bands": [],
+                "rw_exact_dates": exact_rw_dates,
             }
 
         updated = True
@@ -6849,6 +7054,8 @@ def build_or_update_season_accuracy_cache():
                 week_index=int(idx),
                 total_weeks=int(total_weeks),
                 games_graded=int(cache[wk].get("games_graded", 0) or 0),
+                ats_total=int(cache[wk].get("ats_total", 0) or 0),
+                exact_rw_dates=int(cache[wk].get("rw_exact_dates", 0) or 0),
             )
 
     if updated:
@@ -6890,7 +7097,12 @@ BOARD_CACHE = {}
 HC_FILTER_CACHE = {}
 MATCHUP_SNAPSHOT_CACHE = {}
 FILTERED_BOARD_CACHE = {}
+TEAM_BOX_GAME_LOOKUP_CACHE = {}
+TEAM_SNAPS_PREP_CACHE = {}
+INJURY_DIR_INDEX_CACHE = {}
 BRACKET_COMPLETED_LOOKUP_CACHE = {}
+SEASON_VIZ_CACHE = {}
+OVERVIEW_VIZ_CACHE = {}
 DASHBOARD_RUN_LOG = []
 DASHBOARD_LOG_PATH = os.path.join(BASE_DIR, "dashboard_runtime_log.jsonl")
 STARTUP_DIAGNOSTICS = {}
@@ -6921,6 +7133,54 @@ def _dashboard_log(event: str, **payload):
         pass
 
 
+def _validate_board_like(board: pd.DataFrame, label: str = "Board") -> list:
+    warnings = []
+    if board is None:
+        return [f"{label}: board is None."]
+    if not isinstance(board, pd.DataFrame):
+        return [f"{label}: expected DataFrame, got {type(board).__name__}."]
+    if len(board) == 0:
+        warnings.append(f"{label}: board is empty.")
+        return warnings
+
+    required_any = [
+        "home_team", "away_team", "pred_margin_home", "winner_pick", "confidence", "pick_conf"
+    ]
+    missing_core = [c for c in ["home_team", "away_team"] if c not in board.columns]
+    if missing_core:
+        warnings.append(f"{label}: missing team columns: {', '.join(missing_core)}")
+
+    if all(c not in board.columns for c in ["confidence", "pick_conf"]):
+        warnings.append(f"{label}: missing confidence column.")
+
+    if "pred_margin_home" not in board.columns:
+        warnings.append(f"{label}: missing pred_margin_home column.")
+
+    if "winner_pick" not in board.columns:
+        warnings.append(f"{label}: missing winner_pick column.")
+
+    if "game_id" not in board.columns:
+        dedupe_cols = [c for c in ["game_dt_et", "away_team", "home_team"] if c in board.columns]
+        if not dedupe_cols:
+            warnings.append(f"{label}: no game_id or fallback matchup keys present.")
+
+    try:
+        conf = pd.to_numeric(board.get("confidence", board.get("pick_conf")), errors="coerce")
+        if conf is not None and len(conf) and conf.notna().sum() == 0:
+            warnings.append(f"{label}: confidence values are all missing.")
+    except Exception:
+        warnings.append(f"{label}: confidence values could not be parsed.")
+
+    try:
+        pm = pd.to_numeric(board.get("pred_margin_home"), errors="coerce") if "pred_margin_home" in board.columns else pd.Series(dtype=float)
+        if len(pm) and pm.notna().sum() == 0:
+            warnings.append(f"{label}: pred_margin_home values are all missing.")
+    except Exception:
+        warnings.append(f"{label}: pred_margin_home values could not be parsed.")
+
+    return warnings
+
+
 def _warning_html(title: str, items) -> str:
     lines = [str(x).strip() for x in (items or []) if str(x).strip()]
     if not lines:
@@ -6930,6 +7190,94 @@ def _warning_html(title: str, items) -> str:
         f"<div style='background:#2a2111;border-left:4px solid #d9a441;padding:8px 10px;"
         f"color:#f2d28b;margin:0 0 8px 0;'><b>{title}</b><br>{body}</div>"
     )
+
+
+def df_to_html_table(df: pd.DataFrame, max_rows: int = 80) -> str:
+    if df is None or len(df) == 0:
+        return "<div style='color:#AAA; padding:8px;'>No games match current filters.</div>"
+    df = df.head(max_rows)
+    style = """
+    <style>
+    .pred-table-wrap { width:100%; overflow-x:auto; overflow-y:hidden; }
+    .pred-table { border-collapse: collapse; width:max-content; min-width:100%; font-size:12px; color:#EEE; table-layout:auto; }
+    .pred-table th { background:#1a1a1a; color:#FFD700; padding:6px 8px; text-align:left;
+                     border-bottom:2px solid #333; white-space:nowrap; position:relative; }
+    .pred-table td { padding:6px 10px; border-bottom:1px solid #222; white-space:nowrap; }
+    .pred-table tr:hover td { background:#1f1f1f; }
+    </style>"""
+    table_html = df.to_html(escape=False, index=False, classes="pred-table", border=0)
+    return style + f"<div class='pred-table-wrap'>{table_html}</div>"
+
+
+def render_predictions_table(board: pd.DataFrame, max_rows: int = 80) -> str:
+    if board is None or len(board) == 0:
+        return "<div style='color:#AAA; padding:8px;'>No games found for the selected filters.</div>"
+
+    b = board.copy()
+
+    def _fmt_num(series, digits=1, pct=False):
+        s = pd.to_numeric(series, errors="coerce")
+        if pct:
+            return s.map(lambda v: "" if pd.isna(v) else f"{100.0 * float(v):.{digits}f}%")
+        return s.map(lambda v: "" if pd.isna(v) else f"{float(v):.{digits}f}")
+
+    def _fmt_intish(series):
+        s = pd.to_numeric(series, errors="coerce")
+        return s.map(lambda v: "" if pd.isna(v) else (str(int(v)) if float(v).is_integer() else f"{float(v):.1f}"))
+
+    away_team = b.get("away_team", b.get("away_short_display_name", pd.Series("", index=b.index))).astype(str)
+    home_team = b.get("home_team", b.get("home_short_display_name", pd.Series("", index=b.index))).astype(str)
+    matchup = away_team.str.strip() + " @ " + home_team.str.strip()
+
+    out = pd.DataFrame(index=b.index)
+    out["Matchup"] = matchup
+
+    if "game_dt_et" in b.columns:
+        dt = pd.to_datetime(b.get("game_dt_et"), errors="coerce")
+        out["Tip (ET)"] = dt.map(lambda v: "" if pd.isna(v) else pd.Timestamp(v).strftime("%m/%d %I:%M %p"))
+
+    if "winner_pick" in b.columns:
+        out["Winner Pick"] = b["winner_pick"].astype(str)
+
+    if "pick_conf" in b.columns or "confidence" in b.columns:
+        out["Confidence"] = _fmt_num(b.get("pick_conf", b.get("confidence")), digits=1, pct=True)
+
+    if "pred_margin_home" in b.columns:
+        pm = pd.to_numeric(b["pred_margin_home"], errors="coerce")
+        out["Pred Margin"] = pm.map(lambda v: "" if pd.isna(v) else f"{float(v):+.1f}")
+
+    if "model_line_text" in b.columns:
+        out["Model Line"] = b["model_line_text"].astype(str)
+
+    if "rw_spread_home" in b.columns:
+        rw = pd.to_numeric(b["rw_spread_home"], errors="coerce")
+        out["RW Spread"] = rw.map(lambda v: "" if pd.isna(v) else f"{float(v):+.1f}")
+
+    if "rw_total" in b.columns:
+        out["RW Total"] = _fmt_num(b["rw_total"], digits=1, pct=False)
+
+    if "final_score" in b.columns:
+        out["Final"] = b["final_score"].astype(str).replace("nan", "")
+
+    if "status_type_short_detail" in b.columns:
+        out["Status"] = b["status_type_short_detail"].astype(str).replace("nan", "")
+    elif "status_type_state" in b.columns:
+        out["Status"] = b["status_type_state"].astype(str).replace("nan", "")
+
+    if "home_injury_impact" in b.columns and "away_injury_impact" in b.columns and bool(getattr(globals().get("show_inj"), "value", True)):
+        home_inj = pd.to_numeric(b["home_injury_impact"], errors="coerce").fillna(0.0)
+        away_inj = pd.to_numeric(b["away_injury_impact"], errors="coerce").fillna(0.0)
+        out["Inj Impact"] = away_inj.map(lambda v: f"A:{v:.1f}") + " | " + home_inj.map(lambda v: f"H:{v:.1f}")
+
+    if "rw_missing_reason" in b.columns and bool(getattr(globals().get("show_rw_missing"), "value", False)):
+        out["RW Note"] = b["rw_missing_reason"].astype(str).replace("nan", "")
+
+    preferred = [
+        "Matchup", "Tip (ET)", "Winner Pick", "Confidence", "Pred Margin",
+        "Model Line", "RW Spread", "RW Total", "Final", "Status", "Inj Impact", "RW Note"
+    ]
+    out = out[[c for c in preferred if c in out.columns]].head(int(max_rows)).reset_index(drop=True)
+    return df_to_html_table(out, max_rows=int(max_rows))
 
 
 def _normalize_bool_mask(mask, label: str = "", context: str = "") -> pd.Series:
@@ -6983,6 +7331,1488 @@ def _models_ready() -> bool:
     ])
 
 
+def _season_viz_cache_key() -> tuple:
+    return (int(CURRENT_SEASON), _dashboard_runtime_signature())
+
+
+def _overview_viz_cache_key() -> tuple:
+    return (int(CURRENT_SEASON), _dashboard_runtime_signature())
+
+
+def _season_viz_metric_specs() -> dict:
+    return {
+        "win_pct": {"label": "Win %", "column": "win_pct", "ascending": False, "kind": "pct"},
+        "points_for": {"label": "Points For", "column": "points_for", "ascending": False, "kind": "value"},
+        "points_against": {"label": "Points Against", "column": "points_against", "ascending": True, "kind": "value"},
+        "point_diff": {"label": "Point Diff", "column": "point_diff", "ascending": False, "kind": "value"},
+        "assists": {"label": "Assists", "column": "assists", "ascending": False, "kind": "value"},
+        "rebounds": {"label": "Rebounds", "column": "rebounds", "ascending": False, "kind": "value"},
+        "fg_pct": {"label": "FG%", "column": "fg_pct", "ascending": False, "kind": "pct"},
+        "three_pct": {"label": "3PT%", "column": "three_pct", "ascending": False, "kind": "pct"},
+        "ft_pct": {"label": "FT%", "column": "ft_pct", "ascending": False, "kind": "pct"},
+        "turnovers": {"label": "Turnovers", "column": "turnovers", "ascending": True, "kind": "value"},
+    }
+
+
+def _safe_hex_color(value, default="#ff4d6d") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    if not raw.startswith("#"):
+        raw = f"#{raw}"
+    if len(raw) == 4:
+        raw = "#" + "".join(ch * 2 for ch in raw[1:])
+    if len(raw) != 7:
+        return default
+    try:
+        int(raw[1:], 16)
+    except Exception:
+        return default
+    return raw.upper()
+
+
+def _hex_to_rgba(value, alpha=1.0) -> str:
+    color = _safe_hex_color(value)
+    return f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, {float(alpha):.3f})"
+
+
+def _build_home_away_record_table(team_box_df: pd.DataFrame, season: int) -> pd.DataFrame:
+    if team_box_df is None or len(team_box_df) == 0:
+        return pd.DataFrame(columns=["team_id", "home_wins", "home_losses", "away_wins", "away_losses", "home_record", "away_record"])
+
+    games = team_box_df.copy()
+    if "season" in games.columns:
+        games = games[pd.to_numeric(games["season"], errors="coerce") == int(season)].copy()
+    if len(games) == 0 or "team_id" not in games.columns or "team_home_away" not in games.columns:
+        return pd.DataFrame(columns=["team_id", "home_wins", "home_losses", "away_wins", "away_losses", "home_record", "away_record"])
+
+    games["team_id"] = pd.to_numeric(games.get("team_id"), errors="coerce")
+    games = games[games["team_id"].notna()].copy()
+    if len(games) == 0:
+        return pd.DataFrame(columns=["team_id", "home_wins", "home_losses", "away_wins", "away_losses", "home_record", "away_record"])
+    games["team_id"] = games["team_id"].astype(int)
+    games["team_home_away"] = games["team_home_away"].fillna("").astype(str).str.strip().str.lower()
+
+    if "team_winner" in games.columns:
+        win_mask = games["team_winner"].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
+    else:
+        team_score = pd.to_numeric(games.get("team_score"), errors="coerce")
+        opp_score = pd.to_numeric(games.get("opponent_team_score"), errors="coerce")
+        win_mask = team_score.gt(opp_score).fillna(False)
+    games["win"] = win_mask.astype(int)
+
+    home = games[games["team_home_away"] == "home"].copy()
+    away = games[games["team_home_away"] == "away"].copy()
+
+    home_summary = home.groupby("team_id", dropna=False).agg(home_games=("game_id", "nunique"), home_wins=("win", "sum")).reset_index() if len(home) else pd.DataFrame(columns=["team_id", "home_games", "home_wins"])
+    away_summary = away.groupby("team_id", dropna=False).agg(away_games=("game_id", "nunique"), away_wins=("win", "sum")).reset_index() if len(away) else pd.DataFrame(columns=["team_id", "away_games", "away_wins"])
+
+    out = pd.DataFrame({"team_id": sorted(games["team_id"].dropna().astype(int).unique().tolist())})
+    out = out.merge(home_summary, on="team_id", how="left").merge(away_summary, on="team_id", how="left")
+    for col in ["home_games", "home_wins", "away_games", "away_wins"]:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    out["home_losses"] = out["home_games"] - out["home_wins"]
+    out["away_losses"] = out["away_games"] - out["away_wins"]
+    out["home_record"] = out["home_wins"].astype(str) + "-" + out["home_losses"].astype(str)
+    out["away_record"] = out["away_wins"].astype(str) + "-" + out["away_losses"].astype(str)
+    return out[["team_id", "home_wins", "home_losses", "away_wins", "away_losses", "home_record", "away_record"]]
+
+
+def _home_away_records_parquet_path(season: int) -> str:
+    return os.path.join(HOME_AWAY_RECORDS_DIR, f"mbb_home_away_records_{int(season)}.parquet")
+
+
+def _load_or_build_home_away_records(team_box_df: pd.DataFrame, season: int, force: bool = False) -> pd.DataFrame:
+    path = _home_away_records_parquet_path(season)
+    if not force and os.path.exists(path):
+        cached = _load_optional_parquet(path)
+        if cached is not None and len(cached) > 0:
+            return cached
+    out = _build_home_away_record_table(team_box_df, season)
+    try:
+        if out is not None and len(out) > 0:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            out.to_parquet(path, index=False)
+    except Exception:
+        pass
+    return out
+
+
+def _ranking_grade(rank, total_teams: int) -> str:
+    rank_num = pd.to_numeric(pd.Series([rank]), errors="coerce").iloc[0]
+    total_num = pd.to_numeric(pd.Series([total_teams]), errors="coerce").iloc[0]
+    if pd.isna(rank_num) or pd.isna(total_num) or float(total_num) <= 0:
+        return "--"
+    pct = 1.0 - ((float(rank_num) - 1.0) / max(float(total_num) - 1.0, 1.0))
+    if pct >= 0.97:
+        return "A+"
+    if pct >= 0.90:
+        return "A"
+    if pct >= 0.82:
+        return "A-"
+    if pct >= 0.72:
+        return "B+"
+    if pct >= 0.62:
+        return "B"
+    if pct >= 0.52:
+        return "B-"
+    if pct >= 0.40:
+        return "C+"
+    if pct >= 0.30:
+        return "C"
+    if pct >= 0.20:
+        return "C-"
+    return "D"
+
+
+def _build_team_rankings_table(summary_df: pd.DataFrame, season: int) -> pd.DataFrame:
+    if summary_df is None or len(summary_df) == 0 or "team_id" not in summary_df.columns:
+        return pd.DataFrame(columns=[
+            "team_id", "season", "teams_tracked", "overall_rank", "overall_grade",
+            "offense_rank", "offense_grade", "defense_rank", "defense_grade",
+            "rebounds_rank", "rebounds_grade", "assists_rank", "assists_grade",
+            "turnovers_rank", "turnovers_grade",
+        ])
+
+    s = summary_df.copy()
+    s["team_id"] = pd.to_numeric(s.get("team_id"), errors="coerce")
+    s = s[s["team_id"].notna()].copy()
+    if len(s) == 0:
+        return pd.DataFrame(columns=[
+            "team_id", "season", "teams_tracked", "overall_rank", "overall_grade",
+            "offense_rank", "offense_grade", "defense_rank", "defense_grade",
+            "rebounds_rank", "rebounds_grade", "assists_rank", "assists_grade",
+            "turnovers_rank", "turnovers_grade",
+        ])
+    s["team_id"] = s["team_id"].astype(int)
+
+    total_teams = int(s["team_id"].nunique())
+    s["overall_score_model"] = (
+        pd.to_numeric(s.get("win_pct"), errors="coerce").fillna(0) * 0.60 +
+        pd.to_numeric(s.get("point_diff"), errors="coerce").fillna(0).rank(pct=True, method="average") * 0.25 +
+        pd.to_numeric(s.get("points_for"), errors="coerce").fillna(0).rank(pct=True, method="average") * 0.10 +
+        (1.0 - pd.to_numeric(s.get("points_against"), errors="coerce").fillna(0).rank(pct=True, method="average")) * 0.05
+    )
+
+    s["overall_rank"] = s["overall_score_model"].rank(ascending=False, method="min")
+    s["offense_rank"] = pd.to_numeric(s.get("points_for"), errors="coerce").rank(ascending=False, method="min")
+    s["defense_rank"] = pd.to_numeric(s.get("points_against"), errors="coerce").rank(ascending=True, method="min")
+    s["rebounds_rank"] = pd.to_numeric(s.get("rebounds"), errors="coerce").rank(ascending=False, method="min")
+    s["assists_rank"] = pd.to_numeric(s.get("assists"), errors="coerce").rank(ascending=False, method="min")
+    s["turnovers_rank"] = pd.to_numeric(s.get("turnovers"), errors="coerce").rank(ascending=True, method="min")
+
+    for col in ["overall_rank", "offense_rank", "defense_rank", "rebounds_rank", "assists_rank", "turnovers_rank"]:
+        s[col] = pd.to_numeric(s[col], errors="coerce").astype("Int64")
+
+    out = s[["team_id", "overall_rank", "offense_rank", "defense_rank", "rebounds_rank", "assists_rank", "turnovers_rank"]].copy()
+    out["season"] = int(season)
+    out["teams_tracked"] = total_teams
+    out["overall_grade"] = out["overall_rank"].apply(lambda x: _ranking_grade(x, total_teams))
+    out["offense_grade"] = out["offense_rank"].apply(lambda x: _ranking_grade(x, total_teams))
+    out["defense_grade"] = out["defense_rank"].apply(lambda x: _ranking_grade(x, total_teams))
+    out["rebounds_grade"] = out["rebounds_rank"].apply(lambda x: _ranking_grade(x, total_teams))
+    out["assists_grade"] = out["assists_rank"].apply(lambda x: _ranking_grade(x, total_teams))
+    out["turnovers_grade"] = out["turnovers_rank"].apply(lambda x: _ranking_grade(x, total_teams))
+    return out[[
+        "team_id", "season", "teams_tracked", "overall_rank", "overall_grade",
+        "offense_rank", "offense_grade", "defense_rank", "defense_grade",
+        "rebounds_rank", "rebounds_grade", "assists_rank", "assists_grade",
+        "turnovers_rank", "turnovers_grade",
+    ]]
+
+
+def _team_rankings_parquet_path(season: int) -> str:
+    return os.path.join(TEAM_RANKINGS_DIR, f"mbb_team_rankings_{int(season)}.parquet")
+
+
+def _load_official_poll_rankings(season: int) -> pd.DataFrame:
+    rankings = _load_optional_parquet(OFFICIAL_RANKINGS_PATH)
+    if rankings is None or len(rankings) == 0:
+        return pd.DataFrame(columns=["team_id", "poll_rank", "ranking_source"])
+    rankings = rankings.copy()
+    rankings["team_id"] = pd.to_numeric(rankings.get("team_id"), errors="coerce")
+    rankings["poll_rank"] = pd.to_numeric(rankings.get("current"), errors="coerce")
+    if "season_year" in rankings.columns:
+        rankings = rankings[pd.to_numeric(rankings["season_year"], errors="coerce").eq(int(season))]
+    rankings = rankings[rankings["team_id"].notna() & rankings["poll_rank"].between(1, 25)].copy()
+    if len(rankings) == 0:
+        return pd.DataFrame(columns=["team_id", "poll_rank", "ranking_source"])
+    rankings["poll_priority"] = rankings.get("type", "").astype(str).str.lower().eq("ap").astype(int)
+    rankings = rankings.sort_values(["team_id", "poll_priority"], ascending=[True, False]).drop_duplicates("team_id", keep="first")
+    rankings["team_id"] = rankings["team_id"].astype(int)
+    rankings["ranking_source"] = "official API"
+    return rankings[["team_id", "poll_rank", "ranking_source"]]
+
+
+def _load_or_build_team_rankings(summary_df: pd.DataFrame, season: int, force: bool = False) -> pd.DataFrame:
+    path = _team_rankings_parquet_path(season)
+    if not force and os.path.exists(path):
+        cached = _load_optional_parquet(path)
+        if cached is not None and len(cached) > 0:
+            return cached
+    out = _build_team_rankings_table(summary_df, season)
+    try:
+        if out is not None and len(out) > 0:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            out.to_parquet(path, index=False)
+    except Exception:
+        pass
+    return out
+
+
+def _load_optional_parquet(path_str: str) -> pd.DataFrame:
+    try:
+        if path_str and os.path.exists(path_str):
+            return pd.read_parquet(path_str)
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _season_viz_team_conference_lookup(schedule_df: pd.DataFrame) -> pd.DataFrame:
+    if schedule_df is None or len(schedule_df) == 0:
+        return pd.DataFrame(columns=["team_id", "team_name", "conference_id", "conference_name", "conference_short", "conference_display"])
+
+    rows = []
+    conf_name = schedule_df.get("groups_name", pd.Series(index=schedule_df.index, dtype=object))
+    conf_short = schedule_df.get("groups_short_name", pd.Series(index=schedule_df.index, dtype=object))
+    for side in ["home", "away"]:
+        team_id_col = f"{side}_id"
+        conf_id_col = f"{side}_conference_id"
+        if team_id_col not in schedule_df.columns:
+            continue
+        team_names = _safe_team_text_col(
+            schedule_df,
+            [f"{side}_short_display_name", f"{side}_display_name", f"{side}_team", f"{side}_name"],
+            default="Unknown",
+        )
+        x = pd.DataFrame({
+            "team_id": pd.to_numeric(schedule_df.get(team_id_col), errors="coerce"),
+            "team_name": team_names,
+            "conference_id": pd.to_numeric(schedule_df.get(conf_id_col), errors="coerce"),
+            "conference_name": conf_name.astype(str).replace({"nan": ""}),
+            "conference_short": conf_short.astype(str).replace({"nan": ""}),
+        })
+        rows.append(x)
+
+    if not rows:
+        return pd.DataFrame(columns=["team_id", "team_name", "conference_id", "conference_name", "conference_short", "conference_display"])
+
+    lookup = pd.concat(rows, ignore_index=True)
+    lookup = lookup[lookup["team_id"].notna()].copy()
+    if len(lookup) == 0:
+        return pd.DataFrame(columns=["team_id", "team_name", "conference_id", "conference_name", "conference_short", "conference_display"])
+
+    lookup["team_id"] = lookup["team_id"].astype(int)
+    lookup["conference_display"] = lookup["conference_short"].where(
+        lookup["conference_short"].astype(str).str.strip().ne(""),
+        lookup["conference_name"],
+    )
+    lookup["conference_display"] = lookup["conference_display"].fillna("").astype(str).str.strip()
+    lookup.loc[lookup["conference_display"].eq(""), "conference_display"] = "Independent / Unknown"
+    lookup["team_name"] = lookup["team_name"].fillna("Unknown").astype(str)
+
+    grouped = (
+        lookup.groupby(
+            ["team_id", "team_name", "conference_id", "conference_name", "conference_short", "conference_display"],
+            dropna=False,
+        )
+        .size()
+        .reset_index(name="games")
+        .sort_values(["team_id", "games"], ascending=[True, False])
+    )
+    grouped = grouped.drop_duplicates(subset=["team_id"], keep="first").reset_index(drop=True)
+    return grouped[["team_id", "team_name", "conference_id", "conference_name", "conference_short", "conference_display"]]
+
+
+def _season_viz_prepare_games(team_box_df: pd.DataFrame, season: int) -> pd.DataFrame:
+    if team_box_df is None or len(team_box_df) == 0:
+        return pd.DataFrame()
+
+    games = team_box_df.copy()
+    if "season" in games.columns:
+        games = games[pd.to_numeric(games["season"], errors="coerce") == int(season)].copy()
+    if len(games) == 0:
+        return pd.DataFrame()
+
+    games["game_dt_et"] = pd.to_datetime(games.get("game_date_time"), errors="coerce")
+    if "team_id" in games.columns:
+        games["team_id"] = pd.to_numeric(games["team_id"], errors="coerce")
+    games = games[games["team_id"].notna()].copy()
+    if len(games) == 0:
+        return pd.DataFrame()
+    games["team_id"] = games["team_id"].astype(int)
+
+    numeric_cols = [
+        "team_score", "opponent_team_score", "assists", "blocks", "steals",
+        "field_goal_pct", "three_point_field_goal_pct", "free_throw_pct",
+        "total_rebounds", "turnovers",
+    ]
+    for col in numeric_cols:
+        if col in games.columns:
+            games[col] = pd.to_numeric(games[col], errors="coerce")
+
+    games["team_display"] = _safe_team_text_col(
+        games,
+        ["team_display_name", "team_short_display_name", "team_name"],
+        default="Unknown",
+    )
+    games["point_diff"] = pd.to_numeric(games.get("team_score"), errors="coerce") - pd.to_numeric(games.get("opponent_team_score"), errors="coerce")
+    games["win"] = (games["point_diff"] > 0).astype(int)
+    games = games.sort_values(["team_id", "game_dt_et", "game_id"], kind="stable").reset_index(drop=True)
+    games["game_no"] = games.groupby("team_id").cumcount() + 1
+    games["wins_to_date"] = games.groupby("team_id")["win"].cumsum()
+    games["losses_to_date"] = games["game_no"] - games["wins_to_date"]
+    games["rolling_point_diff"] = games.groupby("team_id")["point_diff"].transform(lambda s: s.rolling(5, min_periods=1).mean())
+    games["rolling_points_for"] = games.groupby("team_id")["team_score"].transform(lambda s: s.rolling(5, min_periods=1).mean())
+    games["rolling_points_against"] = games.groupby("team_id")["opponent_team_score"].transform(lambda s: s.rolling(5, min_periods=1).mean())
+    return games
+
+
+def _build_season_viz_payload(force: bool = False) -> dict:
+    key = _season_viz_cache_key()
+    if not force and key in SEASON_VIZ_CACHE:
+        return SEASON_VIZ_CACHE[key]
+
+    team_box_path = os.path.join(TEAM_BOX_DIR, f"mbb_team_box_{CURRENT_SEASON}.parquet")
+    teams_path = os.path.join(RAW_DIR, "teams", "mbb_teams.parquet")
+    standings_path = os.path.join(RAW_DIR, "standings", "mbb_standings.parquet")
+
+    team_box_df = _load_optional_parquet(team_box_path)
+    teams_df = _load_optional_parquet(teams_path)
+    standings_df = _load_optional_parquet(standings_path)
+    schedule_df = globals().get("schedule_cur", pd.DataFrame())
+    if (schedule_df is None or len(schedule_df) == 0) and os.path.exists(os.path.join(SCHEDULE_DIR, f"mbb_schedule_{CURRENT_SEASON}.parquet")):
+        schedule_df = _load_optional_parquet(os.path.join(SCHEDULE_DIR, f"mbb_schedule_{CURRENT_SEASON}.parquet"))
+
+    games = _season_viz_prepare_games(team_box_df, CURRENT_SEASON)
+    conf_lookup = _season_viz_team_conference_lookup(schedule_df)
+
+    if len(games) == 0:
+        payload = {
+            "season": int(CURRENT_SEASON),
+            "summary": pd.DataFrame(),
+            "games": pd.DataFrame(),
+            "team_options": [("All Teams", "__all__")],
+            "conference_options": [("All Conferences", "__all__")],
+        }
+        SEASON_VIZ_CACHE[key] = payload
+        return payload
+
+    summary = (
+        games.groupby(["team_id", "team_display"], dropna=False)
+        .agg(
+            games=("game_id", "nunique"),
+            wins=("win", "sum"),
+            points_for=("team_score", "mean"),
+            points_against=("opponent_team_score", "mean"),
+            point_diff=("point_diff", "mean"),
+            assists=("assists", "mean"),
+            rebounds=("total_rebounds", "mean"),
+            steals=("steals", "mean"),
+            blocks=("blocks", "mean"),
+            turnovers=("turnovers", "mean"),
+            fg_pct=("field_goal_pct", "mean"),
+            three_pct=("three_point_field_goal_pct", "mean"),
+            ft_pct=("free_throw_pct", "mean"),
+        )
+        .reset_index()
+    )
+    summary["losses"] = summary["games"] - summary["wins"]
+    summary["win_pct"] = np.where(summary["games"] > 0, summary["wins"] / summary["games"], np.nan)
+
+    if len(standings_df) > 0:
+        stand = standings_df.copy()
+        if "team_id" in stand.columns:
+            stand["team_id"] = pd.to_numeric(stand["team_id"], errors="coerce")
+            stand = stand[stand["team_id"].notna()].copy()
+            stand["team_id"] = stand["team_id"].astype(int)
+        keep_cols = [c for c in ["team_id", "streak", "wins", "losses", "winpercent", "avgpointsfor", "avgpointsagainst", "pointdifferential", "home_wins", "home_losses", "road_wins", "road_losses", "home", "road"] if c in stand.columns]
+        if keep_cols:
+            stand = stand[keep_cols].drop_duplicates(subset=["team_id"], keep="last")
+            summary = summary.merge(stand, on="team_id", how="left", suffixes=("", "_stand"))
+            if "winpercent" in summary.columns:
+                summary["win_pct"] = pd.to_numeric(summary["winpercent"], errors="coerce").fillna(summary["win_pct"])
+            if "avgpointsfor" in summary.columns:
+                summary["points_for"] = pd.to_numeric(summary["avgpointsfor"], errors="coerce").fillna(summary["points_for"])
+            if "avgpointsagainst" in summary.columns:
+                summary["points_against"] = pd.to_numeric(summary["avgpointsagainst"], errors="coerce").fillna(summary["points_against"])
+            if "pointdifferential" in summary.columns:
+                summary["point_diff"] = pd.to_numeric(summary["pointdifferential"], errors="coerce").fillna(summary["point_diff"])
+            if "wins_stand" in summary.columns:
+                summary["wins"] = pd.to_numeric(summary["wins_stand"], errors="coerce").fillna(summary["wins"])
+            if "losses_stand" in summary.columns:
+                summary["losses"] = pd.to_numeric(summary["losses_stand"], errors="coerce").fillna(summary["losses"])
+
+    home_away_records = _load_or_build_home_away_records(team_box_df, CURRENT_SEASON, force=force)
+    if len(home_away_records) > 0:
+        home_away_records = home_away_records.copy()
+        home_away_records["team_id"] = pd.to_numeric(home_away_records.get("team_id"), errors="coerce")
+        home_away_records = home_away_records[home_away_records["team_id"].notna()].copy()
+        home_away_records["team_id"] = home_away_records["team_id"].astype(int)
+        summary = summary.merge(home_away_records, on="team_id", how="left")
+
+    team_rankings = _load_or_build_team_rankings(summary, CURRENT_SEASON, force=force)
+    official_rankings = _load_official_poll_rankings(CURRENT_SEASON)
+    if len(official_rankings) > 0:
+        summary = summary.merge(official_rankings, on="team_id", how="left")
+    else:
+        summary["poll_rank"] = pd.to_numeric(summary.get("overall_rank"), errors="coerce")
+        summary["ranking_source"] = "derived-rankings"
+    if len(team_rankings) > 0:
+        team_rankings = team_rankings.copy()
+        team_rankings["team_id"] = pd.to_numeric(team_rankings.get("team_id"), errors="coerce")
+        team_rankings = team_rankings[team_rankings["team_id"].notna()].copy()
+        team_rankings["team_id"] = team_rankings["team_id"].astype(int)
+        summary = summary.merge(team_rankings, on="team_id", how="left")
+
+    if len(teams_df) > 0 and "team_id" in teams_df.columns:
+        teams = teams_df.copy()
+        teams["team_id"] = pd.to_numeric(teams["team_id"], errors="coerce")
+        teams = teams[teams["team_id"].notna()].copy()
+        teams["team_id"] = teams["team_id"].astype(int)
+        keep_cols = [c for c in ["team_id", "display_name", "short_name", "team", "color", "alternate_color", "logo", "logo_dark"] if c in teams.columns]
+        teams = teams[keep_cols].drop_duplicates(subset=["team_id"], keep="last")
+        summary = summary.merge(teams, on="team_id", how="left")
+
+    if len(conf_lookup) > 0:
+        summary = summary.merge(conf_lookup, on="team_id", how="left")
+
+    for col in ["display_name", "short_name", "team", "conference_display", "color", "alternate_color", "logo", "logo_dark"]:
+        if col not in summary.columns:
+            summary[col] = ""
+
+    team_name = summary["team_display"].astype(str)
+    team_name = summary["team"].replace("", np.nan).fillna(team_name)
+    team_name = summary["short_name"].replace("", np.nan).fillna(team_name)
+    team_name = summary["display_name"].replace("", np.nan).fillna(team_name)
+    summary["team_name"] = team_name.astype(str)
+    summary["conference_display"] = summary["conference_display"].replace("", np.nan).fillna("Independent / Unknown")
+    summary["team_color"] = summary["color"].apply(_safe_hex_color)
+    summary["team_alt_color"] = summary["alternate_color"].apply(lambda x: _safe_hex_color(x, "#f6c344"))
+    summary["logo"] = summary["logo"].replace({np.nan: ""})
+    summary = summary.sort_values(["win_pct", "point_diff", "team_name"], ascending=[False, False, True]).reset_index(drop=True)
+
+    merge_cols = [c for c in ["team_id", "team_name", "conference_display", "team_color", "team_alt_color", "logo"] if c in summary.columns]
+    games = games.merge(
+        summary[merge_cols],
+        on="team_id",
+        how="left",
+    )
+
+    team_options = [("All Teams", "__all__")] + [
+        (str(name), int(team_id))
+        for team_id, name in summary[["team_id", "team_name"]].drop_duplicates().sort_values("team_name").itertuples(index=False)
+    ]
+    conference_options = [("All Conferences", "__all__")] + [
+        (str(name), str(name))
+        for name in sorted(summary["conference_display"].dropna().astype(str).unique().tolist())
+    ]
+
+    payload = {
+        "season": int(CURRENT_SEASON),
+        "summary": summary,
+        "games": games,
+        "team_options": team_options,
+        "conference_options": conference_options,
+    }
+    SEASON_VIZ_CACHE[key] = payload
+    return payload
+
+
+def _refresh_season_viz_options(force: bool = False):
+    payload = _build_overview_viz_payload(force=force)
+    summary = payload.get("summary", pd.DataFrame())
+    selected_conf = getattr(season_viz_conf, "value", "__all__")
+    selected_team = getattr(season_viz_team, "value", "__all__")
+    selected_opp = getattr(season_viz_opponent, "value", "__avg__")
+
+    season_viz_conf.options = payload.get("conference_options", [("All Conferences", "__all__")])
+    conf_values = [v for _, v in season_viz_conf.options]
+    if selected_conf not in conf_values:
+        selected_conf = "__all__"
+    season_viz_conf.value = selected_conf
+
+    filtered_summary = summary.copy()
+    if selected_conf != "__all__" and "conference_display" in filtered_summary.columns:
+        filtered_summary = filtered_summary[filtered_summary["conference_display"] == selected_conf].copy()
+
+    team_options = [("All Teams", "__all__")]
+    if len(filtered_summary) > 0:
+        team_options.extend(
+            [(str(name), int(team_id)) for team_id, name in filtered_summary[["team_id", "team_name"]].drop_duplicates().sort_values("team_name").itertuples(index=False)]
+        )
+    season_viz_team.options = team_options
+    team_values = [v for _, v in season_viz_team.options]
+    if selected_team not in team_values:
+        selected_team = "__all__"
+    season_viz_team.value = selected_team
+
+    opponent_options = [("National Avg", "__avg__")]
+    for label, value in team_options:
+        if value != "__all__" and value != selected_team:
+            opponent_options.append((label, value))
+    season_viz_opponent.options = opponent_options
+    opp_values = [v for _, v in season_viz_opponent.options]
+    if selected_opp not in opp_values:
+        selected_opp = "__avg__"
+    season_viz_opponent.value = selected_opp
+
+
+def _build_overview_viz_payload(force: bool = False) -> dict:
+    key = _overview_viz_cache_key()
+    if not force and key in OVERVIEW_VIZ_CACHE:
+        return OVERVIEW_VIZ_CACHE[key]
+
+    payload = _build_season_viz_payload(force=force)
+    summary = payload.get("summary", pd.DataFrame()).copy()
+    games = payload.get("games", pd.DataFrame()).copy()
+
+    if len(summary) == 0:
+        empty_payload = {
+            "season": int(CURRENT_SEASON),
+            "summary": pd.DataFrame(),
+            "games": pd.DataFrame(),
+            "conference_summary": pd.DataFrame(),
+            "team_options": [("All Teams", "__all__")],
+            "conference_options": [("All Conferences", "__all__")],
+        }
+        OVERVIEW_VIZ_CACHE[key] = empty_payload
+        return empty_payload
+
+    conf_summary = (
+        summary.groupby("conference_display", dropna=False)
+        .agg(
+            teams=("team_id", "nunique"),
+            wins=("wins", "sum"),
+            losses=("losses", "sum"),
+            avg_win_pct=("win_pct", "mean"),
+            avg_points_for=("points_for", "mean"),
+            avg_points_against=("points_against", "mean"),
+            avg_point_diff=("point_diff", "mean"),
+            avg_fg_pct=("fg_pct", "mean"),
+            avg_three_pct=("three_pct", "mean"),
+            avg_ft_pct=("ft_pct", "mean"),
+            avg_rebounds=("rebounds", "mean"),
+            avg_assists=("assists", "mean"),
+            avg_steals=("steals", "mean"),
+            avg_turnovers=("turnovers", "mean"),
+        )
+        .reset_index()
+    )
+    conf_summary["conference_rank"] = conf_summary["avg_win_pct"].rank(ascending=False, method="dense")
+    conf_summary = conf_summary.sort_values(["avg_win_pct", "avg_point_diff"], ascending=[False, False]).reset_index(drop=True)
+
+    out = {
+        "season": int(CURRENT_SEASON),
+        "summary": summary,
+        "games": games,
+        "conference_summary": conf_summary,
+        "team_options": payload.get("team_options", [("All Teams", "__all__")]),
+        "conference_options": payload.get("conference_options", [("All Conferences", "__all__")]),
+    }
+    OVERVIEW_VIZ_CACHE[key] = out
+    return out
+
+
+def _refresh_overview_options(force: bool = False):
+    payload = _build_overview_viz_payload(force=force)
+    summary = payload.get("summary", pd.DataFrame())
+    selected_conf = getattr(overview_conf, "value", "__all__")
+    selected_team = getattr(overview_team, "value", "__all__")
+    selected_team_b = getattr(overview_team_b, "value", "__all__")
+
+    overview_conf.options = payload.get("conference_options", [("All Conferences", "__all__")])
+    conf_values = [v for _, v in overview_conf.options]
+    if selected_conf not in conf_values:
+        selected_conf = "__all__"
+    overview_conf.value = selected_conf
+
+    filtered_summary = summary.copy()
+    if selected_conf != "__all__":
+        filtered_summary = filtered_summary[filtered_summary["conference_display"] == selected_conf].copy()
+
+    team_options = [("All Teams", "__all__")]
+    if len(filtered_summary) > 0:
+        team_options.extend(
+            [(str(name), int(team_id)) for team_id, name in filtered_summary[["team_id", "team_name"]].drop_duplicates().sort_values("team_name").itertuples(index=False)]
+        )
+
+    overview_team.options = team_options
+    overview_team_b.options = team_options
+    valid_team_values = [v for _, v in team_options]
+    if selected_team not in valid_team_values:
+        selected_team = "__all__"
+    if selected_team_b not in valid_team_values:
+        selected_team_b = "__all__"
+    overview_team.value = selected_team
+    overview_team_b.value = selected_team_b
+
+    mode = getattr(overview_mode, "value", "conference")
+    overview_team_b.disabled = False
+
+
+def _overview_metric_specs() -> list:
+    return [
+        ("win_pct", "Win %", "pct", False),
+        ("points_for", "PPG", "value", False),
+        ("points_against", "PAPG", "value", True),
+        ("point_diff", "Point Diff", "value", False),
+        ("fg_pct", "FG%", "pct", False),
+        ("three_pct", "3PT%", "pct", False),
+        ("ft_pct", "FT%", "pct", False),
+        ("rebounds", "Rebounds", "value", False),
+        ("assists", "Assists", "value", False),
+        ("steals", "Steals", "value", False),
+        ("turnovers", "Turnovers", "value", True),
+    ]
+
+
+def _overview_normalized_profile(pop: pd.DataFrame, row: pd.Series) -> tuple:
+    theta = []
+    values = []
+    raw_labels = []
+    for col, label, kind, invert in _overview_metric_specs():
+        if col not in pop.columns or pd.isna(row.get(col)):
+            continue
+        series = pd.to_numeric(pop[col], errors="coerce").dropna()
+        if len(series) < 2:
+            continue
+        lo = float(series.min())
+        hi = float(series.max())
+        if hi <= lo:
+            norm = 50.0
+        else:
+            norm = 100.0 * ((float(row.get(col)) - lo) / (hi - lo))
+            if invert:
+                norm = 100.0 - norm
+        theta.append(label)
+        values.append(float(np.clip(norm, 0.0, 100.0)))
+        raw_labels.append((label, _season_viz_format(row.get(col), kind)))
+    if theta:
+        theta.append(theta[0])
+        values.append(values[0])
+    return theta, values, raw_labels
+
+
+def _overview_team_table_html(df: pd.DataFrame, accent: str) -> str:
+    import html
+
+    if df is None or len(df) == 0:
+        return "<div style='color:#CBD5E1;'>No teams available for this filter.</div>"
+    rows = []
+    for _, row in df.head(8).iterrows():
+        rows.append(
+            "<tr>"
+            f"<td style='padding:10px 0;color:#F8FAFC;font-weight:700;font-size:12px;'>{html.escape(str(row.get('team_name', 'Team')))}</td>"
+            f"<td style='padding:10px 0;color:#CBD5E1;text-align:right;font-size:12px;'>{int(row.get('wins', 0))}-{int(row.get('losses', 0))}</td>"
+            f"<td style='padding:10px 0;color:{accent};text-align:right;font-weight:800;font-size:12px;'>{_season_viz_format(row.get('win_pct'), 'pct')}</td>"
+            "</tr>"
+        )
+    return (
+        "<table style='width:100%;border-collapse:collapse;'>"
+        "<thead><tr>"
+        "<th style='text-align:left;color:#94A3B8;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;padding-bottom:10px;'>Team</th>"
+        "<th style='text-align:right;color:#94A3B8;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;padding-bottom:10px;'>Record</th>"
+        "<th style='text-align:right;color:#94A3B8;font-size:9px;letter-spacing:0.14em;text-transform:uppercase;padding-bottom:10px;'>Win %</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows) +
+        "</tbody></table>"
+    )
+
+
+def _render_overview_visualizations(_=None, force: bool = False):
+    import html
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    with overview_out:
+        clear_output(wait=True)
+
+        payload = _build_overview_viz_payload(force=force)
+        summary = payload.get("summary", pd.DataFrame()).copy()
+        conf_summary = payload.get("conference_summary", pd.DataFrame()).copy()
+
+        if len(summary) == 0 or len(conf_summary) == 0:
+            overview_status_html.value = "<div style='color:#CBD5E1;padding:8px 0;'>No overview data is available yet.</div>"
+            display(HTML("<div style='color:#CBD5E1;padding:12px;'>No season overview data available yet.</div>"))
+            return
+
+        selected_conf = overview_conf.value if overview_conf.value is not None else "__all__"
+        selected_team = overview_team.value if overview_team.value is not None else "__all__"
+        selected_team_b = overview_team_b.value if overview_team_b.value is not None else "__all__"
+        mode = overview_mode.value if overview_mode.value is not None else "conference"
+
+        filtered_summary = summary.copy()
+        if selected_conf != "__all__":
+            filtered_summary = filtered_summary[filtered_summary["conference_display"] == selected_conf].copy()
+
+        if len(filtered_summary) == 0:
+            overview_status_html.value = "<div style='color:#F8D7DA;padding:8px 0;'>No teams match the current overview filter.</div>"
+            display(HTML("<div style='color:#F8D7DA;padding:12px;'>No teams match the current overview filter.</div>"))
+            return
+
+        if selected_conf == "__all__":
+            if selected_team != "__all__":
+                team_row = summary.loc[summary["team_id"].astype(int) == int(selected_team)]
+                focus_conf = str(team_row.iloc[0]["conference_display"]) if len(team_row) else str(conf_summary.iloc[0]["conference_display"])
+            else:
+                focus_conf = str(conf_summary.iloc[0]["conference_display"])
+        else:
+            focus_conf = str(selected_conf)
+
+        focus_conf_row = conf_summary.loc[conf_summary["conference_display"] == focus_conf]
+        if len(focus_conf_row) == 0:
+            focus_conf_row = conf_summary.head(1)
+            focus_conf = str(focus_conf_row.iloc[0]["conference_display"])
+        focus_conf_row = focus_conf_row.iloc[0]
+
+        conf_teams = summary.loc[summary["conference_display"] == focus_conf].copy()
+        conf_teams = conf_teams.sort_values(["win_pct", "point_diff"], ascending=[False, False])
+
+        if selected_team != "__all__" and int(selected_team) in set(filtered_summary["team_id"].astype(int).tolist()):
+            focus_team = filtered_summary.loc[filtered_summary["team_id"].astype(int) == int(selected_team)].iloc[0]
+        else:
+            focus_team = conf_teams.iloc[0] if len(conf_teams) else filtered_summary.iloc[0]
+
+        compare_team = None
+        if mode == "compare" and selected_team_b != "__all__":
+            match = filtered_summary.loc[filtered_summary["team_id"].astype(int) == int(selected_team_b)]
+            if len(match):
+                compare_team = match.iloc[0]
+        if compare_team is not None and int(compare_team["team_id"]) == int(focus_team["team_id"]):
+            compare_team = None
+
+        accent = _safe_hex_color(focus_team.get("team_color"), "#6d5efc")
+        accent_alt = _safe_hex_color(focus_team.get("team_alt_color"), "#4cc9f0")
+        compare_accent = _safe_hex_color(compare_team.get("team_color"), "#ff4d6d") if compare_team is not None else "#ff4d6d"
+
+        hero_html = f"""
+        <div style="position:relative;overflow:hidden;border-radius:30px;padding:28px;
+                    background:
+                        linear-gradient(135deg, rgba(7,10,28,0.98), rgba(17,21,44,0.92)),
+                        radial-gradient(circle at 70% 10%, {_hex_to_rgba(accent, 0.26)}, transparent 28%);
+                    border:1px solid rgba(255,255,255,0.08);color:#F8FAFC;">
+          <div style="position:relative;display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;">
+            <div style="flex:1 1 420px;min-width:320px;">
+              <div style="color:#94A3B8;font-size:12px;letter-spacing:0.18em;text-transform:uppercase;">General Statistics</div>
+              <div style="font-size:44px;font-weight:900;line-height:1;margin-top:10px;">{html.escape(focus_conf)}</div>
+              <div style="margin-top:10px;color:#CBD5E1;font-size:15px;">
+                {int(focus_conf_row.get('teams', 0))} teams • {int(focus_conf_row.get('wins', 0))}-{int(focus_conf_row.get('losses', 0))} combined record
+              </div>
+            </div>
+            <div style="flex:1 1 320px;min-width:260px;display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:12px;">
+              <div style="background:rgba(255,255,255,0.05);border-radius:18px;padding:16px;">
+                <div style="color:#94A3B8;font-size:11px;letter-spacing:0.12em;text-transform:uppercase;">Conference Rank</div>
+                <div style="margin-top:6px;color:{accent};font-size:34px;font-weight:900;">#{int(focus_conf_row.get('conference_rank', 0))}</div>
+              </div>
+              <div style="background:rgba(255,255,255,0.05);border-radius:18px;padding:16px;">
+                <div style="color:#94A3B8;font-size:11px;letter-spacing:0.12em;text-transform:uppercase;">Avg Win %</div>
+                <div style="margin-top:6px;color:{accent};font-size:34px;font-weight:900;">{_season_viz_format(focus_conf_row.get('avg_win_pct'), 'pct')}</div>
+              </div>
+              <div style="background:rgba(255,255,255,0.05);border-radius:18px;padding:16px;">
+                <div style="color:#94A3B8;font-size:11px;letter-spacing:0.12em;text-transform:uppercase;">Points For</div>
+                <div style="margin-top:6px;color:{accent_alt};font-size:34px;font-weight:900;">{_season_viz_format(focus_conf_row.get('avg_points_for'), 'value')}</div>
+              </div>
+              <div style="background:rgba(255,255,255,0.05);border-radius:18px;padding:16px;">
+                <div style="color:#94A3B8;font-size:11px;letter-spacing:0.12em;text-transform:uppercase;">Point Diff</div>
+                <div style="margin-top:6px;color:{accent_alt};font-size:34px;font-weight:900;">{_season_viz_format(focus_conf_row.get('avg_point_diff'), 'value')}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
+        display(HTML(hero_html))
+
+        teams_card = _overview_team_table_html(conf_teams, accent)
+        mode_label = "Conference Overview" if mode == "conference" else ("Team Focus" if mode == "team" else "Team Compare")
+        sidebar_html = f"""
+        <div style="display:grid;grid-template-columns:minmax(300px,0.95fr) minmax(520px,1.6fr);gap:18px;align-items:start;margin-top:18px;">
+          <div style="display:grid;gap:18px;">
+            <div style="background:linear-gradient(180deg, rgba(24,29,58,0.98), rgba(11,16,36,0.94));border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:20px;">
+              <div style="color:#94A3B8;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;">Total Teams / Records</div>
+              <div style="color:#F8FAFC;font-size:28px;font-weight:900;margin:10px 0 16px 0;">{html.escape(focus_conf)}</div>
+              {teams_card}
+            </div>
+            <div style="background:linear-gradient(180deg, rgba(24,29,58,0.98), rgba(11,16,36,0.94));border:1px solid rgba(255,255,255,0.08);border-radius:24px;padding:20px;">
+              <div style="color:#94A3B8;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;">Dynamics</div>
+              <div style="color:#F8FAFC;font-size:24px;font-weight:900;margin-top:8px;">{html.escape(mode_label)}</div>
+              <div style="margin-top:12px;color:#CBD5E1;font-size:14px;">
+                Focus team: <span style="color:{accent};font-weight:700;">{html.escape(str(focus_team.get('team_name', 'Team')))}</span>
+                {f"<br>Compare team: <span style='color:{compare_accent};font-weight:700;'>{html.escape(str(compare_team.get('team_name')))}</span>" if compare_team is not None else ""}
+              </div>
+            </div>
+          </div>
+          <div id="overview-plot-host"></div>
+        </div>
+        """
+        display(HTML(sidebar_html))
+
+        fig = make_subplots(
+            rows=2,
+            cols=2,
+            specs=[[{"type": "bar"}, {"type": "polar", "rowspan": 2}], [{"type": "bar"}, None]],
+            subplot_titles=("Conference Team Records", "Team Profile Radar", "Conference Ranking vs All Conferences", ""),
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10,
+        )
+
+        team_board = conf_teams.head(10).copy().sort_values("win_pct", ascending=True)
+        fig.add_trace(
+            go.Bar(
+                x=team_board["win_pct"],
+                y=team_board["team_name"],
+                orientation="h",
+                marker=dict(color=[accent if int(tid) == int(focus_team["team_id"]) else _hex_to_rgba("#8B5CF6", 0.55) for tid in team_board["team_id"]]),
+                text=[f"{int(w)}-{int(l)}" for w, l in zip(team_board["wins"], team_board["losses"])],
+                textposition="outside",
+                hovertemplate="%{y}<br>Win %: %{x:.1%}<br>Record: %{text}<extra></extra>",
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+
+        rank_board = conf_summary.head(12).copy().sort_values("avg_win_pct", ascending=True)
+        fig.add_trace(
+            go.Bar(
+                x=rank_board["avg_win_pct"],
+                y=rank_board["conference_display"],
+                orientation="h",
+                marker=dict(color=[accent if str(name) == focus_conf else _hex_to_rgba("#4CC9F0", 0.45) for name in rank_board["conference_display"]]),
+                text=[f"#{int(rank)}" for rank in rank_board["conference_rank"]],
+                textposition="outside",
+                hovertemplate="%{y}<br>Avg Win %: %{x:.1%}<br>Rank: %{text}<extra></extra>",
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+
+        radar_pop = filtered_summary if mode == "compare" and compare_team is not None else conf_teams
+        theta_a, values_a, raw_a = _overview_normalized_profile(radar_pop, focus_team)
+        if theta_a:
+            fig.add_trace(
+                go.Scatterpolar(
+                    r=values_a,
+                    theta=theta_a,
+                    fill="toself",
+                    name=str(focus_team.get("team_name")),
+                    line=dict(color=accent, width=3),
+                    fillcolor=_hex_to_rgba(accent, 0.24),
+                ),
+                row=1,
+                col=2,
+            )
+        if mode == "compare" and compare_team is not None:
+            theta_b, values_b, raw_b = _overview_normalized_profile(radar_pop, compare_team)
+            if theta_b:
+                fig.add_trace(
+                    go.Scatterpolar(
+                        r=values_b,
+                        theta=theta_b,
+                        fill="toself",
+                        name=str(compare_team.get("team_name")),
+                        line=dict(color=compare_accent, width=2.5),
+                        fillcolor=_hex_to_rgba(compare_accent, 0.16),
+                    ),
+                    row=1,
+                    col=2,
+                )
+        elif mode == "conference":
+            theta_c, values_c, _ = _overview_normalized_profile(conf_teams, conf_teams.mean(numeric_only=True))
+            if theta_c:
+                fig.add_trace(
+                    go.Scatterpolar(
+                        r=values_c,
+                        theta=theta_c,
+                        fill="toself",
+                        name=f"{focus_conf} Avg",
+                        line=dict(color=accent_alt, width=2.5),
+                        fillcolor=_hex_to_rgba(accent_alt, 0.14),
+                    ),
+                    row=1,
+                    col=2,
+                )
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=980,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(10,14,30,0.88)",
+            margin=dict(l=36, r=36, t=84, b=36),
+            font=dict(color="#E2E8F0"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        )
+        fig.update_xaxes(tickformat=".0%", showgrid=False, zeroline=False, row=1, col=1)
+        fig.update_yaxes(showgrid=False, zeroline=False, row=1, col=1)
+        fig.update_xaxes(tickformat=".0%", showgrid=False, zeroline=False, row=2, col=1)
+        fig.update_yaxes(showgrid=False, zeroline=False, row=2, col=1)
+        fig.update_polars(
+            bgcolor="rgba(10,14,30,0.55)",
+            radialaxis=dict(range=[0, 100], showticklabels=False, ticks="", gridcolor="rgba(255,255,255,0.10)"),
+            angularaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+            row=1,
+            col=2,
+        )
+        display(fig)
+
+        overview_status_html.value = (
+            f"<div style='color:#CBD5E1;padding:10px 0;'>"
+            f"Mode: <b>{html.escape(mode_label)}</b> • Conference: <b>{html.escape(focus_conf)}</b> • "
+            f"Focus team: <b>{html.escape(str(focus_team.get('team_name', 'Team')))}</b>"
+            f"{f' • Compare: <b>{html.escape(str(compare_team.get("team_name")))}</b>' if compare_team is not None else ''}"
+            f"</div>"
+        )
+
+
+def _overview_filter_changed(change):
+    if change.get("name") != "value":
+        return
+    owner = change.get("owner")
+    if owner is overview_mode:
+        overview_team_b.disabled = False
+    if owner in [overview_conf, overview_mode]:
+        _refresh_overview_options(force=False)
+    _render_overview_visualizations(force=False)
+
+
+def _season_viz_format(value, kind="value") -> str:
+    if pd.isna(value):
+        return "--"
+    value = float(value)
+    if kind == "pct":
+        pct = value * 100.0 if abs(value) <= 1.5 else value
+        return f"{pct:.1f}%"
+    if abs(value) >= 100:
+        return f"{value:.0f}"
+    return f"{value:.1f}"
+
+
+def _season_viz_ring(label: str, value, accent: str, kind: str = "pct") -> str:
+    import html
+
+    pct = float(value) if pd.notna(value) else np.nan
+    if kind == "pct":
+        pct = pct * 100.0 if pd.notna(pct) and abs(pct) <= 1.5 else pct
+    pct = float(np.clip(0.0 if pd.isna(pct) else pct, 0.0, 100.0))
+    return (
+        f"<div style='flex:1 1 160px;min-width:150px;background:rgba(255,255,255,0.04);"
+        f"border:1px solid rgba(255,255,255,0.08);border-radius:22px;padding:18px 16px;text-align:center;'>"
+        f"<div style='width:118px;height:118px;margin:0 auto 12px auto;border-radius:50%;"
+        f"background:conic-gradient({accent} 0 {pct:.1f}%, rgba(255,255,255,0.12) {pct:.1f}% 100%);"
+        f"display:grid;place-items:center;'>"
+        f"<div style='width:82px;height:82px;border-radius:50%;background:#101828;display:grid;place-items:center;"
+        f"color:#F8FAFC;font-size:24px;font-weight:800;'>{html.escape(_season_viz_format(value, kind))}</div>"
+        f"</div><div style='color:#CBD5E1;font-size:12px;letter-spacing:0.18em;text-transform:uppercase;'>"
+        f"{html.escape(label)}</div></div>"
+    )
+
+
+def _render_season_visualizations(_=None, force: bool = False):
+    import html
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    with season_viz_out:
+        clear_output(wait=True)
+
+        payload = _build_overview_viz_payload(force=force)
+        summary = payload.get("summary", pd.DataFrame()).copy()
+        conf_summary = payload.get("conference_summary", pd.DataFrame()).copy()
+        games = payload.get("games", pd.DataFrame()).copy()
+
+        if len(summary) == 0:
+            season_viz_status_html.value = "<div style='color:#CBD5E1;padding:8px 0;'>No season visualization data is available yet.</div>"
+            display(HTML("<div style='color:#CBD5E1;padding:12px;'>No season data available for the visualization view.</div>"))
+            return
+
+        selected_conf = season_viz_conf.value if season_viz_conf.value is not None else "__all__"
+        filtered_summary = summary.copy()
+        if selected_conf != "__all__":
+            filtered_summary = filtered_summary[filtered_summary["conference_display"] == selected_conf].copy()
+        if len(filtered_summary) == 0:
+            season_viz_status_html.value = "<div style='color:#F8D7DA;padding:8px 0;'>No teams match the current conference filter.</div>"
+            display(HTML("<div style='color:#F8D7DA;padding:12px;'>No teams match the current conference filter.</div>"))
+            return
+
+        selected_team = season_viz_team.value if season_viz_team.value is not None else "__all__"
+        if selected_team == "__all__" or int(selected_team) not in set(filtered_summary["team_id"].astype(int).tolist()):
+            focus = filtered_summary.sort_values(["win_pct", "point_diff"], ascending=[False, False]).iloc[0]
+        else:
+            focus = filtered_summary.loc[filtered_summary["team_id"].astype(int) == int(selected_team)].iloc[0]
+
+        selected_opp = season_viz_opponent.value if season_viz_opponent.value is not None else "__avg__"
+        opponent = None
+        compare_name = "National Avg"
+        if selected_opp != "__avg__":
+            opp_match = filtered_summary.loc[filtered_summary["team_id"].astype(int) == int(selected_opp)]
+            if len(opp_match):
+                opponent = opp_match.iloc[0]
+                compare_name = str(opponent.get("team_name", "Opponent"))
+
+        focus_conf = str(focus.get("conference_display", "Independent / Unknown"))
+        conf_row_df = conf_summary.loc[conf_summary["conference_display"] == focus_conf]
+        conf_row = conf_row_df.iloc[0] if len(conf_row_df) else conf_summary.head(1).iloc[0]
+        conf_teams = summary.loc[summary["conference_display"] == focus_conf].copy().sort_values(["win_pct", "point_diff"], ascending=[False, False])
+
+        focus_games = games.loc[games["team_id"].astype(int) == int(focus["team_id"])].copy().sort_values("game_dt_et")
+        opp_games = pd.DataFrame()
+        if opponent is not None:
+            opp_games = games.loc[games["team_id"].astype(int) == int(opponent["team_id"])].copy().sort_values("game_dt_et")
+
+        accent = _safe_hex_color(focus.get("team_color"), "#F6A623")
+        accent_alt = _safe_hex_color(focus.get("team_alt_color"), "#AAB3D7")
+        compare_accent = _safe_hex_color(opponent.get("team_color"), "#FF6B6B") if opponent is not None else "#8A94B8"
+        logo = str(focus.get("logo") or "").strip()
+        national_avg = summary.mean(numeric_only=True)
+        compare_row = opponent if opponent is not None else national_avg
+
+        ranking = int(summary["win_pct"].rank(ascending=False, method="dense").loc[focus.name])
+        gauge_value = float((pd.to_numeric(focus.get("win_pct"), errors="coerce") or 0.0) * 100.0)
+
+        home_wins = away_wins = home_losses = away_losses = 0
+        if len(focus_games) > 0 and "location" in focus_games.columns:
+            loc = focus_games["location"].fillna("").astype(str).str.upper()
+            home_mask = loc.isin(["HOME", "VS"])
+            away_mask = loc.isin(["AWAY", "@"])
+            home_wins = int(focus_games.loc[home_mask, "win"].sum())
+            away_wins = int(focus_games.loc[away_mask, "win"].sum())
+            home_losses = int(home_mask.sum() - home_wins)
+            away_losses = int(away_mask.sum() - away_wins)
+
+        conf_grade = "A" if float(conf_row.get("avg_win_pct", 0.0)) >= 0.68 else ("B" if float(conf_row.get("avg_win_pct", 0.0)) >= 0.58 else ("C" if float(conf_row.get("avg_win_pct", 0.0)) >= 0.50 else "D"))
+        team_list_html = _overview_team_table_html(conf_teams, accent)
+
+        hero_html = f"""
+        <div style="background:linear-gradient(180deg, #32374d 0%, #272c42 100%);border:1px solid rgba(255,255,255,0.06);
+                    border-radius:26px;padding:26px;color:#F5F7FF;box-shadow:0 16px 42px rgba(0,0,0,0.22);">
+          <div style="display:grid;grid-template-columns:minmax(220px,0.92fr) minmax(300px,1.28fr);gap:22px;align-items:start;">
+            <div style="display:grid;gap:18px;">
+              <div style="background:rgba(255,255,255,0.03);border-radius:22px;padding:20px;">
+                <div style="display:flex;align-items:center;gap:14px;">
+                  {f"<img src='{html.escape(logo)}' style='width:52px;height:52px;object-fit:contain;background:rgba(255,255,255,0.05);border-radius:14px;padding:6px;'/>" if logo else ""}
+                  <div>
+                    <div style="font-size:36px;font-weight:900;line-height:1.02;">{html.escape(str(focus.get('team_name', 'Team')))}</div>
+                    <div style="margin-top:8px;color:#BAC1DF;font-size:14px;font-weight:600;">{html.escape(focus_conf)} • {int(focus.get('wins', 0))}-{int(focus.get('losses', 0))}</div>
+                  </div>
+                </div>
+                <div style="margin-top:18px;display:flex;align-items:center;gap:16px;">
+                  <div style="width:110px;height:110px;border-radius:50%;
+                              background:conic-gradient({accent} 0 {gauge_value:.1f}%, rgba(255,255,255,0.12) {gauge_value:.1f}% 100%);
+                              display:grid;place-items:center;">
+                    <div style="width:76px;height:76px;border-radius:50%;background:#262c42;display:grid;place-items:center;
+                                font-size:40px;font-weight:900;">{gauge_value:.0f}</div>
+                  </div>
+                  <div>
+                    <div style="color:#9FA7C8;font-size:10px;letter-spacing:0.2em;text-transform:uppercase;">Win Index</div>
+                    <div style="margin-top:10px;font-size:22px;font-weight:800;color:{accent};">{_season_viz_format(focus.get('win_pct'), 'pct')}</div>
+                    <div style="margin-top:10px;color:#D7DCF3;font-size:12px;">National Ranking</div>
+                    <div style="font-size:44px;font-weight:900;">#{ranking}</div>
+                  </div>
+                </div>
+              </div>
+              <div style="background:rgba(255,255,255,0.03);border-radius:22px;padding:20px;">
+                <div style="color:#9FA7C8;font-size:18px;letter-spacing:0.22em;text-transform:uppercase;font-weight:700;">Conference</div>
+                <div style="margin-top:14px;font-size:40px;font-weight:900;">{html.escape(focus_conf)}</div>
+                <div style="margin-top:18px;display:grid;grid-template-columns:1.35fr auto auto;gap:10px;font-size:15px;color:#DDE2F7;line-height:1.5;">
+                  <div>Overall Team</div><div>#{int(pd.to_numeric(focus.get('overall_rank'), errors='coerce')) if pd.notna(pd.to_numeric(focus.get('overall_rank'), errors='coerce')) else '--'}</div><div style="color:{accent};font-weight:800;">{focus.get('overall_grade', '--')}</div>
+                  <div>Team Offense</div><div>#{int(pd.to_numeric(focus.get('offense_rank'), errors='coerce')) if pd.notna(pd.to_numeric(focus.get('offense_rank'), errors='coerce')) else '--'}</div><div style="color:{accent_alt};font-weight:800;">{focus.get('offense_grade', '--')}</div>
+                  <div>Team Defense</div><div>#{int(pd.to_numeric(focus.get('defense_rank'), errors='coerce')) if pd.notna(pd.to_numeric(focus.get('defense_rank'), errors='coerce')) else '--'}</div><div style="color:{accent_alt};font-weight:800;">{focus.get('defense_grade', '--')}</div>
+                  <div>Rebounding</div><div>#{int(pd.to_numeric(focus.get('rebounds_rank'), errors='coerce')) if pd.notna(pd.to_numeric(focus.get('rebounds_rank'), errors='coerce')) else '--'}</div><div style="color:{accent_alt};font-weight:800;">{focus.get('rebounds_grade', '--')}</div>
+                  <div>Assists</div><div>#{int(pd.to_numeric(focus.get('assists_rank'), errors='coerce')) if pd.notna(pd.to_numeric(focus.get('assists_rank'), errors='coerce')) else '--'}</div><div style="color:{accent_alt};font-weight:800;">{focus.get('assists_grade', '--')}</div>
+                  <div>Turnovers</div><div>#{int(pd.to_numeric(focus.get('turnovers_rank'), errors='coerce')) if pd.notna(pd.to_numeric(focus.get('turnovers_rank'), errors='coerce')) else '--'}</div><div style="color:{accent_alt};font-weight:800;">{focus.get('turnovers_grade', '--')}</div>
+                </div>
+              </div>
+              <div style="background:rgba(255,255,255,0.03);border-radius:22px;padding:20px;">
+                <div style="color:#9FA7C8;font-size:10px;letter-spacing:0.2em;text-transform:uppercase;">Conference Teams</div>
+                <div style="margin-top:14px;">{team_list_html}</div>
+              </div>
+            </div>
+            <div style="display:grid;gap:18px;">
+              <div style="background:rgba(255,255,255,0.03);border-radius:22px;padding:18px 18px 10px 18px;">
+                <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;">
+                  <div style="background:rgba(0,0,0,0.18);border-radius:16px;padding:14px;">
+                    <div style="color:#A7AFD2;font-size:16px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">Points Per Game</div>
+                    <div style="margin-top:10px;font-size:36px;font-weight:900;color:{accent};">{_season_viz_format(focus.get('points_for'), 'value')}</div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.18);border-radius:16px;padding:14px;">
+                    <div style="color:#A7AFD2;font-size:16px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">Rebounds</div>
+                    <div style="margin-top:10px;font-size:36px;font-weight:900;color:{accent};">{_season_viz_format(focus.get('rebounds'), 'value')}</div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.18);border-radius:16px;padding:14px;">
+                    <div style="color:#A7AFD2;font-size:16px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">Assists</div>
+                    <div style="margin-top:10px;font-size:36px;font-weight:900;color:{accent};">{_season_viz_format(focus.get('assists'), 'value')}</div>
+                  </div>
+                </div>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;">
+                <div style="background:rgba(255,255,255,0.03);border-radius:18px;padding:16px;text-align:center;">
+                  <div style="color:#A7AFD2;font-size:15px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">FG %</div>
+                  <div style="margin-top:10px;font-size:32px;font-weight:900;">{_season_viz_format(focus.get('fg_pct'), 'pct')}</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.03);border-radius:18px;padding:16px;text-align:center;">
+                  <div style="color:#A7AFD2;font-size:15px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">3 PT %</div>
+                  <div style="margin-top:10px;font-size:32px;font-weight:900;">{_season_viz_format(focus.get('three_pct'), 'pct')}</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.03);border-radius:18px;padding:16px;text-align:center;">
+                  <div style="color:#A7AFD2;font-size:15px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">Home Record</div>
+                  <div style="margin-top:10px;font-size:32px;font-weight:900;">{home_wins}-{home_losses}</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.03);border-radius:18px;padding:16px;text-align:center;">
+                  <div style="color:#A7AFD2;font-size:15px;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;">Away Record</div>
+                  <div style="margin-top:10px;font-size:32px;font-weight:900;">{away_wins}-{away_losses}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
+        display(HTML(hero_html))
+
+        fig = make_subplots(
+            rows=3,
+            cols=2,
+            specs=[[{"type": "indicator"}, {"type": "scatter"}],
+                   [{"type": "bar"}, {"type": "polar"}],
+                   [{"type": "bar"}, {"type": "scatter"}]],
+            subplot_titles=(
+                "Win Gauge", "Trend vs Opponent / National Avg",
+                "Team vs Compare Benchmarks", "Profile Radar",
+                "Monthly Wins", "Stat Edge Timeline",
+            ),
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10,
+        )
+
+        fig.add_trace(
+            go.Indicator(
+                mode="gauge+number",
+                value=gauge_value,
+                number={"suffix": "%", "font": {"color": "#F5F7FF", "size": 34}},
+                gauge={
+                    "axis": {"range": [0, 100], "tickcolor": "rgba(255,255,255,0.35)"},
+                    "bar": {"color": accent},
+                    "bgcolor": "rgba(255,255,255,0.05)",
+                    "borderwidth": 0,
+                    "steps": [{"range": [0, 100], "color": "rgba(255,255,255,0.06)"}],
+                },
+                title={"text": str(focus.get("team_name", "Team"))},
+            ),
+            row=1,
+            col=1,
+        )
+
+        line_x = focus_games["game_no"] if len(focus_games) else pd.Series(dtype=float)
+        line_team = focus_games["rolling_points_for"] if len(focus_games) else pd.Series(dtype=float)
+        if opponent is not None and len(opp_games):
+            compare_x = opp_games["game_no"]
+            compare_line = opp_games["rolling_points_for"]
+        else:
+            monthly = games.groupby("game_no", dropna=False)["rolling_points_for"].mean().reset_index()
+            compare_x = monthly["game_no"]
+            compare_line = monthly["rolling_points_for"]
+
+        fig.add_trace(go.Scatter(x=line_x, y=line_team, mode="lines+markers", name=str(focus.get("team_name")), line=dict(color=accent, width=3)), row=1, col=2)
+        fig.add_trace(go.Scatter(x=compare_x, y=compare_line, mode="lines", name=compare_name, line=dict(color=compare_accent, width=2.5)), row=1, col=2)
+
+        compare_labels = ["Points Per Game", "Rebounds", "Assists"]
+        compare_cols = ["points_for", "rebounds", "assists"]
+        focus_vals = [pd.to_numeric(focus.get(c), errors="coerce") for c in compare_cols]
+        compare_vals = [pd.to_numeric(compare_row.get(c), errors="coerce") for c in compare_cols]
+        fig.add_trace(go.Bar(x=focus_vals, y=compare_labels, orientation="h", name=str(focus.get("team_name")), marker=dict(color=accent)), row=2, col=1)
+        fig.add_trace(go.Bar(x=compare_vals, y=compare_labels, orientation="h", name=compare_name, marker=dict(color=compare_accent, opacity=0.55)), row=2, col=1)
+
+        radar_pop = filtered_summary if opponent is not None else summary
+        theta_a, values_a, _ = _overview_normalized_profile(radar_pop, focus)
+        if theta_a:
+            fig.add_trace(go.Scatterpolar(r=values_a, theta=theta_a, fill="toself", name=str(focus.get("team_name")), line=dict(color=accent, width=3), fillcolor=_hex_to_rgba(accent, 0.18)), row=2, col=2)
+        if opponent is not None:
+            theta_b, values_b, _ = _overview_normalized_profile(radar_pop, opponent)
+            if theta_b:
+                fig.add_trace(go.Scatterpolar(r=values_b, theta=theta_b, fill="toself", name=str(opponent.get("team_name")), line=dict(color=compare_accent, width=2.5), fillcolor=_hex_to_rgba(compare_accent, 0.12)), row=2, col=2)
+        else:
+            theta_b, values_b, _ = _overview_normalized_profile(summary, national_avg)
+            if theta_b:
+                fig.add_trace(go.Scatterpolar(r=values_b, theta=theta_b, fill="toself", name="National Avg", line=dict(color=compare_accent, width=2.2), fillcolor=_hex_to_rgba(compare_accent, 0.10)), row=2, col=2)
+
+        if len(focus_games):
+            month_board = focus_games.copy()
+            month_board["month_label"] = month_board["game_dt_et"].dt.strftime("%b")
+            month_wins = month_board.groupby("month_label", sort=False)["win"].sum().reset_index()
+            fig.add_trace(go.Bar(x=month_wins["month_label"], y=month_wins["win"], name="Wins", marker=dict(color=accent_alt)), row=3, col=1)
+
+            edge_frame = focus_games[["game_no", "rolling_point_diff", "rolling_points_for", "rolling_points_against"]].copy()
+            fig.add_trace(go.Scatter(x=edge_frame["game_no"], y=edge_frame["rolling_point_diff"], mode="lines+markers", name="Point Diff", line=dict(color=accent, width=3)), row=3, col=2)
+            fig.add_trace(go.Scatter(x=edge_frame["game_no"], y=edge_frame["rolling_points_against"], mode="lines", name="Opp Pts", line=dict(color=compare_accent, width=2, dash="dot")), row=3, col=2)
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=1320,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(40,46,69,0.92)",
+            margin=dict(l=34, r=34, t=90, b=34),
+            font=dict(color="#E6EAFF"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+            barmode="overlay",
+        )
+        fig.update_xaxes(showgrid=False, zeroline=False, row=2, col=1)
+        fig.update_yaxes(showgrid=False, zeroline=False, row=2, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)", row=1, col=2)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)", row=1, col=2)
+        fig.update_xaxes(showgrid=False, zeroline=False, row=3, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)", row=3, col=1)
+        fig.update_xaxes(showgrid=False, zeroline=False, row=3, col=2)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)", row=3, col=2)
+        fig.update_polars(
+            bgcolor="rgba(37,42,62,0.72)",
+            radialaxis=dict(range=[0, 100], showticklabels=False, ticks="", gridcolor="rgba(255,255,255,0.12)"),
+            angularaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+            row=2, col=2
+        )
+        display(fig)
+
+        season_viz_status_html.value = (
+            f"<div style='color:#CBD5E1;padding:10px 0;'>"
+            f"Season Viz template view for <b>{html.escape(str(focus.get('team_name', 'Team')))}</b> in "
+            f"<b>{html.escape(focus_conf)}</b>. Comparing against <b>{html.escape(compare_name)}</b>."
+            f"<br><span style='color:#9FB4FF;'>React dashboard:</span> "
+            f"<a href='http://localhost:5173/' target='_blank' style='color:#7CC4FF;'>http://localhost:5173/</a>"
+            f"</div>"
+        )
+
+
+def _season_viz_filter_changed(change):
+    if change.get("name") != "value":
+        return
+    owner = change.get("owner")
+    if owner in [season_viz_conf, season_viz_team]:
+        _refresh_season_viz_options(force=False)
+    _render_season_visualizations(force=False)
+
+
+
+def refresh(_=None, force_rebuild=False):
+    global LAST_BOARD, LAST_DATE, SEASON_ACC, SEASON_ACC_DATE
+
+    if force_rebuild:
+        FILTERED_BOARD_CACHE.clear()
+        HC_FILTER_CACHE.clear()
+        if LAST_DATE == date_picker.value:
+            LAST_BOARD = None
+
+    if SEASON_ACC is None:
+        try:
+            build_or_update_season_accuracy_cache()
+            SEASON_ACC = load_cached_season_accuracy_snapshot()
+        except Exception:
+            SEASON_ACC = load_cached_season_accuracy_snapshot()
+        if not SEASON_ACC:
+            SEASON_ACC = {}
+        SEASON_ACC_DATE = "Season-to-Date"
+
+    season_html, daily_html = render_two_level_banner(
+        season_acc=SEASON_ACC,
+        season_label=SEASON_ACC_DATE,
+        daily_acc={},
+        daily_label=str(date_picker.value),
+        note=""
+    )
+    season_banner_html.value = season_html
+    daily_banner_html.value = daily_html
+    status_note_html.value = ""
+    tournament_banner_html.value = ""
+
+    if not _models_ready():
+        with out:
+            clear_output(wait=True)
+            display(HTML("<div style='color:#AAA; padding:8px;'>Models are not loaded yet. Run retrain/startup initialization first.</div>"))
+        return
+
+    _refresh_matchup_team_options()
+    if "season_viz_team" in globals() and "season_viz_conf" in globals():
+        _refresh_season_viz_options(force=force_rebuild)
+
+    if (LAST_DATE == date_picker.value) and (LAST_BOARD is not None) and not force_rebuild:
+        with out:
+            clear_output(wait=True)
+
+            b2, _ = _get_filtered_board_cached(LAST_BOARD, date_picker.value)
+            warnings = _validate_board_like(b2, "Predictions")
+            filtered_acc = compute_daily_accuracy(b2)
+
+            note_html = data_status_note(
+                schedule_cur,
+                team_box_hist,
+                LAST_BOARD,
+                selected_date=date_picker.value
+            ) if "team_box_hist" in globals() else ""
+
+            season_html, daily_html = render_two_level_banner(
+                season_acc=SEASON_ACC,
+                season_label=SEASON_ACC_DATE,
+                daily_acc=filtered_acc,
+                daily_label=str(date_picker.value),
+                note=note_html
+            )
+
+            season_banner_html.value = season_html
+            daily_banner_html.value = daily_html
+            status_note_html.value = note_html
+            tournament_banner_html.value = render_tournament_status_banner(
+                LAST_BOARD,
+                manual_override=bool(tournament_mode.value),
+            )
+
+            warn_html = _warning_html("Predictions validation", warnings)
+            if warn_html:
+                display(HTML(warn_html))
+            display(HTML("<div style='color:#CBD5E1; padding:0 0 10px 0;'>React dashboard: <a href='http://localhost:5173/' target='_blank' style='color:#7CC4FF;'>http://localhost:5173/</a></div>"))
+            display(HTML(render_predictions_table(b2, int(max_rows.value))))
+        _dashboard_log(
+            "predictions_render",
+            selected_date=str(date_picker.value),
+            games_processed=int(len(b2)),
+            odds_merged=bool("rw_spread_home" in LAST_BOARD.columns and pd.to_numeric(LAST_BOARD.get("rw_spread_home"), errors="coerce").notna().any()),
+            warnings=warnings,
+            cache_hit=True,
+        )
+        return
+
+    with out:
+        clear_output(wait=True)
+        display(HTML("<div style='color:#AAA; padding:8px;'>Building board...</div>"))
+        _set_build_progress("Starting board build...")
+
+    result, err = _safe_execute(
+        "predictions_build",
+        lambda: _get_board_for_date_cached(date_picker.value, force_rebuild=force_rebuild),
+    )
+    if err is not None:
+        with out:
+            clear_output(wait=True)
+            display(HTML(f"<div style='color:#ffb4b4;'>Board error: {err}</div>"))
+        return
+    board, cache_hit = result
+
+    if board is None or len(board) == 0:
+        with out:
+            clear_output(wait=True)
+            display(HTML("<div style='color:#AAA;'>No games found for this date.</div>"))
+        return
+
+    LAST_BOARD = board
+    LAST_DATE = date_picker.value
+
+    b2, _ = _get_filtered_board_cached(board, date_picker.value)
+    warnings = _validate_board_like(b2, "Predictions")
+    filtered_acc = compute_daily_accuracy(b2)
+
+    note_html = data_status_note(
+        schedule_cur,
+        team_box_hist,
+        board,
+        selected_date=date_picker.value
+    ) if "team_box_hist" in globals() else ""
+
+    season_html, daily_html = render_two_level_banner(
+        season_acc=SEASON_ACC,
+        season_label=SEASON_ACC_DATE,
+        daily_acc=filtered_acc,
+        daily_label=str(date_picker.value),
+        note=note_html
+    )
+
+    season_banner_html.value = season_html
+    daily_banner_html.value = daily_html
+    status_note_html.value = note_html
+    tournament_banner_html.value = render_tournament_status_banner(
+        board,
+        manual_override=bool(tournament_mode.value),
+    )
+
+    with out:
+        clear_output(wait=True)
+        warn_html = _warning_html("Predictions validation", warnings)
+        if warn_html:
+            display(HTML(warn_html))
+        if show_rw_missing.value:
+            miss = board[board.get("rw_missing_reason", pd.Series("", index=board.index)).ne("")]
+            if len(miss):
+                display(HTML(f"<div style='color:#AAA;'>RW missing: {len(miss)} games</div>"))
+                display(miss[["away_team", "home_team", "rw_missing_reason"]].head(20))
+            display(HTML("<div style='color:#CBD5E1; padding:0 0 10px 0;'>React dashboard: <a href='http://localhost:5173/' target='_blank' style='color:#7CC4FF;'>http://localhost:5173/</a></div>"))
+        display(HTML(render_predictions_table(b2, int(max_rows.value))))
+    _dashboard_log(
+        "predictions_render",
+        selected_date=str(date_picker.value),
+        games_processed=int(len(b2)),
+        odds_merged=bool("rw_spread_home" in board.columns and pd.to_numeric(board.get("rw_spread_home"), errors="coerce").notna().any()),
+        warnings=warnings,
+        cache_hit=bool(cache_hit),
+    )
+
+
+
+def _matchup_team_options():
+    schedule_df = globals().get("schedule_cur", pd.DataFrame())
+    snaps_df = globals().get("team_snaps", pd.DataFrame())
+    frames = []
+    if schedule_df is not None and len(schedule_df) > 0:
+        s = schedule_df.copy()
+        for id_col, candidates in [
+            ("home_id", ["home_team", "home_name", "home_display_name"]),
+            ("away_id", ["away_team", "away_name", "away_display_name"]),
+        ]:
+            if id_col in s.columns:
+                x = pd.DataFrame({
+                    "team_id": s[id_col],
+                    "team_label": _safe_team_text_col(s, candidates, default="TBD"),
+                })
+                frames.append(x)
+
+    if not frames:
+        return sorted(
+            [(name, tid) for tid, name in _build_id_team_name_map(schedule_df, snaps_df).items()],
+            key=lambda x: x[0]
+        )
+
+    out = pd.concat(frames, ignore_index=True)
+    out["team_id"] = pd.to_numeric(out["team_id"], errors="coerce")
+    out["team_label"] = out["team_label"].astype(str).str.strip()
+    out = out.dropna(subset=["team_id"]).copy()
+    out = out[~out["team_label"].map(_bad_team_name)].copy()
+    out["team_id"] = out["team_id"].astype(int)
+    out = out.drop_duplicates(subset=["team_id"], keep="last")
+    return sorted([(row["team_label"], int(row["team_id"])) for _, row in out.iterrows()], key=lambda x: x[0])
+
+
+def _refresh_matchup_team_options():
+    if "matchup_team_a" not in globals() or "matchup_team_b" not in globals():
+        return
+
+    options = _matchup_team_options()
+    valid_ids = {int(val) for _, val in options} if options else set()
+
+    prev_a = globals()["matchup_team_a"].value
+    prev_b = globals()["matchup_team_b"].value
+
+    globals()["matchup_team_a"].options = options
+    globals()["matchup_team_b"].options = options
+
+    globals()["matchup_team_a"].value = prev_a if prev_a in valid_ids else None
+    globals()["matchup_team_b"].value = prev_b if prev_b in valid_ids else None
+
+    if options and globals()["matchup_team_a"].value is None:
+        globals()["matchup_team_a"].value = options[0][1]
+    if options and globals()["matchup_team_b"].value is None:
+        fallback_b = next((val for _, val in options if val != globals()["matchup_team_a"].value), options[0][1])
+        globals()["matchup_team_b"].value = fallback_b
+
+
+
 def _board_cache_key(date_et) -> tuple:
     tournament_mode_on = False
     try:
@@ -7030,12 +8860,14 @@ def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
 
     key = _board_cache_key(date_et)
     if not force_rebuild and key in BOARD_CACHE:
+        _set_build_progress(f"Using cached board for {pd.Timestamp(date_et).date()}...")
         board = BOARD_CACHE[key].copy()
-        if _needs_injury_refresh(board):
+        if _needs_injury_refresh(board) and ((not _is_past_local_slate(date_et)) or _has_exact_injury_file_for_date(date_et, INJURY_DIR)):
             board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
             BOARD_CACHE[key] = board.copy()
         return board, True
 
+    _set_build_progress(f"Building board core for {pd.Timestamp(date_et).date()}...")
     board = build_board_for_date(
         date_et=date_et,
         schedule_df=schedule_cur,
@@ -7051,10 +8883,13 @@ def _get_board_for_date_cached(date_et, force_rebuild: bool = False) -> tuple:
         lgb_spread_edge=lgb_spread_edge if "lgb_spread_edge" in globals() else None,
         elo_snap=elo_snap,
     )
-    if _needs_injury_refresh(board):
+    if _needs_injury_refresh(board) and ((not _is_past_local_slate(date_et)) or _has_exact_injury_file_for_date(date_et, INJURY_DIR)):
+        _set_build_progress("Attaching injury context...")
         board = attach_injury_features_to_board(board, date_et, INJURY_DIR)
-    if board is not None and len(board) > 0 and "rw_spread_home" not in board.columns:
+    if board is not None and len(board) > 0 and "rw_spread_home" not in board.columns and ((not _is_past_local_slate(date_et)) or _has_exact_rotowire_file_for_date(date_et, ROTOWIRE_DIR)):
+        _set_build_progress("Attaching Rotowire odds...")
         board = _attach_rotowire_to_board(board, date_et)
+    _set_build_progress("Caching built board...")
     BOARD_CACHE[key] = board.copy() if board is not None else pd.DataFrame()
     if len(BOARD_CACHE) > 12:
         stale = [k for k in BOARD_CACHE if k != key]
@@ -7077,6 +8912,62 @@ def _get_high_confidence_cached(board: pd.DataFrame, date_et, threshold: float) 
         hc = hc.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
     HC_FILTER_CACHE[key] = hc.copy()
     return hc.copy(), False
+
+
+def _set_build_progress(message: str):
+    try:
+        status_note_html.value = f"<div style='color:#AAA; padding:6px 0;'>{message}</div>"
+    except Exception:
+        pass
+    try:
+        print(message)
+    except Exception:
+        pass
+
+
+def _apply_filters(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or len(board) == 0:
+        return pd.DataFrame() if board is None else board.copy()
+
+    out = board.copy()
+
+    conf = pd.to_numeric(out.get("confidence", out.get("pick_conf")), errors="coerce")
+    if "confidence" not in out.columns:
+        out["confidence"] = conf
+    min_conf_val = float(getattr(globals().get("min_conf"), "value", 0.0) or 0.0)
+    if conf.notna().any():
+        out = out.loc[conf.fillna(-np.inf) >= min_conf_val].copy()
+
+    pred_margin = pd.to_numeric(out.get("pred_margin_home"), errors="coerce")
+    min_margin_val = float(getattr(globals().get("min_abs_margin"), "value", 0.0) or 0.0)
+    if min_margin_val > 0 and pred_margin.notna().any():
+        out = out.loc[pred_margin.abs().fillna(-np.inf) >= min_margin_val].copy()
+
+    side_val = str(getattr(globals().get("side_filter"), "value", "all") or "all").strip().lower()
+    if side_val in {"fav", "dog"} and pred_margin.notna().any():
+        if side_val == "fav":
+            out = out.loc[pred_margin > 0].copy()
+        elif side_val == "dog":
+            out = out.loc[pred_margin < 0].copy()
+
+    neutral_val = bool(getattr(globals().get("neutral_only"), "value", False))
+    if neutral_val and "neutral_site" in out.columns:
+        neutral_mask = _coerce_bool_series(out.get("neutral_site"), out.index)
+        out = out.loc[neutral_mask].copy()
+
+    search_val = str(getattr(globals().get("search_box"), "value", "") or "").strip().lower()
+    if search_val:
+        away_txt = _safe_team_text_col(out, ["away_team", "away_short_display_name", "away_display_name", "away_name"], default="")
+        home_txt = _safe_team_text_col(out, ["home_team", "home_short_display_name", "home_display_name", "home_name"], default="")
+        matchup_txt = (away_txt.astype(str) + " " + home_txt.astype(str)).str.lower()
+        out = out.loc[matchup_txt.str.contains(re.escape(search_val), na=False)].copy()
+
+    dedupe_cols = [c for c in ["game_id"] if c in out.columns]
+    if not dedupe_cols:
+        dedupe_cols = [c for c in ["game_dt_et", "away_team", "home_team"] if c in out.columns]
+    if dedupe_cols:
+        out = out.drop_duplicates(subset=dedupe_cols, keep="last")
+    return out.reset_index(drop=True)
 
 
 def _get_filtered_board_cached(board: pd.DataFrame, date_et) -> tuple:
@@ -7102,61 +8993,6 @@ def _get_matchup_snapshot_cached(board: pd.DataFrame, team_a_id: int, team_b_id:
     snap = board.loc[pair_mask].copy()
     MATCHUP_SNAPSHOT_CACHE[key] = snap.copy()
     return snap.copy(), False
-
-
-def _validate_board_like(df: pd.DataFrame, context: str = "Board") -> list:
-    if df is None or len(df) == 0:
-        return []
-    msgs = []
-    required = ["away_team", "home_team"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        msgs.append(f"{context}: missing required columns: {', '.join(missing)}")
-    for c in ["away_team", "home_team"]:
-        if c in df.columns and df[c].astype(str).str.strip().eq("").any():
-            msgs.append(f"{context}: blank team names detected")
-            break
-    for c in ["away_id", "home_id"]:
-        if c in df.columns and pd.to_numeric(df[c], errors="coerce").isna().any():
-            msgs.append(f"{context}: missing team IDs detected")
-            break
-    if "game_id" in df.columns:
-        dupes = df["game_id"].astype(str).str.strip()
-        dupes = dupes[dupes.ne("")]
-        if dupes.duplicated().any():
-            msgs.append(f"{context}: duplicate game_id rows detected")
-    elif {"game_dt_et", "away_team", "home_team"}.issubset(df.columns):
-        dupes = df[["game_dt_et", "away_team", "home_team"]].astype(str)
-        if dupes.duplicated().any():
-            msgs.append(f"{context}: duplicate game rows detected")
-    for c in ["pick_conf", "confidence", "p_home_win"]:
-        if c in df.columns:
-            vals = pd.to_numeric(df[c], errors="coerce")
-            bad = vals.notna() & ((vals < 0) | (vals > 1))
-            if bad.any():
-                msgs.append(f"{context}: {c} outside [0, 1]")
-    for c in ["pred_margin_home", "rw_spread_home", "rw_home_ml", "rw_away_ml", "rw_total"]:
-        if c in df.columns:
-            raw = df[c]
-            bad = raw.notna() & raw.astype(str).str.strip().ne("") & pd.to_numeric(raw, errors="coerce").isna()
-            if bad.any():
-                msgs.append(f"{context}: non-numeric values found in {c}")
-    return msgs
-
-
-def _validate_bracket_summary(summary_df: pd.DataFrame) -> list:
-    if summary_df is None or len(summary_df) == 0:
-        return []
-    msgs = []
-    if "team_id" in summary_df.columns and pd.to_numeric(summary_df["team_id"], errors="coerce").duplicated().any():
-        msgs.append("Bracket Sim: duplicate team rows detected in summary")
-    for c in [x for x in summary_df.columns if x.endswith("_Pct")]:
-        vals = pd.to_numeric(summary_df[c], errors="coerce")
-        bad = vals.notna() & ((vals < 0) | (vals > 100))
-        if bad.any():
-            msgs.append(f"Bracket Sim: {c} outside [0, 100]")
-            break
-    return msgs
 
 
 def _collect_startup_diagnostics():
@@ -7198,199 +9034,219 @@ def _emit_startup_diagnostics():
     _STARTUP_DIAGNOSTICS_EMITTED = True
 
 
-# --- Widgets ---
-def _reuse_widget(name: str, factory):
-    existing = globals().get(name)
-    if existing is not None:
-        return existing
-    return factory()
 
+date_picker     = widgets.DatePicker(description="Slate (ET):")
+retrain_btn     = widgets.Button(description="Force Retrain", button_style="warning")
+open_dashboard_btn = widgets.Button(
+    description="Launch Dashboard",
+    button_style="success",
+    tooltip="Open the interactive dashboard app",
+    layout=widgets.Layout(width="200px")
+)
+min_conf        = widgets.FloatSlider(description="Min Conf", min=0.50, max=0.95, step=0.01, value=0.60, readout_format=".2f")
+min_abs_margin  = widgets.FloatSlider(description="Min |Margin|", min=0.0, max=20.0, step=0.5, value=0.0)
+side_filter     = widgets.Dropdown(description="Side", options=[("All","all"),("Favorites","fav"),("Dogs","dog")], value="all")
+neutral_only    = widgets.Checkbox(description="Neutral only", value=False)
+show_inj        = widgets.Checkbox(description="Show injuries", value=True)
+show_rw_missing = widgets.Checkbox(description="Show RW missing", value=False)
+tournament_mode = widgets.Checkbox(description="Tournament Mode", value=False)
+search_box      = widgets.Text(description="Search", placeholder="team name...")
+max_rows        = widgets.IntSlider(description="Rows", min=10, max=300, step=10, value=80)
 
-date_picker = _reuse_widget("date_picker", lambda: widgets.DatePicker(description="Slate (ET):"))
-refresh_btn = _reuse_widget("refresh_btn", lambda: widgets.Button(description="Refresh", button_style="primary"))
-retrain_btn = _reuse_widget("retrain_btn", lambda: widgets.Button(description="Force Retrain", button_style="warning"))
-open_dashboard_btn = _reuse_widget(
-    "open_dashboard_btn",
-    lambda: widgets.Button(
-        description="Launch Dashboard",
-        button_style="success",
-        tooltip="Open the interactive dashboard app",
-        layout=widgets.Layout(width="200px"),
-    ),
-)
-min_conf = _reuse_widget(
-    "min_conf",
-    lambda: widgets.FloatSlider(description="Min Conf", min=0.50, max=0.95, step=0.01, value=0.60, readout_format=".2f"),
-)
-min_abs_margin = _reuse_widget(
-    "min_abs_margin",
-    lambda: widgets.FloatSlider(description="Min |Margin|", min=0.0, max=20.0, step=0.5, value=0.0),
-)
-side_filter = _reuse_widget(
-    "side_filter",
-    lambda: widgets.Dropdown(description="Side", options=[("All", "all"), ("Favorites", "fav"), ("Dogs", "dog")], value="all"),
-)
-neutral_only = _reuse_widget("neutral_only", lambda: widgets.Checkbox(description="Neutral only", value=False))
-show_inj = _reuse_widget("show_inj", lambda: widgets.Checkbox(description="Show injuries", value=True))
-show_rw_missing = _reuse_widget("show_rw_missing", lambda: widgets.Checkbox(description="Show RW missing", value=False))
-tournament_mode = _reuse_widget("tournament_mode", lambda: widgets.Checkbox(description="Tournament Mode", value=False))
-search_box = _reuse_widget("search_box", lambda: widgets.Text(description="Search", placeholder="team name..."))
-max_rows = _reuse_widget("max_rows", lambda: widgets.IntSlider(description="Rows", min=10, max=300, step=10, value=80))
-
-out = _reuse_widget("out", widgets.Output)
-status_note_html = _reuse_widget("status_note_html", widgets.HTML)
-season_banner_html = _reuse_widget("season_banner_html", widgets.HTML)
-daily_banner_html = _reuse_widget("daily_banner_html", widgets.HTML)
-tournament_banner_html = _reuse_widget("tournament_banner_html", widgets.HTML)
-
-refresh_btn.description = "Refresh"
-refresh_btn.button_style = "primary"
-retrain_btn.description = "Force Retrain"
-retrain_btn.button_style = "warning"
-open_dashboard_btn.description = "Launch Dashboard"
-open_dashboard_btn.button_style = "success"
-open_dashboard_btn.tooltip = "Open the interactive dashboard app"
-open_dashboard_btn.layout = widgets.Layout(width="200px")
-min_conf.description = "Min Conf"
-min_conf.min = 0.50
-min_conf.max = 0.95
-min_conf.step = 0.01
-min_conf.readout_format = ".2f"
-min_abs_margin.description = "Min |Margin|"
-min_abs_margin.min = 0.0
-min_abs_margin.max = 20.0
-min_abs_margin.step = 0.5
-side_filter.description = "Side"
-side_filter.options = [("All", "all"), ("Favorites", "fav"), ("Dogs", "dog")]
-neutral_only.description = "Neutral only"
-show_inj.description = "Show injuries"
-show_rw_missing.description = "Show RW missing"
-tournament_mode.description = "Tournament Mode"
-search_box.description = "Search"
-search_box.placeholder = "team name..."
-max_rows.description = "Rows"
-max_rows.min = 10
-max_rows.max = 300
-max_rows.step = 10
+out = widgets.Output()
+status_note_html = widgets.HTML()
+season_banner_html = widgets.HTML()
+daily_banner_html = widgets.HTML()
+tournament_banner_html = widgets.HTML()
 
 date_picker.value = pd.Timestamp.now(tz="America/New_York").date()
 
+def _season_metric_normalize(metric_name, value, invert=False):
+    value = _matchup_num(value)
+    if pd.isna(value) or team_snaps is None or len(team_snaps) == 0:
+        return np.nan
 
-def _fmt_int_or_blank(v):
+    if metric_name == "rest_days":
+        capped = float(np.clip(value, 0.0, 7.0))
+        norm = 100.0 * (capped / 7.0)
+        if invert:
+            norm = 100.0 - norm
+        return float(np.clip(norm, 0.0, 100.0))
+
+    pop = team_snaps.copy()
+    if "team_id" not in pop.columns:
+        return np.nan
+    pop["team_id"] = pd.to_numeric(pop.get("team_id"), errors="coerce")
+    if "game_dt_et" in pop.columns:
+        pop["game_dt_et"] = pd.to_datetime(pop.get("game_dt_et"), errors="coerce")
+        pop = pop.sort_values("game_dt_et")
+    pop = pop.dropna(subset=["team_id"]).copy()
+    pop["team_id"] = pop["team_id"].astype(int)
+    pop = pop.drop_duplicates(subset=["team_id"], keep="last")
+
+    if metric_name == "r10_mean_point_diff":
+        pf = pd.to_numeric(pop.get("r10_mean_points_for"), errors="coerce")
+        pa = pd.to_numeric(pop.get("r10_mean_points_against"), errors="coerce")
+        series = pf - pa
+    else:
+        if metric_name not in pop.columns:
+            return np.nan
+        series = pd.to_numeric(pop.get(metric_name), errors="coerce")
+
+    series = series.dropna()
+    if len(series) < 2:
+        return np.nan
+
+    lo = float(series.min())
+    hi = float(series.max())
+    if hi <= lo:
+        return 50.0
+
+    norm = 100.0 * ((float(value) - lo) / (hi - lo))
+    if invert:
+        norm = 100.0 - norm
+    return float(np.clip(norm, 0.0, 100.0))
+
+
+matchup_team_a = widgets.Dropdown(description="Team A", options=_matchup_team_options())
+matchup_team_b = widgets.Dropdown(description="Team B", options=_matchup_team_options())
+compare_btn = widgets.Button(description="Compare", button_style="primary")
+matchup_out = widgets.Output()
+matchup_radar_out = widgets.Output(layout=widgets.Layout(width="100%", min_height="380px", overflow="hidden"))
+matchup_snapshot_out = widgets.Output()
+matchup_radar_title = widgets.HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Head-to-Head Radar</div>")
+matchup_radar_section = widgets.VBox(
+    [matchup_radar_title, matchup_radar_out],
+    layout=widgets.Layout(display="none", width="100%"),
+)
+_MATCHUP_RADAR_STATE = {"fig": None, "summary_html": "", "empty_html": ""}
+
+bracket_sim_n = widgets.IntText(description="Sims", value=1000)
+bracket_asof_date = widgets.DatePicker(description="As-of (ET):")
+bracket_asof_date.value = date_picker.value
+run_bracket_btn = widgets.Button(description="Run Simulation", button_style="primary")
+bracket_status_html = widgets.HTML()
+bracket_summary_html = widgets.HTML()
+bracket_out = widgets.Output()
+refresh_bracket_acc_btn = widgets.Button(description="Refresh Accuracy")
+bracket_acc_status_html = widgets.HTML()
+bracket_acc_out = widgets.Output()
+
+season_viz_team = widgets.Dropdown(description="Team", options=[("All Teams", "__all__")])
+season_viz_conf = widgets.Dropdown(description="Conference", options=[("All Conferences", "__all__")])
+season_viz_metric = widgets.Dropdown(
+    description="Metric",
+    options=[(spec["label"], key) for key, spec in _season_viz_metric_specs().items()],
+    value="win_pct",
+)
+season_viz_refresh_btn = widgets.Button(description="Refresh Visuals", button_style="primary")
+season_viz_status_html = widgets.HTML()
+season_viz_out = widgets.Output()
+season_viz_opponent = widgets.Dropdown(description="Opponent", options=[("National Avg", "__avg__")])
+
+
+
+def force_retrain_clicked(_=None):
+    import html
+    import traceback
+
+    _dashboard_log("force_retrain", status="start", selected_date=str(date_picker.value))
+    with out:
+        clear_output(wait=True)
+        display(HTML("<div style='color:#FFD700;'>Starting force retrain...</div>"))
+        try:
+            result = check_and_retrain(force_data=True, force_model=True)
+            training_rows = int((result or {}).get("training_rows", 0) or 0)
+            injury_cols_in_features = list((result or {}).get("injury_cols_in_features", []) or [])
+            injury_cols_in_dataset = list((result or {}).get("injury_cols_in_dataset", []) or [])
+            sig = str((result or {}).get("training_input_signature", "") or "")
+            display(HTML(
+                "<div style='color:#9FD89F; padding:6px 0;'>"
+                f"Force retrain completed. Data refresh: <b>{html.escape(str((result or {}).get('data_refresh_action', 'unknown')))}</b>"
+                f" | Model refresh: <b>{html.escape(str((result or {}).get('model_refresh_action', 'unknown')))}</b>"
+                "</div>"
+            ))
+            display(HTML(
+                "<div style='color:#bbb; padding:2px 0 8px 0;'>"
+                f"Training rows: <b>{training_rows:,}</b><br>"
+                f"Injury columns in training dataset: <b>{html.escape(', '.join(injury_cols_in_dataset) if injury_cols_in_dataset else 'none')}</b><br>"
+                f"Injury columns in final trained feature set: <b>{html.escape(', '.join(injury_cols_in_features) if injury_cols_in_features else 'none')}</b><br>"
+                f"ATS edge threshold: <b>{html.escape(str((result or {}).get('ats_edge_threshold', 'unknown')))}</b><br>"
+                f"Spread ensemble LGB weight: <b>{html.escape(str((result or {}).get('spread_ensemble_weight_lgb', 'unknown')))}</b><br>"
+                f"Market blend: <b>{html.escape(str((result or {}).get('market_blend', 'unknown')))}</b><br>"
+                f"Saved model timestamp: <b>{html.escape(str((result or {}).get('last_model_fit', 'unknown')))}</b><br>"
+                f"Feature signature: <b>{html.escape(sig)}</b>"
+                "</div>"
+            ))
+        except Exception as e:
+            tb = traceback.format_exc()
+            _dashboard_log("force_retrain", status="error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
+            display(HTML(
+                "<div style='color:#ffb4b4; padding:6px 0;'>"
+                f"Force retrain failed: {html.escape(str(e))}</div>"
+                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
+            ))
+            return
+
     try:
-        return str(int(float(v)))
+        refresh(force_rebuild=True)
+    except Exception as e:
+        tb = traceback.format_exc()
+        _dashboard_log("force_retrain", status="refresh_error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
+        with out:
+            display(HTML(
+                "<div style='color:#ffb4b4; padding:6px 0;'>"
+                f"Retrain succeeded, but dashboard refresh failed: {html.escape(str(e))}</div>"
+                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
+            ))
+        return
+
+    with out:
+        display(HTML("<div style='color:#9FD89F; padding:6px 0;'>Force retrain flow finished.</div>"))
+    _dashboard_log("force_retrain", status="completed", selected_date=str(date_picker.value))
+
+
+def predictions_refresh_clicked(_=None):
+    import html
+    import traceback
+
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    with out:
+        clear_output(wait=True)
+    try:
+        refresh(force_rebuild=True)
+    except Exception as e:
+        tb = traceback.format_exc()
+        _dashboard_log("predictions_refresh", status="error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
+        with out:
+            clear_output(wait=True)
+            display(HTML(
+                "<div style='color:#ffb4b4; padding:8px;'>"
+                f"Predictions refresh failed: {html.escape(str(e))}</div>"
+                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
+            ))
+
+
+def _rebind_button_click(button, handler):
+    if hasattr(button, "_click_handlers") and hasattr(button._click_handlers, "callbacks"):
+        button._click_handlers.callbacks = []
+    button.on_click(handler)
+
+
+def _rebind_observer(widget, handler, names="value"):
+    try:
+        widget.unobserve(handler, names=names)
     except Exception:
-        return ""
-
-
-def _fmt_spread_abs(v):
-    v = abs(float(v))
-    return str(int(v)) if v == int(v) else f"{v:.1f}"
-
-
-def _win_style(t):
-    return f"<span style='color:#2ECC71;font-weight:800;'>{t}</span>"
-
-
-def _lose_style(t):
-    return f"<span style='color:#FF6B6B;'>{t}</span>"
-
-
-def _render_compact_health_html(meta: dict, board=None, selected_date=None, injury_file_used: str = "NONE",
-                                schedule_max=None, team_box_max=None, rw_rows: int = 0, stale: bool = False) -> str:
-    feature_sig = str(meta.get("training_input_signature", "") or "")
-    if len(feature_sig) > 48:
-        feature_sig = feature_sig[:48] + "..."
-
-    active_features = list(globals().get("feature_cols", []) or meta.get("feature_cols", []) or [])
-    injury_included = all(c in active_features for c in ["diff_injury_impact", "diff_inj_out"])
-    training_rows = meta.get("last_training_rows", "")
-    training_rows_txt = f"{int(training_rows):,}" if str(training_rows).strip() not in {"", "None"} else "NA"
-
-    warnings = []
-    if not _models_ready():
-        warnings.append("models not loaded")
-    if injury_file_used == "NONE":
-        warnings.append("injury file missing")
-    if stale:
-        warnings.append("stale schedule/team box data")
-    if selected_date is not None and board is not None and len(board) == 0:
-        warnings.append("empty board for selected date")
-
-    warnings_html = ""
-    if warnings:
-        warnings_html = f"<div style='margin-top:6px;color:#d9a441;'>Warnings: {' | '.join(warnings)}</div>"
-
-    return f"""
-    <div style="
-        background:#111;
-        border-left:4px solid #555;
-        padding:8px;
-        font-size:12px;
-        color:#bbb;
-        margin-bottom:10px;
-    ">
-    Model ts: {meta.get("last_model_fit", "never")}<br>
-    Feature signature: {feature_sig or "NA"}<br>
-    Injury features active: {"YES" if injury_included else "NO"}<br>
-    Training rows: {training_rows_txt}<br>
-    Last data refresh: {meta.get("last_data_refresh", "never")}<br>
-    Last model action: {meta.get("last_model_refresh_action", "unknown")}<br>
-    Injury file found: {"YES" if injury_file_used != "NONE" else "NO"}<br>
-    Schedule through: {schedule_max}<br>
-    Team box through: {team_box_max}<br>
-    Odds fallback rows: {rw_rows}
-    {warnings_html}
-    </div>
-    """
-
-
-def _render_confidence_calibration_summary_html() -> str:
-    rows = load_cached_confidence_calibration_snapshot()
-    if not rows:
-        return ""
-
-    def _fmt_pct(v):
-        return "" if v is None or pd.isna(v) else f"{100.0 * float(v):.1f}%"
-
-    html_rows = []
-    for row in rows:
-        html_rows.append(
-            "<tr>"
-            f"<td style='padding:4px 8px; border-bottom:1px solid #222;'>{row.get('band', '')}</td>"
-            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{int(row.get('games', 0) or 0)}</td>"
-            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{_fmt_pct(row.get('winner_acc'))}</td>"
-            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{_fmt_pct(row.get('ats_acc'))}</td>"
-            f"<td style='padding:4px 8px; border-bottom:1px solid #222; text-align:right;'>{_fmt_pct(row.get('avg_conf'))}</td>"
-            "</tr>"
-        )
-
-    return """
-    <div style="
-        background:#111;
-        border-left:4px solid #555;
-        padding:8px;
-        font-size:12px;
-        color:#bbb;
-        margin-bottom:10px;
-    ">
-    <div style="color:#ddd; font-weight:700; margin-bottom:6px;">Confidence Calibration (Season to Date)</div>
-    <table style="border-collapse:collapse; width:100%; color:#bbb;">
-      <thead>
-        <tr style="color:#888;">
-          <th style="padding:4px 8px; text-align:left; border-bottom:1px solid #333;">Band</th>
-          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">Games</th>
-          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">Winner</th>
-          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">ATS</th>
-          <th style="padding:4px 8px; text-align:right; border-bottom:1px solid #333;">Avg Conf</th>
-        </tr>
-      </thead>
-      <tbody>
-        """ + "".join(html_rows) + """
-      </tbody>
-    </table>
-    </div>
-    """
+        pass
+    try:
+        if hasattr(widget, "_trait_notifiers"):
+            notifiers = widget._trait_notifiers.get(names, {})
+            if "change" in notifiers:
+                notifiers["change"] = []
+    except Exception:
+        pass
+    widget.observe(handler, names=names)
 
 
 def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
@@ -7405,7 +9261,7 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
         schedule_max = s["game_date_time"].max()
         if pd.notna(schedule_max):
             schedule_max = schedule_max.tz_convert("America/New_York").tz_localize(None)
-    except:
+    except Exception:
         pass
 
     try:
@@ -7414,14 +9270,14 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
         team_box_max = t["game_date_time"].max()
         if pd.notna(team_box_max):
             team_box_max = team_box_max.tz_convert("America/New_York").tz_localize(None)
-    except:
+    except Exception:
         pass
 
     try:
         if board is not None:
             gid = board.get("game_id", pd.Series(index=board.index, dtype=object)).astype(str)
             rw_rows = int(gid.str.startswith("RW_").sum())
-    except:
+    except Exception:
         pass
 
     try:
@@ -7429,31 +9285,24 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
             injury_files = find_injury_files_for_date(selected_date, INJURY_DIR)
             if injury_files:
                 injury_file_used = os.path.basename(injury_files[-1])
-    except:
+    except Exception:
         pass
 
     selected_ts = pd.Timestamp(selected_date).normalize() if selected_date else None
 
-    # ---------------------------------------------------
-    # suppress stale warning if board already has finals
-    # ---------------------------------------------------
     board_has_finals = False
     try:
         if board is not None and len(board) > 0:
             fs = board.get("final_score", pd.Series("", index=board.index)).astype(str).str.strip()
             board_has_finals = fs.ne("").any()
-
-            # fallback check in case final_score wasn't built yet
             if not board_has_finals:
                 completed = board.get("status_type_completed", pd.Series(False, index=board.index)).astype(str).str.lower().isin(["true", "1", "yes"])
                 state_final = board.get("status_type_state", pd.Series("", index=board.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
                 detail_final = board.get("status_type_short_detail", pd.Series("", index=board.index)).astype(str).str.contains("Final", case=False, na=False)
-
                 hs = pd.to_numeric(board.get("home_score", pd.Series(np.nan, index=board.index)), errors="coerce")
                 aw = pd.to_numeric(board.get("away_score", pd.Series(np.nan, index=board.index)), errors="coerce")
-
                 board_has_finals = ((completed | state_final | detail_final) & hs.notna() & aw.notna()).any()
-    except:
+    except Exception:
         pass
 
     stale = False
@@ -7495,354 +9344,32 @@ def data_status_note(schedule_df, team_box_df, board=None, selected_date=None):
     </div>
     """
 
-    meta = _load_metadata()
-    health_html = _render_compact_health_html(
-        meta=meta,
-        board=board,
-        selected_date=selected_date,
-        injury_file_used=injury_file_used,
-        schedule_max=schedule_max,
-        team_box_max=team_box_max,
-        rw_rows=rw_rows,
-        stale=stale,
-    )
-    calibration_html = _render_confidence_calibration_summary_html()
-
-    return warning_html + info_html + health_html + calibration_html
-
-
-def render_dashboard_banner(acc: dict, date_et=None, note: str = "") -> str:
-    base = render_accuracy_banner(acc, date_et=date_et)
-    if note:
-        base += f"<div style='color:#888; font-size:12px; margin:4px 0 8px 0;'>{note}</div>"
-    return base
-
-
-def df_to_html_table(df: pd.DataFrame, max_rows: int = 80) -> str:
-    if df is None or len(df) == 0:
-        return "<div style='color:#AAA; padding:8px;'>No games match current filters.</div>"
-    df = df.head(max_rows)
-    style = """
-    <style>
-    .pred-table-wrap { width:100%; overflow-x:auto; overflow-y:hidden; }
-    .pred-table { border-collapse: collapse; width:max-content; min-width:100%; font-size:12px; color:#EEE; table-layout:auto; }
-    .pred-table th { background:#1a1a1a; color:#FFD700; padding:6px 8px; text-align:left;
-                     border-bottom:2px solid #333; white-space:nowrap; position:relative; }
-    .pred-table td { padding:6px 10px; border-bottom:1px solid #222; white-space:nowrap; }
-    .pred-table tr:hover td { background:#1f1f1f; }
-    </style>"""
-    table_html = df.to_html(escape=False, index=False, classes="pred-table", border=0)
-    return style + f"<div class='pred-table-wrap'>{table_html}</div>"
-
-
-def _apply_filters(board: pd.DataFrame) -> pd.DataFrame:
-    if board is None or len(board) == 0:
-        return pd.DataFrame()
-
-    b = board.copy()
-
-    if "pick_conf" in b.columns:
-        b = b[pd.to_numeric(b["pick_conf"], errors="coerce").fillna(0) >= float(min_conf.value)]
-
-    if "pred_margin_home" in b.columns:
-        b = b[pd.to_numeric(b["pred_margin_home"], errors="coerce").abs().fillna(0) >= float(min_abs_margin.value)]
-
-    if neutral_only.value and "neutral_site" in b.columns:
-        b = b[b["neutral_site"].astype(str).str.lower().isin(["true", "1", "yes", "y"])]
-
-    if side_filter.value == "fav":
-        fav = np.where(b["pred_margin_home"] >= 0, b["home_team"], b["away_team"])
-        b = b[b["winner_pick"] == fav]
-    elif side_filter.value == "dog":
-        fav = np.where(b["pred_margin_home"] >= 0, b["home_team"], b["away_team"])
-        b = b[b["winner_pick"] != fav]
-
-    s = search_box.value.strip().lower()
-    if s:
-        b = b[
-            (b["home_team"].str.lower().str.contains(s, na=False)) |
-            (b["away_team"].str.lower().str.contains(s, na=False))
-        ]
-
-    return b
-
-
-def _is_real_final_row(row) -> bool:
+    extra_html = ""
     try:
-        hs = pd.to_numeric(row.get("home_score"), errors="coerce")
-        aw = pd.to_numeric(row.get("away_score"), errors="coerce")
-    except Exception:
-        return False
-
-    if pd.isna(hs) or pd.isna(aw):
-        return False
-
-    completed = str(row.get("status_type_completed", "")).strip().lower() in {"true", "1", "yes"}
-    state_ok  = str(row.get("status_type_state", "")).strip().lower() in {"post", "postgame", "final"}
-    detail_ok = "final" in str(row.get("status_type_short_detail", "")).strip().lower()
-
-    return completed or state_ok or detail_ok
-
-
-def _real_final_mask(df: pd.DataFrame) -> pd.Series:
-    if df is None or len(df) == 0:
-        return pd.Series(dtype=bool)
-
-    hs = pd.to_numeric(df.get("home_score", pd.Series(np.nan, index=df.index)), errors="coerce")
-    aw = pd.to_numeric(df.get("away_score", pd.Series(np.nan, index=df.index)), errors="coerce")
-    completed = df.get("status_type_completed", pd.Series(False, index=df.index)).astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
-    state_ok = df.get("status_type_state", pd.Series("", index=df.index)).astype(str).str.strip().str.lower().isin({"post", "postgame", "final"})
-    detail_ok = df.get("status_type_short_detail", pd.Series("", index=df.index)).astype(str).str.strip().str.lower().str.contains("final", na=False)
-    return hs.notna() & aw.notna() & (completed | state_ok | detail_ok)
-
-
-def _format_board_for_display(board: pd.DataFrame) -> pd.DataFrame:
-    b = board.copy()
-    ats_threshold = float(_get_ats_edge_threshold())
-    winner_col = next((c for c in ["winner_team", "winner"] if c in b.columns), None)
-    winner_raw = (
-        b[winner_col].fillna("").astype(str).str.strip()
-        if winner_col is not None else
-        pd.Series("", index=b.index, dtype=object)
-    )
-    game_dt_series = pd.to_datetime(
-        b.get("game_dt_et", b.get("game_date_time", pd.Series(pd.NaT, index=b.index))),
-        errors="coerce",
-    )
-    if getattr(game_dt_series.dt, "tz", None) is not None:
-        game_dt_series = game_dt_series.dt.tz_convert("America/New_York").dt.tz_localize(None)
-    today_et = pd.Timestamp.now(tz="America/New_York").date()
-    row_game_date = game_dt_series.dt.date
-    is_future_game = row_game_date.gt(today_et).fillna(False)
-    hs_base = pd.to_numeric(b.get("home_score", pd.Series(np.nan, index=b.index)), errors="coerce")
-    aw_base = pd.to_numeric(b.get("away_score", pd.Series(np.nan, index=b.index)), errors="coerce")
-    completed_by_score = hs_base.notna() & aw_base.notna() & ~(hs_base.eq(0) & aw_base.eq(0))
-    status_completed_mask = _coerce_bool_series(b.get("status_type_completed", False), b.index)
-    state_completed_mask = b.get("status_type_state", pd.Series("", index=b.index)).astype(str).str.strip().str.lower().isin({"post", "postgame", "final"})
-    detail_completed_mask = b.get("status_type_short_detail", pd.Series("", index=b.index)).astype(str).str.strip().str.lower().str.contains("final", na=False)
-    completed_by_winner = winner_raw.ne("") & (status_completed_mask | state_completed_mask | detail_completed_mask)
-    completed_mask = (~is_future_game) & (completed_by_score | completed_by_winner)
-    actual_winner_series = pd.Series(
-        np.where(
-            (~is_future_game) & completed_by_score,
-            np.where(hs_base >= aw_base, b["home_team"].astype(str), b["away_team"].astype(str)),
-            np.where((~is_future_game) & completed_by_winner, winner_raw, ""),
-        ),
-        index=b.index,
-        dtype=object,
-    )
-
-    for col in ["pick_conf", "p_home_win"]:
-        if col in b.columns:
-            b[col] = pd.to_numeric(b[col], errors="coerce").map(
-                lambda v: "" if pd.isna(v) else f"{v*100:.1f}%"
+        health_fn = globals().get("_render_compact_health_html")
+        if callable(health_fn):
+            extra_html += health_fn(
+                meta=_load_metadata(),
+                board=board,
+                selected_date=selected_date,
+                injury_file_used=injury_file_used,
+                schedule_max=schedule_max,
+                team_box_max=team_box_max,
+                rw_rows=rw_rows,
+                stale=stale,
             )
+    except Exception:
+        extra_html += ""
 
-    if "rw_spread_home" in b.columns:
-        sp = pd.to_numeric(b["rw_spread_home"], errors="coerce")
-        vt = []
-        for ht, at, v in zip(b["home_team"], b["away_team"], sp):
-            if pd.isna(v):
-                vt.append("")
-            elif abs(float(v)) < 1e-9:
-                vt.append("PK")
-            elif float(v) < 0:
-                vt.append(f"{ht} {float(v):.1f}")
-            else:
-                vt.append(f"{at} -{abs(float(v)):.1f}")
-        b["Vegas Spread"] = vt
-    else:
-        b["Vegas Spread"] = ""
+    try:
+        calib_fn = globals().get("_render_confidence_calibration_summary_html")
+        if callable(calib_fn):
+            extra_html += calib_fn()
+    except Exception:
+        extra_html += ""
 
-    b["ATS Edge"] = ""
-    b["ATS Pick"] = ""
-    b["ATS Bet"] = ""
-    b["ATS Result"] = ""
-    if {"pred_margin_home", "rw_spread_home", "home_team", "away_team"}.issubset(b.columns):
-        pm_num = pd.to_numeric(b["pred_margin_home"], errors="coerce")
-        sp_num = pd.to_numeric(b["rw_spread_home"], errors="coerce")
-        edge_num = pm_num + sp_num
-        b["ATS Edge"] = edge_num.map(lambda v: "" if pd.isna(v) else f"{float(v):+.1f}")
-        b["ATS Pick"] = [
-            "" if pd.isna(edge) or abs(float(edge)) < ats_threshold else (ht if float(edge) > 0 else at)
-            for edge, ht, at in zip(edge_num, b["home_team"], b["away_team"])
-        ]
-        b["ATS Bet"] = [
-            "" if pd.isna(edge) else ("YES" if abs(float(edge)) >= ats_threshold else "NO")
-            for edge in edge_num
-        ]
+    return warning_html + info_html + extra_html
 
-        cover_margin = hs_base + sp_num - aw_base
-        ats_result = []
-        for edge, cover, is_complete, is_future in zip(edge_num, cover_margin, completed_mask, is_future_game):
-            if pd.isna(edge) or abs(float(edge)) < ats_threshold:
-                ats_result.append("")
-            elif bool(is_future):
-                ats_result.append("LIVE")
-            elif not bool(is_complete) or pd.isna(cover):
-                ats_result.append("")
-            elif abs(float(cover)) < 1e-9:
-                ats_result.append("P")
-            elif (float(edge) > 0 and float(cover) > 0) or (float(edge) < 0 and float(cover) < 0):
-                ats_result.append("W")
-            else:
-                ats_result.append("L")
-        b["ATS Result"] = ats_result
-
-    if all(c in b.columns for c in ["rw_home_ml", "rw_away_ml"]):
-        hml = pd.to_numeric(b["rw_home_ml"], errors="coerce")
-        aml = pd.to_numeric(b["rw_away_ml"], errors="coerce")
-        mls = []
-
-        for ht, at, wp, hv, av in zip(
-            b["home_team"],
-            b["away_team"],
-            b.get("winner_pick", [""] * len(b)),
-            hml,
-            aml
-        ):
-            if str(wp) == str(ht) and pd.notna(hv):
-                hv = int(round(float(hv)))
-                mls.append(f"{ht} {'+' if hv > 0 else ''}{hv}")
-            elif str(wp) == str(at) and pd.notna(av):
-                av = int(round(float(av)))
-                mls.append(f"{at} {'+' if av > 0 else ''}{av}")
-            else:
-                mls.append("")
-        b["Vegas ML"] = mls
-    else:
-        b["Vegas ML"] = ""
-
-    # Model Spread + Pred_vs_Final
-    if "pred_margin_home" in b.columns:
-        pm = pd.to_numeric(b["pred_margin_home"], errors="coerce")
-        actual_margin = (hs_base - aw_base).where((~is_future_game) & completed_by_score, np.nan)
-
-        def _pred_vs_final_spread(pred_margin, actual_margin, actual_winner, home_team, away_team):
-            if pd.isna(pred_margin):
-                return ""
-            if pd.notna(actual_margin):
-                if float(pred_margin) == 0 or float(actual_margin) == 0:
-                    return "P"
-                return "W" if ((pred_margin > 0 and actual_margin > pred_margin) or
-                               (pred_margin < 0 and actual_margin < pred_margin)) else "L"
-            actual_key = canonical_team(actual_winner)
-            if not actual_key:
-                return ""
-            if abs(float(pred_margin)) < 1e-9:
-                return "P"
-            pred_winner_key = canonical_team(home_team if float(pred_margin) > 0 else away_team)
-            return "W" if pred_winner_key == actual_key else "L"
-
-        b["Pred_vs_Final"] = [
-            _pred_vs_final_spread(p, a, w, ht, at)
-            for p, a, w, ht, at in zip(pm, actual_margin, actual_winner_series, b["home_team"], b["away_team"])
-        ]
-
-        model_txt = []
-        for ht, at, v in zip(b["home_team"], b["away_team"], pm):
-            if pd.isna(v):
-                model_txt.append("")
-            elif abs(float(v)) < 1e-9:
-                model_txt.append("PK")
-            elif float(v) > 0:
-                model_txt.append(f"{ht} -{_fmt_spread_abs(v)}")
-            else:
-                model_txt.append(f"{at} -{_fmt_spread_abs(v)}")
-
-        def _col(txt, res):
-            if res == "W":
-                return f"<span style='color:#2ECC71;'>{txt}</span>"
-            if res == "L":
-                return f"<span style='color:#FF6B6B;'>{txt}</span>"
-            if res == "P":
-                return f"<span style='color:#FFD166;'>{txt}</span>"
-            return txt
-
-        b["Model Spread"] = [_col(t, r) for t, r in zip(model_txt, b["Pred_vs_Final"])]
-    else:
-        b["Model Spread"] = ""
-        b["Pred_vs_Final"] = ""
-
-    finals = []
-    if all(c in b.columns for c in ["home_score", "away_score"]):
-        hs = hs_base.copy()
-        aw = aw_base.copy()
-        real_final_mask = (~is_future_game) & completed_by_score
-
-        for ht, at, h, a, is_final in zip(b["home_team"], b["away_team"], hs, aw, real_final_mask):
-            if not is_final or pd.isna(h) or pd.isna(a):
-                finals.append("")
-                continue
-
-            h, a = float(h), float(a)
-            home_t = f"{ht} {_fmt_int_or_blank(h)}"
-            away_t = f"{at} {_fmt_int_or_blank(a)}"
-
-            if h > a:
-                finals.append(f"<div>{_win_style(home_t)}</div><div>{_lose_style(away_t)}</div>")
-            elif a > h:
-                finals.append(f"<div>{_lose_style(home_t)}</div><div>{_win_style(away_t)}</div>")
-            else:
-                finals.append(f"<div>{home_t}</div><div>{away_t}</div>")
-    else:
-        finals = [""] * len(b)
-
-    b["Final"] = finals
-
-    if {"winner_pick", "home_team", "away_team"}.issubset(b.columns):
-        winner_pick_canon = b["winner_pick"].astype(str).map(canonical_team)
-        actual_winner_canon = actual_winner_series.astype(str).map(canonical_team)
-        ml_correct = completed_mask & actual_winner_canon.ne("") & winner_pick_canon.eq(actual_winner_canon)
-        b["winner_pick"] = [
-            f"<span style='color:#2ECC71;font-weight:800;'>{txt}</span>" if ok else txt
-            for txt, ok in zip(b["winner_pick"], ml_correct)
-        ]
-
-    if show_inj.value and "home_injury_impact" in b.columns:
-        b["home_injury_impact"] = pd.to_numeric(b["home_injury_impact"], errors="coerce").map(
-            lambda v: f"{v:.0f}" if pd.notna(v) and float(v) > 0 else "-"
-        )
-        b["away_injury_impact"] = pd.to_numeric(b["away_injury_impact"], errors="coerce").map(
-            lambda v: f"{v:.0f}" if pd.notna(v) and float(v) > 0 else "-"
-        )
-    else:
-        b = b.drop(columns=["home_injury_impact", "away_injury_impact"], errors="ignore")
-            
-    if "rw_total" in b.columns:
-        b["rw_total"] = pd.to_numeric(b["rw_total"], errors="coerce").map(
-            lambda v: "" if pd.isna(v) else f"{float(v):.1f}"
-        )
-
-    rename = {
-        "game_dt_et": "Time",
-        "away_team": "Away",
-        "home_team": "Home",
-        "pick_conf": "Confidence",
-        "p_home_win": "Home Win%",
-        "winner_pick": "ML Pick",
-        "rw_total": "Total",
-        "home_injury_impact": "Home Inj",
-        "away_injury_impact": "Away Inj",
-    }
-
-    final_order = [
-        "game_dt_et", "away_team", "home_team",
-        "pick_conf", "p_home_win",
-        "Model Spread", "winner_pick",
-        "Vegas Spread", "ATS Edge", "ATS Pick", "ATS Bet", "ATS Result", "Vegas ML",
-        "Final", "Pred_vs_Final",
-        "rw_total",
-        "home_injury_impact", "away_injury_impact",
-    ]
-
-    b = b[[c for c in final_order if c in b.columns]]
-    b = b.rename(columns={k: v for k, v in rename.items() if k in b.columns})
-    return b
-
-
-def render_predictions_table(board: pd.DataFrame, max_rows: int) -> str:
-    return df_to_html_table(_format_board_for_display(board), max_rows=max_rows)
 
 def render_two_level_banner(season_acc: dict = None, season_label: str = "", daily_acc: dict = None, daily_label: str = "", note: str = "") -> tuple:
     season_html = ""
@@ -7904,86 +9431,6 @@ def render_tournament_status_banner(board: pd.DataFrame = None, manual_override:
     </div>"""
 
 
-def _current_dashboard_snapshot_html() -> str:
-    table_html = "<div style='color:#AAA; padding:12px;'>No current board is available yet.</div>"
-    rw_html = ""
-
-    if LAST_BOARD is not None and len(LAST_BOARD) > 0:
-        b2, _ = _get_filtered_board_cached(LAST_BOARD, LAST_DATE if LAST_DATE is not None else date_picker.value)
-        table_html = render_predictions_table(b2, int(max_rows.value))
-        if show_rw_missing.value:
-            miss = LAST_BOARD[LAST_BOARD.get("rw_missing_reason", pd.Series("", index=LAST_BOARD.index)).ne("")]
-            if len(miss):
-                rw_html = (
-                    f"<div style='color:#AAA; margin:0 0 8px 0;'>RW missing: {len(miss)} games</div>"
-                    + df_to_html_table(miss[["away_team", "home_team", "rw_missing_reason"]].head(20), max_rows=20)
-                )
-
-    return f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NCAA AI Dashboard</title>
-  <style>
-    html, body {{
-      margin: 0;
-      padding: 0;
-      background: #0b0b0b;
-      color: #eeeeee;
-      font-family: Arial, Helvetica, sans-serif;
-    }}
-    body {{
-      padding: 24px;
-    }}
-    .app-wrap {{
-      width: 100%;
-      max-width: 1800px;
-      margin: 0 auto;
-    }}
-    .app-title {{
-      font-size: 28px;
-      font-weight: 700;
-      margin: 0 0 18px 0;
-      color: #f5f5f5;
-    }}
-    table {{
-      border-collapse: collapse;
-      width: max-content;
-      min-width: 100%;
-      background: #111111;
-    }}
-    th, td {{
-      border: 1px solid #2a2a2a;
-      padding: 8px 10px;
-      vertical-align: top;
-      text-align: left;
-      white-space: nowrap;
-    }}
-    th {{
-      background: #1a1a1a;
-      color: #f0f0f0;
-      position: relative;
-    }}
-    .pred-table-wrap {{
-      overflow-x: auto;
-      margin-top: 10px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="app-wrap">
-    <div class="app-title">NCAA AI Dashboard</div>
-    {status_note_html.value}
-    {season_banner_html.value}
-    {daily_banner_html.value}
-    {tournament_banner_html.value}
-    {rw_html}
-    {table_html}
-  </div>
-</body>
-</html>"""
-
 
 def open_dashboard_clicked(_=None):
     html = _current_dashboard_snapshot_html()
@@ -8004,220 +9451,148 @@ def open_dashboard_clicked(_=None):
 
 
 
-# Helpers go above this line
-def refresh(_=None, force_rebuild=False):
-    global LAST_BOARD, LAST_DATE, SEASON_ACC, SEASON_ACC_DATE
+def _render_bracket_accuracy(_=None):
+    asof_date = bracket_asof_date.value or date_picker.value
+    payload = None
+    try:
+        payload = _load_cached_bracket_sim(_bracket_cache_signature(int(bracket_sim_n.value), asof_date))
+    except Exception:
+        payload = None
 
-    if force_rebuild:
-        FILTERED_BOARD_CACHE.clear()
-        HC_FILTER_CACHE.clear()
-        if LAST_DATE == date_picker.value:
-            LAST_BOARD = None
+    summary_df = payload.get("summary_df") if isinstance(payload, dict) else pd.DataFrame()
+    latest_run_df = payload.get("latest_run_df") if isinstance(payload, dict) else pd.DataFrame()
+    report = _build_bracket_accuracy_report(summary_df, latest_run_df, asof_date=asof_date)
+    if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
+        base_note = report.get("status_note", "")
+        extra_note = "Run the Bracket Sim tab for this as-of date and sim count to populate accuracy checks."
+        report["status_note"] = f"{base_note} {extra_note}".strip()
 
-    # build season snapshot once only
-    if SEASON_ACC is None:
-        try:
-            build_or_update_season_accuracy_cache()
-            SEASON_ACC = load_cached_season_accuracy_snapshot()
-        except Exception:
-            SEASON_ACC = load_cached_season_accuracy_snapshot()
-        if not SEASON_ACC:
-            SEASON_ACC = {}
-        SEASON_ACC_DATE = "Season-to-Date"
+    note = report.get("status_note", "")
+    if note:
+        bracket_acc_status_html.value = f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#CCC;'>{note}</div>"
+    else:
+        bracket_acc_status_html.value = ""
 
-    # blank initial render
-    season_html, daily_html = render_two_level_banner(
-        season_acc=SEASON_ACC,
-        season_label=SEASON_ACC_DATE,
-        daily_acc={},
-        daily_label=str(date_picker.value),
-        note=""
-    )
-    season_banner_html.value = season_html
-    daily_banner_html.value = daily_html
-    status_note_html.value = ""
-    tournament_banner_html.value = ""
-
-    if not _models_ready():
-        with out:
+    if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
+        with bracket_acc_out:
             clear_output(wait=True)
-            display(HTML("<div style='color:#AAA; padding:8px;'>Models are not loaded yet. Run retrain/startup initialization first.</div>"))
+            display(HTML("<div style='color:#AAA; padding:8px;'>Run the Bracket Sim tab first to populate accuracy checks.</div>"))
         return
 
-    _refresh_matchup_team_options()
-
-    # fast path
-    if (LAST_DATE == date_picker.value) and (LAST_BOARD is not None) and not force_rebuild:
-        with out:
-            clear_output(wait=True)
-
-            b2, _ = _get_filtered_board_cached(LAST_BOARD, date_picker.value)
-            warnings = _validate_board_like(b2, "Predictions")
-            filtered_acc = compute_daily_accuracy(b2)
-
-            note_html = data_status_note(
-                schedule_cur,
-                team_box_hist,
-                LAST_BOARD,
-                selected_date=date_picker.value
-            ) if "team_box_hist" in globals() else ""
-
-            season_html, daily_html = render_two_level_banner(
-                season_acc=SEASON_ACC,
-                season_label=SEASON_ACC_DATE,
-                daily_acc=filtered_acc,
-                daily_label=str(date_picker.value),
-                note=note_html
-            )
-
-            season_banner_html.value = season_html
-            daily_banner_html.value = daily_html
-            status_note_html.value = note_html
-            tournament_banner_html.value = render_tournament_status_banner(
-                LAST_BOARD,
-                manual_override=bool(tournament_mode.value),
-            )
-
-            warn_html = _warning_html("Predictions validation", warnings)
-            if warn_html:
-                display(HTML(warn_html))
-            display(HTML(render_predictions_table(b2, int(max_rows.value))))
-        _dashboard_log(
-            "predictions_render",
-            selected_date=str(date_picker.value),
-            games_processed=int(len(b2)),
-            odds_merged=bool("rw_spread_home" in LAST_BOARD.columns and pd.to_numeric(LAST_BOARD.get("rw_spread_home"), errors="coerce").notna().any()),
-            warnings=warnings,
-            cache_hit=True,
-        )
-        return
-
-    with out:
+    integrity = report.get("integrity_counts", {})
+    calib = report.get("calibration", {})
+    brier_txt = ""
+    log_loss_txt = ""
+    if "brier" in calib and pd.notna(calib.get("brier")):
+        brier_txt = f"{float(calib['brier']):.4f}"
+    if "log_loss" in calib and pd.notna(calib.get("log_loss")):
+        log_loss_txt = f"{float(calib['log_loss']):.4f}"
+    with bracket_acc_out:
         clear_output(wait=True)
-        display(HTML("<div style='color:#AAA; padding:8px;'>Building board...</div>"))
 
-    result, err = _safe_execute(
-        "predictions_build",
-        lambda: _get_board_for_date_cached(date_picker.value, force_rebuild=force_rebuild),
-    )
-    if err is not None:
-        with out:
-            clear_output(wait=True)
-            display(HTML(f"<div style='color:#ffb4b4;'>Board error: {err}</div>"))
-        return
-    board, cache_hit = result
+        display(HTML(
+            "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Simulation Integrity</div>"
+            f"<div style='color:#CFCFCF; margin-bottom:10px;'>"
+            f"Completed tournament games detected: <b>{integrity.get('completed_games', report.get('completed_games', 0))}</b>"
+            f" &nbsp;|&nbsp; Locked winners applied: <b>{integrity.get('locked_winners', report.get('locked_winners', 0))}</b>"
+            f" &nbsp;|&nbsp; Eliminated teams with future probability: <b>{integrity.get('eliminated_with_future_prob', 0)}</b>"
+            f" &nbsp;|&nbsp; Alive teams with impossible zero reached-round probability: <b>{integrity.get('alive_with_zero_reached_prob', 0)}</b>"
+            f" &nbsp;|&nbsp; Round probability consistency violations: <b>{integrity.get('round_probability_violations', 0)}</b>"
+            f"</div>"
+        ))
 
-    if board is None or len(board) == 0:
-        with out:
-            clear_output(wait=True)
-            display(HTML("<div style='color:#AAA;'>No games found for this date.</div>"))
-        return
-
-    LAST_BOARD = board
-    LAST_DATE = date_picker.value
-
-    b2, _ = _get_filtered_board_cached(board, date_picker.value)
-    warnings = _validate_board_like(b2, "Predictions")
-    filtered_acc = compute_daily_accuracy(b2)
-
-    note_html = data_status_note(
-        schedule_cur,
-        team_box_hist,
-        board,
-        selected_date=date_picker.value
-    ) if "team_box_hist" in globals() else ""
-
-    season_html, daily_html = render_two_level_banner(
-        season_acc=SEASON_ACC,
-        season_label=SEASON_ACC_DATE,
-        daily_acc=filtered_acc,
-        daily_label=str(date_picker.value),
-        note=note_html
-    )
-
-    season_banner_html.value = season_html
-    daily_banner_html.value = daily_html
-    status_note_html.value = note_html
-    tournament_banner_html.value = render_tournament_status_banner(
-        board,
-        manual_override=bool(tournament_mode.value),
-    )
-
-    with out:
-        clear_output(wait=True)
-        warn_html = _warning_html("Predictions validation", warnings)
-        if warn_html:
-            display(HTML(warn_html))
-        if show_rw_missing.value:
-            miss = board[board.get("rw_missing_reason", pd.Series("", index=board.index)).ne("")]
-            if len(miss):
-                display(HTML(f"<div style='color:#AAA;'>RW missing: {len(miss)} games</div>"))
-                display(miss[["away_team", "home_team", "rw_missing_reason"]].head(20))
-        display(HTML(render_predictions_table(b2, int(max_rows.value))))
-    _dashboard_log(
-        "predictions_render",
-        selected_date=str(date_picker.value),
-        games_processed=int(len(b2)),
-        odds_merged=bool("rw_spread_home" in board.columns and pd.to_numeric(board.get("rw_spread_home"), errors="coerce").notna().any()),
-        warnings=warnings,
-        cache_hit=bool(cache_hit),
-    )
-
-
-def _matchup_team_options():
-    schedule_df = globals().get("schedule_cur", pd.DataFrame())
-    snaps_df = globals().get("team_snaps", pd.DataFrame())
-    frames = []
-    if schedule_df is not None and len(schedule_df) > 0:
-        s = schedule_df.copy()
-        for id_col, candidates in [
-            ("home_id", ["home_team", "home_name", "home_display_name"]),
-            ("away_id", ["away_team", "away_name", "away_display_name"]),
+        for title, key in [
+            ("Eliminated But Still Showing Future Advancement", "eliminated"),
+            ("Alive But Zero In Already-Reached Rounds", "alive_zero"),
+            ("Round Probability Consistency Checks", "monotonic"),
         ]:
-            if id_col in s.columns:
-                x = pd.DataFrame({
-                    "team_id": s[id_col],
-                    "team_label": _safe_team_text_col(s, candidates, default="TBD"),
-                })
-                frames.append(x)
+            df = report.get("integrity_tables", {}).get(key, pd.DataFrame())
+            if df is not None and len(df) > 0:
+                display(HTML(f"<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>{title}</div>"))
+                display(HTML(df_to_html_table(df, max_rows=min(len(df), 20))))
 
-    if not frames:
-        return sorted(
-            [(name, tid) for tid, name in _build_id_team_name_map(schedule_df, snaps_df).items()],
-            key=lambda x: x[0]
-        )
+        display(HTML("<div style='color:#EEE; font-weight:700; margin:16px 0 8px 0;'>Simulation Accuracy / Calibration</div>"))
+        display(HTML(
+            f"<div style='color:#CFCFCF; margin-bottom:10px;'>"
+            f"Brier score: <b>{brier_txt}</b>"
+            f" &nbsp;|&nbsp; Log loss: <b>{log_loss_txt}</b>"
+            f"</div>"
+        ))
 
-    out = pd.concat(frames, ignore_index=True)
-    out["team_id"] = pd.to_numeric(out["team_id"], errors="coerce")
-    out["team_label"] = out["team_label"].astype(str).str.strip()
-    out = out.dropna(subset=["team_id"]).copy()
-    out = out[~out["team_label"].map(_bad_team_name)].copy()
-    out["team_id"] = out["team_id"].astype(int)
-    out = out.drop_duplicates(subset=["team_id"], keep="last")
-    return sorted([(row["team_label"], int(row["team_id"])) for _, row in out.iterrows()], key=lambda x: x[0])
+        buckets = calib.get("buckets", pd.DataFrame())
+        if buckets is not None and len(buckets) > 0:
+            buckets = buckets.rename(columns={"bucket": "Bucket", "AvgPred": "Avg Pred", "WinRate": "Win Rate"})
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Calibration Buckets</div>"))
+            display(HTML(df_to_html_table(buckets, max_rows=len(buckets))))
+
+        misses = calib.get("biggest_misses", pd.DataFrame())
+        if misses is not None and len(misses) > 0:
+            misses = misses.rename(columns={"away_team": "Away", "home_team": "Home", "winner_team": "Winner"})
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Biggest Misses / Upsets</div>"))
+            display(HTML(df_to_html_table(misses, max_rows=min(len(misses), 20))))
+
+        actual_vs_sim = calib.get("actual_vs_sim", pd.DataFrame())
+        if actual_vs_sim is not None and len(actual_vs_sim) > 0:
+            actual_vs_sim = actual_vs_sim.rename(columns={
+                "away_team": "Away",
+                "home_team": "Home",
+                "winner_team": "Winner",
+                "Pred Home Win%": "Pred Home",
+                "Pred Winner Win%": "Pred Winner",
+            })
+            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Actual Winners vs Simulated Win Probabilities</div>"))
+            display(HTML(df_to_html_table(actual_vs_sim, max_rows=min(len(actual_vs_sim), 30))))
 
 
-def _refresh_matchup_team_options():
-    if "matchup_team_a" not in globals() or "matchup_team_b" not in globals():
+
+def _on_filter_widget_change(change):
+    if change.get("name") != "value":
         return
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    refresh()
 
-    options = _matchup_team_options()
-    valid_ids = {int(val) for _, val in options} if options else set()
 
-    prev_a = globals()["matchup_team_a"].value
-    prev_b = globals()["matchup_team_b"].value
+def _on_date_change(change):
+    if change.get("name") != "value":
+        return
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    refresh()
 
-    globals()["matchup_team_a"].options = options
-    globals()["matchup_team_b"].options = options
 
-    globals()["matchup_team_a"].value = prev_a if prev_a in valid_ids else None
-    globals()["matchup_team_b"].value = prev_b if prev_b in valid_ids else None
+def _on_tournament_mode_change(change):
+    if change.get("name") != "value":
+        return
+    FILTERED_BOARD_CACHE.clear()
+    HC_FILTER_CACHE.clear()
+    refresh(force_rebuild=True)
 
-    if options and globals()["matchup_team_a"].value is None:
-        globals()["matchup_team_a"].value = options[0][1]
-    if options and globals()["matchup_team_b"].value is None:
-        fallback_b = next((val for _, val in options if val != globals()["matchup_team_a"].value), options[0][1])
-        globals()["matchup_team_b"].value = fallback_b
+
+def _latest_matchup_asof_date():
+    latest_dates = []
+    try:
+        ts = globals().get("team_snaps", pd.DataFrame())
+        if ts is not None and len(ts) > 0 and "game_dt_et" in ts.columns:
+            ts_dates = pd.to_datetime(ts.get("game_dt_et"), errors="coerce").dropna()
+            if len(ts_dates) > 0:
+                latest_dates.append(ts_dates.max())
+    except Exception:
+        pass
+    try:
+        sched = globals().get("schedule_cur", pd.DataFrame())
+        if sched is not None and len(sched) > 0 and "game_dt_et" in sched.columns:
+            sched_dates = pd.to_datetime(sched.get("game_dt_et"), errors="coerce").dropna()
+            if len(sched_dates) > 0:
+                latest_dates.append(sched_dates.max())
+    except Exception:
+        pass
+    if latest_dates:
+        return pd.Timestamp(max(latest_dates)).date()
+    try:
+        return pd.Timestamp(date_picker.value).date()
+    except Exception:
+        return pd.Timestamp.now(tz="America/New_York").date()
 
 
 def _team_snapshot_asof(team_id, date_et):
@@ -8236,13 +9611,6 @@ def _team_snapshot_asof(team_id, date_et):
 
 def _matchup_num(v):
     return pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
-
-
-def _display_plotly_figure(fig):
-    try:
-        display(fig)
-    except Exception:
-        display(HTML(pio.to_html(fig, full_html=False, include_plotlyjs="cdn")))
 
 
 def _elo_asof_value(team_id, date_et):
@@ -8274,80 +9642,16 @@ def _render_model_edge_breakdown(team_a_id, team_b_id, team_a_name, team_b_name,
         pred_margin = float(pred.get("pred_margin_team_a", 0.0))
         favored_margin = pred_margin if favored == "A" else -pred_margin
     except Exception:
-        favored = "A"
         favored_name = team_a_name
         favored_prob = np.nan
         favored_margin = np.nan
-
-    injury_map = {}
-    try:
-        inj = _load_injury_impact_for_date(date_et, INJURY_DIR)
-        if inj is not None and len(inj) > 0 and "team_canon" in inj.columns and "injury_impact_score" in inj.columns:
-            injury_map = (
-                inj[["team_canon", "injury_impact_score"]]
-                .dropna(subset=["team_canon"])
-                .drop_duplicates(subset=["team_canon"], keep="last")
-                .set_index("team_canon")["injury_impact_score"]
-                .to_dict()
-            )
-    except Exception:
-        injury_map = {}
-
-    team_a_canon = canonical_team(team_a_name)
-    team_b_canon = canonical_team(team_b_name)
-
-    metric_specs = [
-        {"label": "Shooting efficiency", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_field_goal_pct")), "b": _matchup_num(snap_b.get("r10_mean_field_goal_pct")), "weight": 1.35, "fmt": "{:+.1f}% FG"},
-        {"label": "3-point shooting", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_three_point_field_goal_pct")), "b": _matchup_num(snap_b.get("r10_mean_three_point_field_goal_pct")), "weight": 1.15, "fmt": "{:+.1f}% 3PT"},
-        {"label": "Free-throw shooting", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_free_throw_pct")), "b": _matchup_num(snap_b.get("r10_mean_free_throw_pct")), "weight": 0.75, "fmt": "{:+.1f}% FT"},
-        {"label": "Scoring output", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_points_for")), "b": _matchup_num(snap_b.get("r10_mean_points_for")), "weight": 1.05, "fmt": "{:+.1f} pts"},
-        {"label": "Defense", "kind": "lower", "a": _matchup_num(snap_a.get("r10_mean_points_against")), "b": _matchup_num(snap_b.get("r10_mean_points_against")), "weight": 1.30, "fmt": "{:+.1f} pts allowed"},
-        {"label": "Point differential", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_point_diff")), "b": _matchup_num(snap_b.get("r10_mean_point_diff")), "weight": 1.45, "fmt": "{:+.1f} diff"},
-        {"label": "Turnover edge", "kind": "lower", "a": _matchup_num(snap_a.get("r10_mean_turnovers")), "b": _matchup_num(snap_b.get("r10_mean_turnovers")), "weight": 1.00, "fmt": "{:+.1f} TO"},
-        {"label": "Rebounding", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_total_rebounds")), "b": _matchup_num(snap_b.get("r10_mean_total_rebounds")), "weight": 0.70, "fmt": "{:+.1f} reb"},
-        {"label": "Offensive rebounding", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_offensive_rebounds")), "b": _matchup_num(snap_b.get("r10_mean_offensive_rebounds")), "weight": 0.60, "fmt": "{:+.1f} OReb"},
-        {"label": "Steals", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_steals")), "b": _matchup_num(snap_b.get("r10_mean_steals")), "weight": 0.55, "fmt": "{:+.1f} stl"},
-        {"label": "Blocks", "kind": "higher", "a": _matchup_num(snap_a.get("r10_mean_blocks")), "b": _matchup_num(snap_b.get("r10_mean_blocks")), "weight": 0.45, "fmt": "{:+.1f} blk"},
-        {"label": "Rest advantage", "kind": "higher", "a": _matchup_num(snap_a.get("rest_days")), "b": _matchup_num(snap_b.get("rest_days")), "weight": 0.55, "fmt": "{:+.1f} days"},
-        {"label": "ELO rating", "kind": "higher", "a": _elo_asof_value(team_a_id, date_et), "b": _elo_asof_value(team_b_id, date_et), "weight": 0.018, "fmt": "{:+.0f} Elo"},
-        {"label": "Injury edge", "kind": "lower", "a": _matchup_num(injury_map.get(team_a_canon, 0.0)), "b": _matchup_num(injury_map.get(team_b_canon, 0.0)), "weight": 0.85, "fmt": "{:+.1f} injury load"},
-    ]
-
-    contributors = []
-    for spec in metric_specs:
-        a = _matchup_num(spec["a"])
-        b = _matchup_num(spec["b"])
-        if pd.isna(a) or pd.isna(b):
-            continue
-        delta_ab = float(a - b)
-        support_a = delta_ab if spec["kind"] == "higher" else -delta_ab
-        support_favored = support_a if favored == "A" else -support_a
-        if support_favored <= 0:
-            continue
-        favored_delta = delta_ab if favored == "A" else -delta_ab
-        contributors.append({
-            "label": spec["label"],
-            "weight": float(spec["weight"]),
-            "score": abs(float(support_favored)) * float(spec["weight"]),
-            "text": spec["fmt"].format(favored_delta),
-        })
-
-    contributors = sorted(contributors, key=lambda x: x["score"], reverse=True)[:5]
-    if contributors:
-        bullets = "".join(
-            f"<li style='margin:4px 0;'>+ {c['label']} ({c['text']})</li>"
-            for c in contributors
-        )
-    else:
-        bullets = "<li style='margin:4px 0;'>+ No strong single-feature edge; the matchup profiles are fairly balanced.</li>"
 
     prob_text = "" if pd.isna(favored_prob) else f" <span style='color:#AAA;'>(Win prob: {100.0 * favored_prob:.1f}%, proj margin: {favored_margin:+.1f})</span>"
     return (
         "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
         "background:#15191f; border-radius:8px;'>"
         "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Model Edge Breakdown</div>"
-        f"<div style='color:#CFCFCF; margin-bottom:6px;'><b>{favored_name}</b> is favored mainly because of:{prob_text}</div>"
-        f"<ul style='color:#D7D7D7; margin:0 0 0 16px; padding:0;'>{bullets}</ul>"
+        f"<div style='color:#CFCFCF;'>Lean: <b>{favored_name}</b>{prob_text}</div>"
         "</div>"
     )
 
@@ -8369,32 +9673,12 @@ def _render_matchup_injury_summary_html(team_a_name, team_b_name, date_et) -> st
 
     team_a_canon = canonical_team(team_a_name)
     team_b_canon = canonical_team(team_b_name)
-    cols = [c for c in ["team_canon", "injury_impact_score", "injury_count_out", "injury_count_q"] if c in inj.columns]
+    cols = [c for c in ["team_canon", "injury_impact_score", "injury_count_out"] if c in inj.columns]
     work = inj[cols].copy().drop_duplicates(subset=["team_canon"], keep="last").set_index("team_canon")
-
     a_impact = _matchup_num(work["injury_impact_score"].get(team_a_canon)) if "injury_impact_score" in work.columns else np.nan
     b_impact = _matchup_num(work["injury_impact_score"].get(team_b_canon)) if "injury_impact_score" in work.columns else np.nan
     a_out = _matchup_num(work["injury_count_out"].get(team_a_canon)) if "injury_count_out" in work.columns else np.nan
     b_out = _matchup_num(work["injury_count_out"].get(team_b_canon)) if "injury_count_out" in work.columns else np.nan
-
-    if pd.isna(a_impact) and pd.isna(b_impact) and pd.isna(a_out) and pd.isna(b_out):
-        return (
-            "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
-            "background:#15191f; border-radius:8px;'>"
-            "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Injury Summary</div>"
-            "<div style='color:#AAA;'>No injury data available for one or both teams.</div>"
-            "</div>"
-        )
-
-    edge_line = ""
-    if pd.notna(a_impact) and pd.notna(b_impact):
-        diff = float(b_impact) - float(a_impact)
-        if abs(diff) < 1e-9:
-            edge_line = "<div style='color:#CFCFCF; margin-top:6px;'>Injury Edge: Even</div>"
-        elif diff > 0:
-            edge_line = f"<div style='color:#CFCFCF; margin-top:6px;'>Injury Edge: {team_a_name} healthier by <b>{diff:.1f}</b></div>"
-        else:
-            edge_line = f"<div style='color:#CFCFCF; margin-top:6px;'>Injury Edge: {team_b_name} healthier by <b>{abs(diff):.1f}</b></div>"
 
     def _fmt_impact(v):
         return "" if pd.isna(v) else f"{float(v):.1f}"
@@ -8406,288 +9690,17 @@ def _render_matchup_injury_summary_html(team_a_name, team_b_name, date_et) -> st
         "<div style='margin:12px 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
         "background:#15191f; border-radius:8px;'>"
         "<div style='color:#EEE; font-weight:700; margin-bottom:6px;'>Injury Summary</div>"
-        f"<div style='color:#CFCFCF;'>{team_a_name}: <b>{_fmt_impact(a_impact)}</b> impact"
-        f" &nbsp;|&nbsp; Out: <b>{_fmt_out(a_out)}</b></div>"
-        f"<div style='color:#CFCFCF; margin-top:4px;'>{team_b_name}: <b>{_fmt_impact(b_impact)}</b> impact"
-        f" &nbsp;|&nbsp; Out: <b>{_fmt_out(b_out)}</b></div>"
-        f"{edge_line}"
+        f"<div style='color:#CFCFCF;'>{team_a_name}: <b>{_fmt_impact(a_impact)}</b> impact &nbsp;|&nbsp; Out: <b>{_fmt_out(a_out)}</b></div>"
+        f"<div style='color:#CFCFCF; margin-top:4px;'>{team_b_name}: <b>{_fmt_impact(b_impact)}</b> impact &nbsp;|&nbsp; Out: <b>{_fmt_out(b_out)}</b></div>"
         "</div>"
     )
 
 
-def _season_metric_normalize(metric_name, value, invert=False):
-    value = _matchup_num(value)
-    if pd.isna(value) or team_snaps is None or len(team_snaps) == 0:
-        return np.nan
-
-    if metric_name == "rest_days":
-        capped = float(np.clip(value, 0.0, 7.0))
-        norm = 100.0 * (capped / 7.0)
-        if invert:
-            norm = 100.0 - norm
-        return float(np.clip(norm, 0.0, 100.0))
-
-    pop = team_snaps.copy()
-    if "team_id" not in pop.columns:
-        return np.nan
-    pop["team_id"] = pd.to_numeric(pop.get("team_id"), errors="coerce")
-    if "game_dt_et" in pop.columns:
-        pop["game_dt_et"] = pd.to_datetime(pop.get("game_dt_et"), errors="coerce")
-        pop = pop.sort_values("game_dt_et")
-    pop = pop.dropna(subset=["team_id"]).copy()
-    pop["team_id"] = pop["team_id"].astype(int)
-    pop = pop.drop_duplicates(subset=["team_id"], keep="last")
-
-    if metric_name == "r10_mean_point_diff":
-        pf = pd.to_numeric(pop.get("r10_mean_points_for"), errors="coerce")
-        pa = pd.to_numeric(pop.get("r10_mean_points_against"), errors="coerce")
-        series = pf - pa
-    else:
-        if metric_name not in pop.columns:
-            return np.nan
-        series = pd.to_numeric(pop.get(metric_name), errors="coerce")
-
-    series = series.dropna()
-    if len(series) < 2:
-        return np.nan
-
-    lo = float(series.min())
-    hi = float(series.max())
-    if hi <= lo:
-        return 50.0
-
-    norm = 100.0 * ((float(value) - lo) / (hi - lo))
-    if invert:
-        norm = 100.0 - norm
-    return float(np.clip(norm, 0.0, 100.0))
-
-
-matchup_team_a = widgets.Dropdown(description="Team A", options=_matchup_team_options())
-matchup_team_b = widgets.Dropdown(description="Team B", options=_matchup_team_options())
-matchup_date_picker = widgets.DatePicker(description="Slate (ET):")
-matchup_date_picker.value = date_picker.value
-compare_btn = widgets.Button(description="Compare", button_style="primary")
-matchup_out = widgets.Output()
-matchup_radar_out = widgets.Output(layout=widgets.Layout(width="100%", min_height="380px", overflow="hidden"))
-matchup_snapshot_out = widgets.Output()
-matchup_radar_title = widgets.HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Head-to-Head Radar</div>")
-matchup_radar_section = widgets.VBox(
-    [matchup_radar_title, matchup_radar_out],
-    layout=widgets.Layout(display="none", width="100%"),
-)
-_MATCHUP_RADAR_STATE = {"fig": None, "summary_html": "", "empty_html": ""}
-
-bracket_sim_n = widgets.IntText(description="Sims", value=1000)
-bracket_asof_date = widgets.DatePicker(description="As-of (ET):")
-bracket_asof_date.value = date_picker.value
-run_bracket_btn = widgets.Button(description="Run Simulation", button_style="primary")
-bracket_status_html = widgets.HTML()
-bracket_summary_html = widgets.HTML()
-bracket_out = widgets.Output()
-refresh_bracket_acc_btn = widgets.Button(description="Refresh Accuracy")
-bracket_acc_status_html = widgets.HTML()
-bracket_acc_out = widgets.Output()
-
-
-def _legacy_render_matchup(_=None):
-    with matchup_out:
-        clear_output(wait=True)
-
-        if matchup_team_a.value is None or matchup_team_b.value is None:
-            display(HTML("<div style='color:#AAA;'>Select two teams to compare.</div>"))
-            return
-        if matchup_team_a.value == matchup_team_b.value:
-            display(HTML("<div style='color:#ffb4b4;'>Choose two different teams.</div>"))
-            return
-
-        snap_a = _team_snapshot_asof(matchup_team_a.value, matchup_date_picker.value)
-        snap_b = _team_snapshot_asof(matchup_team_b.value, matchup_date_picker.value)
-        if len(snap_a) == 0 or len(snap_b) == 0:
-            display(HTML("<div style='color:#AAA;'>No team profile data available for one or both teams on that date.</div>"))
-            return
-
-        team_a_name = next((label for label, val in matchup_team_a.options if val == matchup_team_a.value), str(matchup_team_a.value))
-        team_b_name = next((label for label, val in matchup_team_b.options if val == matchup_team_b.value), str(matchup_team_b.value))
-        metric_specs = [
-            ("r10_mean_points_for", "Points For (Last 10)", False),
-            ("r10_mean_points_against", "Points Against (Last 10)", True),
-            ("r10_mean_point_diff", "Point Diff (Last 10)", False),
-            ("r10_mean_field_goal_pct", "FG%", False),
-            ("r10_mean_three_point_field_goal_pct", "3PT%", False),
-            ("r10_mean_free_throw_pct", "FT%", False),
-            ("r10_mean_total_rebounds", "Total Rebounds", False),
-            ("r10_mean_offensive_rebounds", "Offensive Rebounds", False),
-            ("r10_mean_steals", "Steals", False),
-            ("r10_mean_blocks", "Blocks", False),
-            ("r10_mean_turnovers", "Turnovers", True),
-            ("rest_days", "Rest Days", False),
-            ("r10_gp", "Games In Window", False),
-        ]
-        rows = []
-        radar_theta = []
-        radar_a = []
-        radar_b = []
-        for c, label, invert in metric_specs:
-            va = _matchup_num(snap_a.get(c))
-            vb = _matchup_num(snap_b.get(c))
-            if c == "r10_mean_point_diff" and (pd.isna(va) or pd.isna(vb)):
-                va_pf = _matchup_num(snap_a.get("r10_mean_points_for"))
-                vb_pf = _matchup_num(snap_b.get("r10_mean_points_for"))
-                va_pa = _matchup_num(snap_a.get("r10_mean_points_against"))
-                vb_pa = _matchup_num(snap_b.get("r10_mean_points_against"))
-                va = va_pf - va_pa if pd.notna(va_pf) and pd.notna(va_pa) else np.nan
-                vb = vb_pf - vb_pa if pd.notna(vb_pf) and pd.notna(vb_pa) else np.nan
-            if pd.isna(va) and pd.isna(vb):
-                continue
-            rows.append({
-                "Metric": label,
-                team_a_name: "" if pd.isna(va) else f"{float(va):.2f}",
-                team_b_name: "" if pd.isna(vb) else f"{float(vb):.2f}",
-            })
-            na = _season_metric_normalize(c, va, invert=invert)
-            nb = _season_metric_normalize(c, vb, invert=invert)
-            if pd.notna(na) and pd.notna(nb):
-                radar_theta.append(label)
-                radar_a.append(float(na))
-                radar_b.append(float(nb))
-
-        display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Team Profile Comparison</div>"))
-        display(HTML(df_to_html_table(pd.DataFrame(rows), max_rows=max(10, len(rows)))))
-        display(HTML(_render_model_edge_breakdown(
-            matchup_team_a.value,
-            matchup_team_b.value,
-            team_a_name,
-            team_b_name,
-            snap_a,
-            snap_b,
-            matchup_date_picker.value,
-        )))
-        display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Head-to-Head Radar</div>"))
-        display(matchup_radar_out)
-
-    with matchup_radar_out:
-        clear_output(wait=True)
-        if radar_theta:
-            try:
-                import plotly.graph_objects as go
-
-                clean_theta = []
-                clean_a = []
-                clean_b = []
-                edge_vals = []
-                for theta, va, vb in zip(radar_theta, radar_a, radar_b):
-                    va = _matchup_num(va)
-                    vb = _matchup_num(vb)
-                    if pd.isna(va) or pd.isna(vb) or not np.isfinite(float(va)) or not np.isfinite(float(vb)):
-                        continue
-                    clean_theta.append(theta)
-                    clean_a.append(float(va))
-                    clean_b.append(float(vb))
-                    edge_vals.append(float(va) - float(vb))
-
-                if len(clean_theta) >= 3:
-                    edge_arr = np.asarray(edge_vals, dtype=float)
-                    mean_abs_edge = float(np.nanmean(np.abs(edge_arr))) if len(edge_arr) else 0.0
-                    edge_strength = float(np.clip(mean_abs_edge / 12.0, 0.0, 1.0))
-                    a_wins = int((edge_arr > 0).sum())
-                    b_wins = int((edge_arr < 0).sum())
-                    ties = int((edge_arr == 0).sum())
-                    a_fill = 0.16 + (0.18 * edge_strength)
-                    b_fill = 0.12 + (0.14 * edge_strength)
-                    a_color = f"rgba(46, 204, 113, {0.88 if a_wins >= b_wins else 0.68})"
-                    b_color = f"rgba(231, 76, 60, {0.88 if b_wins > a_wins else 0.68})"
-                    a_fill_color = f"rgba(46, 204, 113, {a_fill:.3f})"
-                    b_fill_color = f"rgba(231, 76, 60, {b_fill:.3f})"
-
-                    display(HTML(
-                        "<div style='margin:0 0 10px 0; padding:10px 12px; border:1px solid #2f3640; "
-                        "background:#15191f; border-radius:8px;'>"
-                        "<div style='color:#EEE; font-weight:700; margin-bottom:4px;'>Edge Summary</div>"
-                        f"<div style='color:#CFCFCF;'>{team_a_name}: <b>{a_wins}</b> metrics"
-                        f" &nbsp;|&nbsp; {team_b_name}: <b>{b_wins}</b> metrics"
-                        f"{'' if not ties else f' &nbsp;|&nbsp; Ties: <b>{ties}</b>'}"
-                        f" &nbsp;|&nbsp; Avg edge magnitude: <b>{mean_abs_edge:.1f}</b></div>"
-                        "</div>"
-                    ))
-
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatterpolar(
-                        r=clean_a + [clean_a[0]],
-                        theta=clean_theta + [clean_theta[0]],
-                        fill="toself",
-                        name=team_a_name,
-                        line=dict(color=a_color, width=3),
-                        fillcolor=a_fill_color,
-                    ))
-                    fig.add_trace(go.Scatterpolar(
-                        r=clean_b + [clean_b[0]],
-                        theta=clean_theta + [clean_theta[0]],
-                        fill="toself",
-                        name=team_b_name,
-                        line=dict(color=b_color, width=3),
-                        fillcolor=b_fill_color,
-                    ))
-                    fig.update_layout(
-                        title="Head-to-Head Radar",
-                        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-                        showlegend=True,
-                        margin=dict(l=40, r=40, t=60, b=40),
-                        height=520,
-                    )
-                    _display_plotly_figure(fig)
-                else:
-                    display(HTML("<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Not enough matchup metrics are available to draw a radar chart.</div>"))
-            except ImportError:
-                display(HTML("<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Plotly is not available, so the radar chart could not be rendered.</div>"))
-            except Exception as e:
-                display(HTML(f"<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Radar chart rendering failed: {e}</div>"))
-        else:
-            display(HTML("<div style='color:#AAA; min-height:520px; display:flex; align-items:center;'>Not enough matchup metrics are available to draw a radar chart.</div>"))
-
-    with matchup_out:
-        try:
-            if LAST_BOARD is not None and LAST_DATE == matchup_date_picker.value:
-                board = LAST_BOARD.copy()
-            else:
-                board = build_board_for_date(
-                    date_et=matchup_date_picker.value,
-                    schedule_df=schedule_cur,
-                    team_snaps=team_snaps,
-                    roll_cols=roll_cols,
-                    spread_booster=spread_booster,
-                    winner_booster=winner_booster,
-                    lgb_spread=lgb_spread,
-                    iso=iso,
-                    imp=imp,
-                    feature_cols=feature_cols,
-                    spread_edge_booster=spread_edge_booster if "spread_edge_booster" in globals() else None,
-                    lgb_spread_edge=lgb_spread_edge if "lgb_spread_edge" in globals() else None,
-                    elo_snap=elo_snap,
-                )
-                if board is not None and len(board) > 0:
-                    board = _attach_rotowire_to_board(board, matchup_date_picker.value)
-        except Exception as e:
-            display(HTML(f"<div style='color:#ffb4b4;'>Matchup prediction error: {e}</div>"))
-            return
-
-        if board is None or len(board) == 0:
-            display(HTML("<div style='color:#AAA; margin-top:8px;'>No board rows found for that slate date.</div>"))
-            return
-
-        a_id = int(matchup_team_a.value)
-        b_id = int(matchup_team_b.value)
-        pair_mask = (
-            (pd.to_numeric(board.get("home_id"), errors="coerce") == a_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == b_id)
-        ) | (
-            (pd.to_numeric(board.get("home_id"), errors="coerce") == b_id) & (pd.to_numeric(board.get("away_id"), errors="coerce") == a_id)
-        )
-        snap_board = board.loc[pair_mask].copy()
-
-        if len(snap_board):
-            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
-            display(HTML(render_predictions_table(snap_board, len(snap_board))))
-        else:
-            display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
+def _display_plotly_figure(fig):
+    try:
+        display(fig)
+    except Exception:
+        display(HTML(pio.to_html(fig, full_html=False, include_plotlyjs="cdn")))
 
 
 def _render_persisted_matchup_radar():
@@ -8720,6 +9733,8 @@ def render_matchup(_=None):
         clear_output(wait=True)
     _set_matchup_radar_state(fig=None, summary_html="", empty_html="")
 
+    latest_asof = _latest_matchup_asof_date()
+
     with matchup_out:
         if matchup_team_a.value is None or matchup_team_b.value is None:
             display(HTML("<div style='color:#AAA;'>Select two teams to compare.</div>"))
@@ -8728,14 +9743,15 @@ def render_matchup(_=None):
             display(HTML("<div style='color:#ffb4b4;'>Choose two different teams.</div>"))
             return
 
-        snap_a = _team_snapshot_asof(matchup_team_a.value, matchup_date_picker.value)
-        snap_b = _team_snapshot_asof(matchup_team_b.value, matchup_date_picker.value)
+        snap_a = _team_snapshot_asof(matchup_team_a.value, latest_asof)
+        snap_b = _team_snapshot_asof(matchup_team_b.value, latest_asof)
         if len(snap_a) == 0 or len(snap_b) == 0:
-            display(HTML("<div style='color:#AAA;'>No team profile data available for one or both teams on that date.</div>"))
+            display(HTML("<div style='color:#AAA;'>No latest team profile data is available for one or both teams.</div>"))
             return
 
         team_a_name = next((label for label, val in matchup_team_a.options if val == matchup_team_a.value), str(matchup_team_a.value))
         team_b_name = next((label for label, val in matchup_team_b.options if val == matchup_team_b.value), str(matchup_team_b.value))
+        display(HTML(f"<div style='color:#9AA4B2; margin:0 0 8px 0;'>Using latest available team data through <b>{latest_asof}</b>.</div>"))
         metric_specs = [
             ("r10_mean_points_for", "Points For (Last 10)", False),
             ("r10_mean_points_against", "Points Against (Last 10)", True),
@@ -8788,12 +9804,12 @@ def render_matchup(_=None):
             team_b_name,
             snap_a,
             snap_b,
-            matchup_date_picker.value,
+            latest_asof,
         )))
         display(HTML(_render_matchup_injury_summary_html(
             team_a_name,
             team_b_name,
-            matchup_date_picker.value,
+            latest_asof,
         )))
 
     fig = None
@@ -8881,7 +9897,7 @@ def render_matchup(_=None):
         clear_output(wait=True)
         result, err = _safe_execute(
             "matchup_board",
-            lambda: _get_board_for_date_cached(matchup_date_picker.value, force_rebuild=False),
+            lambda: _get_board_for_date_cached(latest_asof, force_rebuild=False),
         )
         if err is not None:
             display(HTML(f"<div style='color:#ffb4b4;'>Matchup prediction error: {err}</div>"))
@@ -8889,12 +9905,12 @@ def render_matchup(_=None):
         board, board_cache_hit = result
 
         if board is None or len(board) == 0:
-            display(HTML("<div style='color:#AAA; margin-top:8px;'>No board rows found for that slate date.</div>"))
+            display(HTML("<div style='color:#AAA; margin-top:8px;'>No board rows found for the latest available slate.</div>"))
             return
 
         a_id = int(matchup_team_a.value)
         b_id = int(matchup_team_b.value)
-        snap_board, snapshot_cache_hit = _get_matchup_snapshot_cached(board, a_id, b_id, matchup_date_picker.value)
+        snap_board, snapshot_cache_hit = _get_matchup_snapshot_cached(board, a_id, b_id, latest_asof)
         warnings = _validate_board_like(snap_board, "Matchup Snapshot")
 
         if len(snap_board):
@@ -8904,10 +9920,10 @@ def render_matchup(_=None):
             display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Slate Prediction Snapshot</div>"))
             display(HTML(render_predictions_table(snap_board, len(snap_board))))
         else:
-            display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the selected slate.</div>"))
+            display(HTML("<div style='color:#AAA; margin-top:8px;'>These teams are not matched on the latest available slate, so only the profile comparison is shown.</div>"))
         _dashboard_log(
             "matchup_render",
-            selected_date=str(matchup_date_picker.value),
+            selected_date=str(latest_asof),
             games_processed=int(len(snap_board)),
             odds_merged=bool("rw_spread_home" in board.columns and pd.to_numeric(board.get("rw_spread_home"), errors="coerce").notna().any()),
             warnings=warnings,
@@ -8915,2860 +9931,42 @@ def render_matchup(_=None):
             snapshot_cache_hit=bool(snapshot_cache_hit),
         )
 
-# ============================================================
-# BRACKET SIMULATOR: PATCH 1
-# ============================================================
-BRACKET_WORKBOOK_PATH = r"G:\My Drive\NCAABB\bracket\2026Bracket_rebuilt_sim_ready.xlsx"
-BRACKET_OUTPUT_DIR = os.path.dirname(BRACKET_WORKBOOK_PATH)
-BRACKET_CACHE_PATH = os.path.join(BRACKET_OUTPUT_DIR, "2026_bracket_sim_cache.pkl")
-BRACKET_SUMMARY_CSV = os.path.join(BRACKET_OUTPUT_DIR, "2026_bracket_sim_summary.csv")
-BRACKET_SIM_LOGIC_VERSION = "2026-03-27-later-round-workbook-locks-v5-faster-aggregation"
 
-_BRACKET_MATCHUP_CACHE = {}
-_BRACKET_TEAM_SNAPSHOT_CACHE = {}
 
-BRACKET_TEAM_ALIASES = {
-    "ohio st": "ohio state",
-    "michigan st": "michigan state",
-    "iowa st": "iowa state",
-    "north dakota st": "north dakota state",
-    "wright st": "wright state",
-    "utah st": "utah state",
-    "kennesaw st": "kennesaw state",
-    "uconn": "connecticut",
-    "ucf": "central florida",
-    "umbc": "maryland-baltimore county",
-    "long island": "liu brooklyn",
-    "saint mary's": "saint marys",
-    "saint marys": "saint marys",
-    "st mary's": "saint marys",
-    "st marys": "saint marys",
-    "cal baptist": "california baptist",
-    "penn": "pennsylvania",
-    "mcneese": "mcneese state",
-    "byu": "brigham young",
-    "miami ohio": "miami oh",
-    "miami (ohio)": "miami oh",
-    "miami fl": "miami",
-    "miami (fl)": "miami",
-    "miami florida": "miami",
-    "prairie view a&m": "prairie view",
-    "prairie view a and m": "prairie view",
-    "prairie view am": "prairie view",
-    "queens (n.c.)": "queens",
-    "queens (nc)": "queens",
-    "queens nc": "queens",
-}
-
-BRACKET_REQUIRED_SHEETS = ("First_Round", "First_Four", "Structure")
-BRACKET_OPTIONAL_SHEETS = ("Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship")
-BRACKET_SHEET_SCHEMA = {
-    "First_Round": {
-        "required": {
-            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-        },
-        "optional": {
-            "game_number": ("Game Number",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "region_code": ("Region Code",),
-            "round_name": ("Round",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "Second_Round": {
-        "required": {
-            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
-        },
-        "optional": {
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-            "game_number": ("Game Number",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "region_code": ("Region Code",),
-            "round_name": ("Round",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "Sweet_16": {
-        "required": {
-            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
-        },
-        "optional": {
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-            "game_number": ("Game Number",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "region_code": ("Region Code",),
-            "round_name": ("Round",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "Elite_8": {
-        "required": {
-            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
-        },
-        "optional": {
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-            "game_number": ("Game Number",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "region_code": ("Region Code",),
-            "round_name": ("Round",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "Final_Four": {
-        "required": {
-            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
-        },
-        "optional": {
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-            "game_number": ("Game Number",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "region_code": ("Region Code",),
-            "round_name": ("Round",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "Championship": {
-        "required": {
-            "game_key": ("Game Slot", "Game", "Game_ID", "Slot"),
-        },
-        "optional": {
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-            "game_number": ("Game Number",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "region_code": ("Region Code",),
-            "round_name": ("Round",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "First_Four": {
-        "required": {
-            "game_key": ("Play-In Slot", "Game", "Game_ID", "Slot"),
-            "team1_raw": ("Team A", "Team1", "Away_Team"),
-            "team2_raw": ("Team B", "Team2", "Home_Team"),
-        },
-        "optional": {
-            "description": ("Description",),
-            "seed1": ("Seed A", "Seed1", "Away_Seed"),
-            "seed2": ("Seed B", "Seed2", "Home_Seed"),
-            "region": ("Bracket Region", "Region"),
-            "round_name": ("Round",),
-            "feeds_into_slot": ("Feeds Into Round 1 Slot",),
-            "winner_raw": ("Winner",),
-        },
-    },
-    "Structure": {
-        "required": {
-            "source_game": ("From Slot", "Source_Game", "Winner_Of"),
-            "dest_game": ("To Slot", "Dest_Game", "Next_Game"),
-            "carry": ("Carry", "Dest_Slot", "Winner_Slot"),
-        },
-        "optional": {
-            "region": ("Bracket Region", "Region"),
-            "from_round": ("From Round",),
-            "dest_round": ("To Round", "Dest_Round", "Round"),
-        },
-    },
-}
-
-
-def _get_bracket_workbook_path() -> str:
-    return os.environ.get("NCAABB_BRACKET_PATH", BRACKET_WORKBOOK_PATH)
-
-
-def _resolve_bracket_sheet_names(sheets_dict: dict) -> dict:
-    if not isinstance(sheets_dict, dict):
-        return {}
-    raw_map = {str(k): v for k, v in sheets_dict.items()}
-    key_map = {_normalize_bracket_key(k): k for k in raw_map.keys()}
-    alias_map = {
-        "Final_Four": ("Final_4", "Final Four", "F4"),
-        "Championship": ("Finals", "Final", "Title", "Title_Game"),
-    }
-    resolved = {}
-    for sheet_name in list(BRACKET_REQUIRED_SHEETS) + list(BRACKET_OPTIONAL_SHEETS):
-        direct = raw_map.get(sheet_name)
-        if direct is not None:
-            resolved[sheet_name] = direct
-            continue
-        alt_key = _normalize_bracket_key(sheet_name)
-        if alt_key in key_map:
-            resolved[sheet_name] = raw_map[key_map[alt_key]]
-            continue
-        for alias in alias_map.get(sheet_name, ()):
-            alias_key = _normalize_bracket_key(alias)
-            if alias_key in key_map:
-                resolved[sheet_name] = raw_map[key_map[alias_key]]
-                break
-    return resolved
-
-
-def _bracket_file_signature(path: str) -> dict:
-    if not path or not os.path.exists(path):
-        return {}
-    st = os.stat(path)
-    return {
-        "path": os.path.abspath(path),
-        "size": int(st.st_size),
-        "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
-    }
-
-
-def _bracket_lock_state_signature() -> list:
-    try:
-        bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
-    except Exception:
-        return []
-    if errors:
-        return []
-    rows = []
-    for sheet_name in ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"]:
-        df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
-        if df is None or len(df) == 0 or "winner_raw" not in df.columns:
-            continue
-        df["winner_raw"] = df["winner_raw"].map(_clean_bracket_text)
-        df["game_key"] = df.get("game_key", pd.Series("", index=df.index)).astype(str).str.strip()
-        df = df[df["winner_raw"].astype(str).str.strip().ne("")].copy()
-        if len(df) == 0:
-            continue
-        rows.extend([
-            {
-                "sheet": sheet_name,
-                "game_key": str(row.get("game_key", "")).strip(),
-                "winner": str(row.get("winner_raw", "")).strip(),
-            }
-            for _, row in df.sort_values("game_key").iterrows()
-        ])
-    return rows
-
-
-def _normalize_bracket_key(x) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
-
-
-def _clean_bracket_text(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def _bracket_team_canon(name: str) -> str:
-    raw = str(name or "").strip()
-    canon = canonical_team(raw)
-    alias = BRACKET_TEAM_ALIASES.get(canon, canon)
-    return canonical_team(alias)
-
-
-def _bracket_team_norm_key(name: str) -> str:
-    return _normalize_bracket_key(str(name or "").strip())
-
-
-def _is_bracket_composite_placeholder(raw_name: str) -> bool:
-    txt = str(raw_name or "").strip()
-    return "/" in txt and len([p for p in re.split(r"\s*/\s*", txt) if p.strip()]) >= 2
-
-
-def _valid_first_four_placeholder_slots(bracket_data: dict) -> set:
-    ff = bracket_data.get("First_Four", pd.DataFrame())
-    if ff is None or len(ff) == 0 or "feeds_into_slot_norm" not in ff.columns:
-        return set()
-    return set(ff["feeds_into_slot_norm"].dropna().astype(str))
-
-
-def _split_bracket_composite_placeholder(raw_name: str) -> list:
-    return [p.strip() for p in re.split(r"\s*/\s*", str(raw_name or "").strip()) if p.strip()]
-
-
-def _valid_first_four_placeholder_pairs(bracket_data: dict) -> dict:
-    ff = bracket_data.get("First_Four", pd.DataFrame())
-    if ff is None or len(ff) == 0:
-        return {}
-    out = {}
-    for _, row in ff.iterrows():
-        dest = str(row.get("feeds_into_slot_norm", "")).strip()
-        if not dest:
-            continue
-        pair = tuple(sorted([
-            _bracket_team_canon(row.get("team1_raw", "")),
-            _bracket_team_canon(row.get("team2_raw", "")),
-        ]))
-        out[dest] = pair
-    return out
-
-
-def _normalize_round_name(name: str) -> str:
-    txt = str(name or "").strip().lower()
-    if "first four" in txt or "play-in" in txt:
-        return "First_Four"
-    if txt in {"ff", "firstfour"}:
-        return "First_Four"
-    if "first round" in txt or "round of 64" in txt:
-        return "First_Round"
-    if txt in {"r64", "rd64"}:
-        return "First_Round"
-    if "second round" in txt or "round of 32" in txt:
-        return "Second_Round"
-    if txt in {"r32", "rd32"}:
-        return "Second_Round"
-    if "sweet 16" in txt or "sweet sixteen" in txt or "regional semifinal" in txt:
-        return "Sweet_16"
-    if txt in {"s16", "sw16"}:
-        return "Sweet_16"
-    if "elite 8" in txt or "elite eight" in txt or "regional final" in txt:
-        return "Elite_8"
-    if txt in {"e8", "el8"}:
-        return "Elite_8"
-    if "final four" in txt or "national semifinal" in txt:
-        return "Final_Four"
-    if txt in {"f4", "ffour"}:
-        return "Final_Four"
-    if "finals" in txt:
-        return "Championship"
-    if "championship" in txt or "title game" in txt:
-        return "Championship"
-    if txt in {"title", "final", "f2"}:
-        return "Championship"
-    return str(name).strip() if str(name).strip() else ""
-
-
-def _next_advancement_bucket(round_name: str) -> str:
-    order = {
-        "First_Four": "First_Round",
-        "First_Round": "Second_Round",
-        "Second_Round": "Sweet_16",
-        "Sweet_16": "Elite_8",
-        "Elite_8": "Final_Four",
-        "Final_Four": "Championship",
-        "Championship": "Champion",
-    }
-    return order.get(str(round_name).strip(), "")
-
-
-def _normalize_bracket_slot_position(value):
-    txt = str(value or "").strip().lower()
-    if txt in {"1", "a", "team a", "top", "left", "away"}:
-        return 1
-    if txt in {"2", "b", "team b", "bottom", "right", "home"}:
-        return 2
-    return np.nan
-
-
-def _infer_workbook_slot_participants(bracket_data: dict, game_key_norm: str, team_lookup: dict) -> list:
-    structure = bracket_data.get("Structure", pd.DataFrame())
-    if structure is None or len(structure) == 0:
-        return []
-    dest_key = str(game_key_norm or "").strip()
-    if not dest_key:
-        return []
-
-    participants = []
-    seen_ids = set()
-    incoming = structure.loc[structure.get("dest_game_norm", pd.Series("", index=structure.index)).astype(str).eq(dest_key)].copy()
-    if len(incoming) == 0:
-        return []
-
-    source_frames = []
-    for sheet_name in ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four"]:
-        df = bracket_data.get(sheet_name, pd.DataFrame())
-        if df is not None and len(df) > 0:
-            source_frames.append(df.copy())
-    if not source_frames:
-        return []
-    source_games = pd.concat(source_frames, ignore_index=True, sort=False)
-    if "game_key_norm" not in source_games.columns:
-        return []
-
-    for _, edge in incoming.iterrows():
-        src_key = str(edge.get("source_game_norm", "") or "").strip()
-        if not src_key:
-            continue
-        src = source_games.loc[source_games["game_key_norm"].astype(str).eq(src_key)].copy()
-        if len(src) == 0:
-            continue
-        row = src.iloc[-1]
-        winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
-        if not winner_raw:
-            continue
-        winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
-        if winner is None:
-            continue
-        tid = int(winner["team_id"])
-        if tid in seen_ids:
-            continue
-        team = dict(winner)
-        raw1 = str(row.get("team1_raw", "") or "").strip()
-        raw2 = str(row.get("team2_raw", "") or "").strip()
-        if _bracket_team_canon(winner_raw) == _bracket_team_canon(raw1) and pd.notna(row.get("seed1")):
-            team["seed"] = str(row.get("seed1")).strip()
-        elif _bracket_team_canon(winner_raw) == _bracket_team_canon(raw2) and pd.notna(row.get("seed2")):
-            team["seed"] = str(row.get("seed2")).strip()
-        if pd.notna(row.get("region")):
-            team["region"] = str(row.get("region") or "").strip()
-        participants.append(team)
-        seen_ids.add(tid)
-    return participants
-
-
-def _should_infer_later_round_participants(
-    team1_raw: str,
-    team2_raw: str,
-    team_lookup: dict,
-    winner_raw: str = "",
-) -> bool:
-    team1_raw = str(team1_raw or "").strip()
-    team2_raw = str(team2_raw or "").strip()
-    winner_key = _bracket_team_canon(winner_raw)
-    pair_keys = {_bracket_team_canon(team1_raw), _bracket_team_canon(team2_raw)} - {""}
-    if not team1_raw or not team2_raw:
-        return True
-    if _is_bracket_composite_placeholder(team1_raw) or _is_bracket_composite_placeholder(team2_raw):
-        return True
-    if team_lookup:
-        if _resolve_bracket_team_lookup_entry(team1_raw, team_lookup) is None:
-            return True
-        if _resolve_bracket_team_lookup_entry(team2_raw, team_lookup) is None:
-            return True
-    if winner_key and winner_key not in pair_keys:
-        return True
-    return False
-
-
-def _collect_second_round_participant_warnings(bracket_data: dict, team_lookup: dict) -> list:
-    sr = bracket_data.get("Second_Round", pd.DataFrame())
-    if sr is None or len(sr) == 0:
-        return []
-
-    warnings = []
-    for _, row in sr.iterrows():
-        game_key = str(row.get("game_key", "") or "").strip()
-        game_key_norm = str(row.get("game_key_norm", "") or "").strip()
-        raw1 = str(row.get("team1_raw", "") or "").strip()
-        raw2 = str(row.get("team2_raw", "") or "").strip()
-        if not raw1 or not raw2:
-            continue
-
-        inferred = _infer_workbook_slot_participants(bracket_data, game_key_norm, team_lookup)
-        if len(inferred) < 2:
-            continue
-
-        workbook_pair = tuple(sorted([_bracket_team_canon(raw1), _bracket_team_canon(raw2)]))
-        inferred_pair = tuple(sorted([_bracket_team_canon(t.get("team_name", "")) for t in inferred[:2]]))
-        if workbook_pair != inferred_pair:
-            warnings.append(
-                f"Second_Round participant mismatch for {game_key}: workbook has {raw1} / {raw2}, "
-                f"upstream winners imply {inferred[0].get('team_name', '')} / {inferred[1].get('team_name', '')}."
-            )
-    return warnings
-
-
-def _normalize_bracket_carry(value: str) -> str:
-    txt = str(value or "").strip().lower()
-    if txt == "winner":
-        return "winner"
-    return ""
-
-
-def _bracket_pick_column(df: pd.DataFrame, aliases: tuple, required: bool = True):
-    for col in aliases:
-        if col in df.columns:
-            return col, None
-    if required:
-        return None, f"Missing required column. Expected one of: {', '.join(aliases)}"
-    return None, None
-
-
-def _normalize_bracket_sheet(df: pd.DataFrame, sheet_name: str) -> tuple:
-    if df is None or len(df) == 0:
-        return pd.DataFrame(), [], [f"{sheet_name} sheet is empty."]
-
-    schema = BRACKET_SHEET_SCHEMA[sheet_name]
-    out = pd.DataFrame(index=df.index)
-    info = []
-    errors = []
-
-    for target, aliases in schema["required"].items():
-        col, err = _bracket_pick_column(df, aliases, required=True)
-        if err:
-            errors.append(f"{sheet_name}: {err}")
-            continue
-        out[target] = df[col]
-        if col != aliases[0]:
-            info.append(f"{sheet_name}: mapped {target} from '{col}'")
-
-    for target, aliases in schema.get("optional", {}).items():
-        col, _ = _bracket_pick_column(df, aliases, required=False)
-        if col is not None:
-            out[target] = df[col]
-            if col != aliases[0]:
-                info.append(f"{sheet_name}: mapped {target} from '{col}'")
-        else:
-            out[target] = np.nan
-
-    if errors:
-        return pd.DataFrame(), info, errors
-
-    if sheet_name in {"First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "First_Four"}:
-        out["game_key"] = out["game_key"].astype(str).str.strip()
-        if "team1_raw" not in out.columns:
-            out["team1_raw"] = ""
-        if "team2_raw" not in out.columns:
-            out["team2_raw"] = ""
-        out["team1_raw"] = out["team1_raw"].fillna("").astype(str).str.strip()
-        out["team2_raw"] = out["team2_raw"].fillna("").astype(str).str.strip()
-        if "winner_raw" in out.columns:
-            out["winner_raw"] = out["winner_raw"].map(_clean_bracket_text)
-        if sheet_name in {"Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"}:
-            out = out.replace({"": np.nan}).dropna(subset=["game_key"]).copy()
-            out["team1_raw"] = out["team1_raw"].fillna("")
-            out["team2_raw"] = out["team2_raw"].fillna("")
-        else:
-            out = out.replace({"": np.nan}).dropna(subset=["game_key", "team1_raw", "team2_raw"]).copy()
-        if "round_name" in out.columns:
-            out["round_name"] = out["round_name"].map(_normalize_round_name)
-        else:
-            out["round_name"] = sheet_name
-        out["round_name"] = out["round_name"].replace("", sheet_name).fillna(sheet_name)
-        out["game_key_norm"] = out["game_key"].map(_normalize_bracket_key)
-        out["team1_canon"] = out["team1_raw"].map(_bracket_team_canon)
-        out["team2_canon"] = out["team2_raw"].map(_bracket_team_canon)
-        if "feeds_into_slot" in out.columns:
-            out["feeds_into_slot"] = out["feeds_into_slot"].astype(str).str.strip()
-            out["feeds_into_slot_norm"] = out["feeds_into_slot"].map(_normalize_bracket_key)
-    else:
-        out["source_game"] = out["source_game"].astype(str).str.strip()
-        out["dest_game"] = out["dest_game"].astype(str).str.strip()
-        out["carry"] = out["carry"].astype(str).str.strip()
-        out = out.replace({"": np.nan}).dropna(subset=["source_game", "dest_game", "carry"]).copy()
-        out["source_game_norm"] = out["source_game"].map(_normalize_bracket_key)
-        out["dest_game_norm"] = out["dest_game"].map(_normalize_bracket_key)
-        out["dest_round"] = out["dest_round"].map(_normalize_round_name)
-        if "from_round" in out.columns:
-            out["from_round"] = out["from_round"].map(_normalize_round_name)
-        out["carry_norm"] = out["carry"].map(_normalize_bracket_carry)
-        bad_carry = out["carry_norm"].eq("")
-        if bad_carry.any():
-            return pd.DataFrame(), info, [f"{sheet_name}: Carry contains unsupported values: {', '.join(sorted(out.loc[bad_carry, 'carry'].astype(str).unique())[:10])}"]
-
-    return out.reset_index(drop=True), info, errors
-
-
-def _validate_bracket_workbook(sheets_dict: dict) -> tuple:
-    sheets_dict = _resolve_bracket_sheet_names(sheets_dict)
-    missing = [s for s in BRACKET_REQUIRED_SHEETS if s not in sheets_dict]
-    if missing:
-        return None, [], [f"Missing required workbook sheet(s): {', '.join(missing)}"]
-
-    normalized = {}
-    info = []
-    errors = []
-    for sheet_name in list(BRACKET_REQUIRED_SHEETS) + [s for s in BRACKET_OPTIONAL_SHEETS if s in sheets_dict]:
-        norm_df, sheet_info, sheet_errors = _normalize_bracket_sheet(sheets_dict[sheet_name], sheet_name)
-        info.extend(sheet_info)
-        errors.extend(sheet_errors)
-        if len(sheet_errors) == 0:
-            normalized[sheet_name] = norm_df
-
-    if errors:
-        return None, info, errors
-    return normalized, info, []
-
-
-def _load_bracket_workbook(path: str = None) -> tuple:
-    path = path or _get_bracket_workbook_path()
-    if not path or not os.path.exists(path):
-        return None, [], [f"Bracket workbook not found: {path}"]
-    try:
-        sheets = pd.read_excel(path, sheet_name=None)
-    except Exception as e:
-        return None, [], [f"Could not load bracket workbook: {e}"]
-    return _validate_bracket_workbook(sheets)
-
-
-def _build_bracket_team_lookup(schedule_df: pd.DataFrame, team_snaps_df: pd.DataFrame) -> dict:
-    frames = []
-    if schedule_df is not None and len(schedule_df) > 0:
-        s = schedule_df.copy()
-        for id_col, candidates in [
-            ("home_id", ["home_team", "home_name", "home_display_name", "home_short_display_name"]),
-            ("away_id", ["away_team", "away_name", "away_display_name", "away_short_display_name"]),
-        ]:
-            if id_col in s.columns:
-                frames.append(pd.DataFrame({
-                    "team_id": pd.to_numeric(s[id_col], errors="coerce"),
-                    "team_name": _safe_team_text_col(s, candidates, default=""),
-                }))
-                for c in candidates:
-                    if c in s.columns:
-                        frames.append(pd.DataFrame({
-                            "team_id": pd.to_numeric(s[id_col], errors="coerce"),
-                            "team_name": s[c].astype(str).str.strip(),
-                        }))
-    if team_snaps_df is not None and len(team_snaps_df) > 0 and "team_id" in team_snaps_df.columns:
-        ts = team_snaps_df.copy()
-        for col in ["team_display_name", "display_name", "team_name", "short_display_name", "team"]:
-            if col in ts.columns:
-                frames.append(pd.DataFrame({
-                    "team_id": pd.to_numeric(ts["team_id"], errors="coerce"),
-                    "team_name": ts[col].astype(str).str.strip(),
-                }))
-    if not frames:
-        return {}
-    out = pd.concat(frames, ignore_index=True)
-    out = out.dropna(subset=["team_id"]).copy()
-    out["team_id"] = out["team_id"].astype(int)
-    out["team_name"] = out["team_name"].astype(str).str.strip()
-    out = out[~out["team_name"].map(_bad_team_name)].copy()
-    out["team_canon"] = out["team_name"].map(_bracket_team_canon)
-    out["team_norm"] = out["team_name"].map(_bracket_team_norm_key)
-
-    lookup = {}
-    conflicts = []
-
-    def _register(key: str, row) -> None:
-        if not key:
-            return
-        payload = {"team_id": int(row["team_id"]), "team_name": row["team_name"]}
-        existing = lookup.get(key)
-        if existing is None:
-            lookup[key] = payload
-        elif int(existing["team_id"]) != int(row["team_id"]):
-            conflicts.append({"key": key, "existing": existing["team_name"], "incoming": row["team_name"]})
-
-    out = out.sort_values(["team_id", "team_name"]).drop_duplicates(subset=["team_id", "team_name"], keep="first")
-    for _, row in out.iterrows():
-        raw_name = str(row["team_name"]).strip()
-        _register(raw_name, row)
-        _register(_bracket_team_norm_key(raw_name), row)
-        _register(str(row["team_canon"]).strip(), row)
-
-    TOURNAMENT_FLAG_DEBUG["bracket_team_lookup"] = {
-        "rows": int(len(out)),
-        "unique_team_ids": int(out["team_id"].nunique()) if len(out) else 0,
-        "keys": int(len(lookup)),
-        "conflicts": int(len(conflicts)),
-        "key_samples": list(lookup.keys())[:12],
-        "conflict_samples": conflicts[:10],
-    }
-    return lookup
-
-
-def _resolve_bracket_team_lookup_entry(raw_name: str, team_lookup: dict):
-    raw = str(raw_name or "").strip()
-    for key in [raw, _bracket_team_norm_key(raw), _bracket_team_canon(raw)]:
-        if key in team_lookup:
-            return team_lookup[key]
-    return None
-
-
-def _canonicalize_bracket_teams(bracket_data: dict, team_lookup: dict) -> tuple:
-    game_frames = [bracket_data.get("First_Four", pd.DataFrame()), bracket_data.get("First_Round", pd.DataFrame())]
-    for sheet_name in ["Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"]:
-        if sheet_name in bracket_data:
-            game_frames.append(bracket_data.get(sheet_name, pd.DataFrame()))
-    game_frames = [df for df in game_frames if df is not None and len(df) > 0]
-    games = pd.concat(game_frames, ignore_index=True, sort=False) if game_frames else pd.DataFrame()
-    play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
-    unresolved = []
-    resolved_count = 0
-    targeted_debug = {
-        "single_checks": [],
-        "composite_checks": [],
-    }
-    for _, row in games.iterrows():
-        round_name = str(row.get("round_name", "")).strip()
-        round_key = _normalize_bracket_key(round_name)
-        slot_norm = str(row.get("game_key_norm", "")).strip()
-
-        exempt_pair_placeholder = False
-        is_round_of_64 = round_key in {"firstround", "r64", "roundof64"}
-        if is_round_of_64 and slot_norm in play_in_slots:
-            raw1 = str(row.get("team1_raw", "")).strip()
-            raw2 = str(row.get("team2_raw", "")).strip()
-            composite_raws = [raw for raw in [raw1, raw2] if _is_bracket_composite_placeholder(raw)]
-            if composite_raws:
-                exempt_pair_placeholder = True
-                if len(targeted_debug["composite_checks"]) < 10:
-                    targeted_debug["composite_checks"].append({
-                        "game_key": row.get("game_key", ""),
-                        "slot_norm": slot_norm,
-                        "raw_values": composite_raws,
-                        "slot_is_feeder": slot_norm in play_in_slots,
-                        "exempted": bool(exempt_pair_placeholder),
-                    })
-
-        for col_raw in ["team1_raw", "team2_raw"]:
-            raw = str(row.get(col_raw, "")).strip()
-            if not raw:
-                continue
-            canon = _bracket_team_canon(raw)
-            if exempt_pair_placeholder and _is_bracket_composite_placeholder(raw):
-                continue
-            resolved = _resolve_bracket_team_lookup_entry(raw, team_lookup)
-            if canon in {"prairie view", "miami", "queens"} and len(targeted_debug["single_checks"]) < 10:
-                targeted_debug["single_checks"].append({
-                    "raw": raw,
-                    "canon": canon,
-                    "raw_exists": raw in team_lookup,
-                    "norm_key": _bracket_team_norm_key(raw),
-                    "norm_exists": _bracket_team_norm_key(raw) in team_lookup,
-                    "canon_exists": canon in team_lookup,
-                    "resolved": resolved is not None,
-                })
-            if resolved is not None:
-                resolved_count += 1
-                continue
-            if canon not in team_lookup:
-                unresolved.append({
-                    "sheet_round": round_name,
-                    "game_key": row.get("game_key", ""),
-                    "team_raw": raw,
-                    "team_canon": canon,
-                })
-    TOURNAMENT_FLAG_DEBUG["bracket_resolution"] = {
-        "lookup_keys": int(len(team_lookup)),
-        "resolved_team_entries": int(resolved_count),
-        "unresolved_team_entries": int(len(unresolved)),
-        "unresolved_samples": unresolved[:10],
-        **targeted_debug,
-    }
-    return games.reset_index(drop=True), pd.DataFrame(unresolved).drop_duplicates().reset_index(drop=True)
-
-
-def _latest_bracket_snapshot(team_id, asof_date):
-    key = (int(team_id), str(pd.Timestamp(asof_date).date()))
-    if key not in _BRACKET_TEAM_SNAPSHOT_CACHE:
-        _BRACKET_TEAM_SNAPSHOT_CACHE[key] = _team_snapshot_asof(team_id, asof_date)
-    return _BRACKET_TEAM_SNAPSHOT_CACHE[key]
-
-
-def _build_hypothetical_neutral_game(team_a: dict, team_b: dict, asof_date) -> pd.DataFrame:
-    snap_a = _latest_bracket_snapshot(team_a["team_id"], asof_date)
-    snap_b = _latest_bracket_snapshot(team_b["team_id"], asof_date)
-    if len(snap_a) == 0 or len(snap_b) == 0:
-        raise ValueError(
-            f"Missing team snapshot as of {pd.Timestamp(asof_date).date()} for "
-            f"{team_a['team_name']} or {team_b['team_name']}."
-        )
-
-    game_dt = pd.Timestamp(asof_date).normalize() + pd.Timedelta(hours=12)
-    joined = pd.DataFrame([{
-        "game_id": f"BRACKET_{pd.Timestamp(asof_date).strftime('%Y%m%d')}_{team_a['team_id']}_{team_b['team_id']}",
-        "game_dt_et": game_dt,
-        "neutral_site": True,
-        "is_tournament": 1,
-        "is_conf_tourney": 0,
-        "is_ncaa_tourney": 1,
-        "home_id": int(team_a["team_id"]),
-        "away_id": int(team_b["team_id"]),
-        "home_team": team_a["team_name"],
-        "away_team": team_b["team_name"],
-        "home_short_display_name": team_a["team_name"],
-        "away_short_display_name": team_b["team_name"],
-        "home_score": np.nan,
-        "away_score": np.nan,
-        "status_type_completed": False,
-        "status_type_state": "pre",
-        "status_type_name": "STATUS_SCHEDULED",
-        "status_type_short_detail": "",
-    }])
-
-    use_roll_cols = [c for c in roll_cols if (c in snap_a.index) or (c in snap_b.index)]
-    for c in use_roll_cols:
-        joined[f"{c}_HOME"] = _matchup_num(snap_a.get(c))
-        joined[f"{c}_AWAY"] = _matchup_num(snap_b.get(c))
-
-    joined["teamA_id"] = np.minimum(joined["home_id"], joined["away_id"]).astype(int)
-    joined["teamB_id"] = np.maximum(joined["home_id"], joined["away_id"]).astype(int)
-    teamA_is_home = joined["teamA_id"].values == joined["home_id"].values
-
-    ta_cols, tb_cols, diff_cols_local = {}, {}, {}
-    for c in use_roll_cols:
-        h = joined[f"{c}_HOME"]
-        a = joined[f"{c}_AWAY"]
-        ta = np.where(teamA_is_home, h, a)
-        tb = np.where(teamA_is_home, a, h)
-        ta_cols[f"{c}_TA"] = ta
-        tb_cols[f"{c}_TB"] = tb
-        diff_cols_local[f"diff_{c}"] = ta - tb
-
-    if diff_cols_local:
-        joined = pd.concat(
-            [
-                joined,
-                pd.DataFrame(ta_cols, index=joined.index),
-                pd.DataFrame(tb_cols, index=joined.index),
-                pd.DataFrame(diff_cols_local, index=joined.index),
-            ],
-            axis=1
-        )
-        use_diff = [c for c in joined.columns if c.startswith("diff_")]
-        joined[use_diff] = joined[use_diff].apply(pd.to_numeric, errors="coerce")
-
-    if elo_snap is not None and len(elo_snap) > 0:
-        joined = add_elo_asof_features(joined, elo_snap)
-
-    joined["home_court_A"] = 0.0
-    return normalize_board_for_downstream(joined)
-
-
-def _predict_neutral_matchup(team_a: dict, team_b: dict, asof_date) -> dict:
-    def _project_final_score(req_a: dict, req_b: dict, margin_a: float, market_total=np.nan) -> dict:
-        snap_a = _latest_bracket_snapshot(req_a["team_id"], asof_date)
-        snap_b = _latest_bracket_snapshot(req_b["team_id"], asof_date)
-
-        def _snap_num(snap, keys):
-            if snap is None or len(snap) == 0:
-                return np.nan
-            key_list = keys if isinstance(keys, (list, tuple)) else [keys]
-            for key in key_list:
-                val = _matchup_num(snap.get(key))
-                if pd.notna(val):
-                    return val
-            return np.nan
-
-        pf_a = _snap_num(snap_a, ["r10_mean_points_for", "mean_points_for", "points_for"])
-        pf_b = _snap_num(snap_b, ["r10_mean_points_for", "mean_points_for", "points_for"])
-        pa_a = _snap_num(snap_a, ["r10_mean_points_against", "mean_points_against", "points_against"])
-        pa_b = _snap_num(snap_b, ["r10_mean_points_against", "mean_points_against", "points_against"])
-        poss_a = _snap_num(snap_a, ["r10_mean_possessions", "r10_mean_estimated_possessions", "r10_mean_pace"])
-        poss_b = _snap_num(snap_b, ["r10_mean_possessions", "r10_mean_estimated_possessions", "r10_mean_pace"])
-
-        a_point_inputs = [x for x in [pf_a, pa_b] if pd.notna(x)]
-        b_point_inputs = [x for x in [pf_b, pa_a] if pd.notna(x)]
-        exp_a = float(np.nanmean(a_point_inputs)) if a_point_inputs else np.nan
-        exp_b = float(np.nanmean(b_point_inputs)) if b_point_inputs else np.nan
-
-        if pd.isna(exp_a) and pd.isna(exp_b):
-            exp_a = 71.0 + float(margin_a) / 2.0
-            exp_b = 71.0 - float(margin_a) / 2.0
-        elif pd.isna(exp_a):
-            exp_a = float(exp_b) + float(margin_a)
-        elif pd.isna(exp_b):
-            exp_b = float(exp_a) - float(margin_a)
-
-        total_base = float(exp_a + exp_b)
-        base_margin = float(exp_a - exp_b)
-        adj_margin = 0.7 * float(margin_a) + 0.3 * base_margin
-
-        if pd.notna(poss_a) and pd.notna(poss_b):
-            pace_avg = float(np.nanmean([poss_a, poss_b]))
-            total_base = total_base * np.clip(pace_avg / 69.5, 0.94, 1.08)
-
-        if pd.notna(market_total):
-            total_base = 0.7 * total_base + 0.3 * float(market_total)
-
-        total_base = float(np.clip(total_base, 118.0, 172.0))
-
-        score_a = (float(total_base) + float(adj_margin)) / 2.0
-        score_b = float(total_base) - score_a
-
-        score_a_i = int(np.round(score_a))
-        score_b_i = int(np.round(score_b))
-        if score_a_i == score_b_i:
-            if float(margin_a) >= 0:
-                score_a_i += 1
-            else:
-                score_b_i += 1
-
-        projected_final = f"{req_a['team_name']} {score_a_i}, {req_b['team_name']} {score_b_i}"
-        model_pick = str(req_a["team_name"]) if score_a_i >= score_b_i else str(req_b["team_name"])
-        return {
-            "team_a_score": int(score_a_i),
-            "team_b_score": int(score_b_i),
-            "projected_final": projected_final,
-            "model_pick": model_pick,
-        }
-
-    def _orient_neutral_matchup_result(cached: dict, req_a: dict, req_b: dict) -> dict:
-        req_a_id = int(req_a["team_id"])
-        req_b_id = int(req_b["team_id"])
-        low_id = int(cached["team_low_id"])
-        high_id = int(cached["team_high_id"])
-
-        if req_a_id == low_id and req_b_id == high_id:
-            p_a = float(cached["p_team_low_win"])
-            margin_a = float(cached["pred_margin_team_low"])
-            winner_pick = str(cached["winner_pick"])
-        elif req_a_id == high_id and req_b_id == low_id:
-            p_a = float(1.0 - cached["p_team_low_win"])
-            margin_a = float(-cached["pred_margin_team_low"])
-            winner_pick = str(req_a["team_name"]) if p_a >= 0.5 else str(req_b["team_name"])
-        else:
-            raise ValueError("Cached neutral-matchup orientation does not match requested team IDs.")
-
-        if "proj_score_team_low" in cached and "proj_score_team_high" in cached:
-            score_a = int(cached["proj_score_team_low"]) if req_a_id == low_id else int(cached["proj_score_team_high"])
-            score_b = int(cached["proj_score_team_high"]) if req_a_id == low_id else int(cached["proj_score_team_low"])
-            projected_final = (
-                f"{req_a['team_name']} {int(cached['proj_score_team_low'])}, {req_b['team_name']} {int(cached['proj_score_team_high'])}"
-                if req_a_id == low_id else
-                f"{req_a['team_name']} {int(cached['proj_score_team_high'])}, {req_b['team_name']} {int(cached['proj_score_team_low'])}"
-            )
-            model_pick = str(req_a["team_name"]) if score_a >= score_b else str(req_b["team_name"])
-        else:
-            legacy_proj = _project_final_score(req_a, req_b, margin_a, market_total=np.nan)
-            score_a = int(legacy_proj["team_a_score"])
-            score_b = int(legacy_proj["team_b_score"])
-            projected_final = str(legacy_proj["projected_final"])
-            model_pick = str(legacy_proj["model_pick"])
-
-        return {
-            "team_a_id": req_a_id,
-            "team_b_id": req_b_id,
-            "team_a_name": str(req_a["team_name"]),
-            "team_b_name": str(req_b["team_name"]),
-            "p_team_a_win": float(p_a),
-            "p_team_b_win": float(1.0 - p_a),
-            "pred_margin_team_a": float(margin_a),
-            "winner_pick": winner_pick,
-            "proj_score_team_a": score_a,
-            "proj_score_team_b": score_b,
-            "projected_final": projected_final,
-            "model_pick": model_pick,
-            "model_pick_prob": float(max(p_a, 1.0 - p_a)),
-        }
-
-    team_a_id = int(team_a["team_id"])
-    team_b_id = int(team_b["team_id"])
-    key = (
-        min(team_a_id, team_b_id),
-        max(team_a_id, team_b_id),
-        str(pd.Timestamp(asof_date).date()),
-    )
-
-    if key not in _BRACKET_MATCHUP_CACHE:
-        low_team, high_team = (
-            (team_a, team_b) if team_a_id <= team_b_id else (team_b, team_a)
-        )
-        pregame = _build_hypothetical_neutral_game(low_team, high_team, asof_date)
-        scored = predict_slate(
-            pregame,
-            spread_booster, winner_booster, lgb_spread,
-            iso, imp, feature_cols,
-        )
-        row = scored.iloc[0]
-        p_low = float(row["p_home_win"])
-        margin_low = float(row["pred_margin_home"])
-        market_total = _matchup_num(row.get("rw_total"))
-        proj = _project_final_score(low_team, high_team, margin_low, market_total=market_total)
-        _BRACKET_MATCHUP_CACHE[key] = {
-            "team_low_id": int(low_team["team_id"]),
-            "team_high_id": int(high_team["team_id"]),
-            "team_low_name": str(low_team["team_name"]),
-            "team_high_name": str(high_team["team_name"]),
-            "p_team_low_win": p_low,
-            "p_team_high_win": float(1.0 - p_low),
-            "pred_margin_team_low": margin_low,
-            "winner_pick": str(low_team["team_name"]) if p_low >= 0.5 else str(high_team["team_name"]),
-            "proj_score_team_low": int(proj["team_a_score"]),
-            "proj_score_team_high": int(proj["team_b_score"]),
-        }
-
-    return _orient_neutral_matchup_result(_BRACKET_MATCHUP_CACHE[key], team_a, team_b)
-
-
-def _resolve_first_four(bracket_data: dict, team_lookup: dict, asof_date, completed_lookup: dict = None) -> tuple:
-    ff = bracket_data["First_Four"].copy()
-    fr = bracket_data["First_Round"].copy()
-    structure = bracket_data["Structure"].copy()
-
-    first_four_results = []
-    for _, row in ff.iterrows():
-        team_a = _resolve_bracket_team_lookup_entry(row.get("team1_raw", ""), team_lookup)
-        team_b = _resolve_bracket_team_lookup_entry(row.get("team2_raw", ""), team_lookup)
-        if team_a is None or team_b is None:
-            raise ValueError(
-                f"Could not resolve First Four teams for {row.get('game_key', '')}: "
-                f"{row.get('team1_raw', '')} vs {row.get('team2_raw', '')}"
-            )
-
-        winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
-        winner = None
-        pred = None
-        locked_row = _lookup_completed_bracket_winner("First_Four", team_a["team_name"], team_b["team_name"], completed_lookup or {})
-        locked_result = False
-        if winner_raw:
-            winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
-            if winner is None:
-                raise ValueError(
-                    f"Could not resolve First Four workbook winner for {row.get('game_key', '')}: {winner_raw}"
-                )
-            if int(winner["team_id"]) not in {int(team_a["team_id"]), int(team_b["team_id"])}:
-                raise ValueError(
-                    f"First Four workbook winner does not match participants for {row.get('game_key', '')}: "
-                    f"{winner_raw} vs {row.get('team1_raw', '')} / {row.get('team2_raw', '')}"
-                )
-        elif locked_row is not None:
-            winner = team_a if _bracket_team_canon(team_a["team_name"]) == _bracket_team_canon(locked_row.get("winner_team", "")) else team_b
-            locked_result = True
-        else:
-            pred = _predict_neutral_matchup(team_a, team_b, asof_date)
-            winner = team_a if np.random.random() < pred["p_team_a_win"] else team_b
-        loser = team_b if winner["team_id"] == team_a["team_id"] else team_a
-        first_four_results.append({
-            "game_key": row.get("game_key", ""),
-            "game_key_norm": row.get("game_key_norm", _normalize_bracket_key(row.get("game_key", ""))),
-            "round_name": "First_Four",
-            "region": str(row.get("region", "") or ""),
-            "team1": team_a["team_name"],
-            "team2": team_b["team_name"],
-            "team1_seed": str(row.get("seed1", "") or ""),
-            "team2_seed": str(row.get("seed2", "") or ""),
-            "winner": winner["team_name"],
-            "winner_team": winner["team_name"],
-            "winner_canon": canonical_team(winner["team_name"]),
-            "winner_id": int(winner["team_id"]),
-            "winner_seed": str(row.get("seed1", "") or "") if winner["team_id"] == team_a["team_id"] else str(row.get("seed2", "") or ""),
-            "winner_region": str(row.get("region", "") or ""),
-            "loser": loser["team_name"],
-            "loser_team": loser["team_name"],
-            "loser_canon": canonical_team(loser["team_name"]),
-            "loser_id": int(loser["team_id"]),
-            "loser_seed": str(row.get("seed2", "") or "") if winner["team_id"] == team_a["team_id"] else str(row.get("seed1", "") or ""),
-            "loser_region": str(row.get("region", "") or ""),
-            "win_prob": (
-                pred["p_team_a_win"] if winner["team_id"] == team_a["team_id"] else pred["p_team_b_win"]
-            ) if pred is not None else np.nan,
-            "pred_margin": (
-                pred["pred_margin_team_a"] if winner["team_id"] == team_a["team_id"] else -pred["pred_margin_team_a"]
-            ) if pred is not None else np.nan,
-            "model_pick": pred.get("model_pick", pred.get("winner_pick", "")) if pred is not None else "",
-            "model_pick_prob": pred.get("model_pick_prob", np.nan) if pred is not None else np.nan,
-            "proj_score_team1": pred.get("proj_score_team_a", np.nan) if pred is not None else np.nan,
-            "proj_score_team2": pred.get("proj_score_team_b", np.nan) if pred is not None else np.nan,
-            "projected_final": pred.get("projected_final", "") if pred is not None else "",
-            "locked_result": bool(locked_result or bool(winner_raw)),
-            "result_source": "completed_game" if locked_result else ("workbook_lock" if winner_raw else "simulated"),
-        })
-
-        dest_key = row.get("feeds_into_slot_norm", "")
-        if dest_key:
-            mask = fr["game_key_norm"] == dest_key
-            if mask.any():
-                replace1 = fr.loc[mask, "team1_raw"].astype(str).str.strip().eq("") | fr.loc[mask, "team1_raw"].astype(str).map(_is_bracket_composite_placeholder)
-                replace2 = fr.loc[mask, "team2_raw"].astype(str).str.strip().eq("") | fr.loc[mask, "team2_raw"].astype(str).map(_is_bracket_composite_placeholder)
-                if replace1.any():
-                    fr.loc[mask & replace1, "team1_raw"] = winner["team_name"]
-                    fr.loc[mask & replace1, "team1_canon"] = canonical_team(winner["team_name"])
-                elif replace2.any():
-                    fr.loc[mask & replace2, "team2_raw"] = winner["team_name"]
-                    fr.loc[mask & replace2, "team2_canon"] = canonical_team(winner["team_name"])
-                else:
-                    dest_rows = structure[structure["source_game_norm"] == row.get("game_key_norm", _normalize_bracket_key(row.get("game_key", "")))].copy()
-                    for _, edge in dest_rows.iterrows():
-                        slot = int(pd.to_numeric(edge["dest_slot"], errors="coerce"))
-                        fr.loc[mask, f"team{slot}_raw"] = winner["team_name"]
-                        fr.loc[mask, f"team{slot}_canon"] = canonical_team(winner["team_name"])
-
-    updated = dict(bracket_data)
-    updated["First_Round"] = fr.reset_index(drop=True)
-    return updated, pd.DataFrame(first_four_results)
-
-
-def _initial_bracket_games(bracket_data: dict, team_lookup: dict) -> dict:
-    games = {}
-    play_in_slots = _valid_first_four_placeholder_slots(bracket_data)
-    for sheet_name in ["First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"]:
-        df = bracket_data.get(sheet_name, pd.DataFrame()).copy()
-        if len(df) == 0:
-            continue
-        for _, row in df.iterrows():
-            round_name = str(row.get("round_name", sheet_name)).strip()
-            round_key = _normalize_bracket_key(round_name)
-            slot_norm = str(row.get("game_key_norm", "")).strip()
-            is_round_of_64 = round_key in {"firstround", "r64", "roundof64"}
-
-            raw1 = str(row.get("team1_raw", "")).strip()
-            raw2 = str(row.get("team2_raw", "")).strip()
-
-            if (
-                sheet_name in {"Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"}
-                and _should_infer_later_round_participants(raw1, raw2, team_lookup)
-            ):
-                inferred = _infer_workbook_slot_participants(bracket_data, row.get("game_key_norm", ""), team_lookup)
-                if len(inferred) >= 1:
-                    raw1 = str(inferred[0].get("team_name", "") or "").strip()
-                if len(inferred) >= 2:
-                    raw2 = str(inferred[1].get("team_name", "") or "").strip()
-
-            if sheet_name in {"Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"}:
-                game_key_norm = str(row.get("game_key_norm", "")).strip()
-                games[game_key_norm] = {
-                    "game_key": row["game_key"],
-                    "game_key_norm": game_key_norm,
-                    "round_name": row.get("round_name", sheet_name),
-                    "region": str(row.get("region", "") or ""),
-                    "team1": None,
-                    "team2": None,
-                }
-                continue
-
-            team1_pending = is_round_of_64 and slot_norm in play_in_slots and _is_bracket_composite_placeholder(raw1)
-            team2_pending = is_round_of_64 and slot_norm in play_in_slots and _is_bracket_composite_placeholder(raw2)
-
-            team1 = None if team1_pending else _resolve_bracket_team_lookup_entry(raw1, team_lookup)
-            team2 = None if team2_pending else _resolve_bracket_team_lookup_entry(raw2, team_lookup)
-            if (not team1_pending and team1 is None) or (not team2_pending and team2 is None):
-                raise ValueError(
-                    f"Could not resolve bracket teams for {row.get('game_key', '')}: "
-                    f"{row.get('team1_raw', '')} vs {row.get('team2_raw', '')}"
-                )
-            game_key_norm = str(row.get("game_key_norm", "")).strip()
-            games[game_key_norm] = {
-                "game_key": row["game_key"],
-                "game_key_norm": game_key_norm,
-                "round_name": row.get("round_name", sheet_name),
-                "region": str(row.get("region", "") or ""),
-                "team1": dict(team1) if team1 is not None else None,
-                "team2": dict(team2) if team2 is not None else None,
-            }
-            if team1 is not None and "seed1" in row and pd.notna(row.get("seed1")):
-                games[game_key_norm]["team1"]["seed"] = str(row.get("seed1")).strip()
-            if team2 is not None and "seed2" in row and pd.notna(row.get("seed2")):
-                games[game_key_norm]["team2"]["seed"] = str(row.get("seed2")).strip()
-            if team1 is not None:
-                games[game_key_norm]["team1"]["region"] = games[game_key_norm]["region"]
-            if team2 is not None:
-                games[game_key_norm]["team2"]["region"] = games[game_key_norm]["region"]
-    return games
-
-
-def _structure_destinations(structure_df: pd.DataFrame) -> tuple:
-    edges = {}
-    node_meta = {}
-    for _, row in structure_df.iterrows():
-        src = str(row.get("source_game_norm", "")).strip()
-        dst = str(row.get("dest_game_norm", "")).strip()
-        if not src or not dst:
-            continue
-        carry = str(row.get("carry_norm", row.get("carry", ""))).strip().lower()
-        edges.setdefault(src, []).append({"dest_game": dst, "carry": carry})
-        node_meta.setdefault(src, {
-            "game_key": row.get("source_game", src),
-            "game_key_norm": src,
-            "round_name": str(row.get("from_round", "") or ""),
-            "region": str(row.get("region", "") or ""),
-        })
-        dst_meta = node_meta.setdefault(dst, {
-            "game_key": row.get("dest_game", dst),
-            "game_key_norm": dst,
-            "round_name": str(row.get("dest_round", "") or ""),
-            "region": str(row.get("region", "") or ""),
-        })
-        if not dst_meta.get("round_name") and str(row.get("dest_round", "") or "").strip():
-            dst_meta["round_name"] = str(row.get("dest_round", "") or "")
-        if not dst_meta.get("game_key") and str(row.get("dest_game", "") or "").strip():
-            dst_meta["game_key"] = str(row.get("dest_game", "") or "")
-    return edges, node_meta
-
-
-def _single_bracket_advancement_template(bracket_data: dict, team_lookup: dict) -> dict:
-    store = {}
-    for sheet_name in ["First_Four", "First_Round"]:
-        df = bracket_data.get(sheet_name, pd.DataFrame())
-        if df is None or len(df) == 0:
-            continue
-        round_bucket = "First_Four" if sheet_name == "First_Four" else "First_Round"
-        for _, row in df.iterrows():
-            for team_col, seed_col in [("team1_raw", "seed1"), ("team2_raw", "seed2")]:
-                raw = str(row.get(team_col, "") or "").strip()
-                if not raw or _is_bracket_composite_placeholder(raw):
-                    continue
-                team = _resolve_bracket_team_lookup_entry(raw, team_lookup)
-                if team is None:
-                    continue
-                team = dict(team)
-                if seed_col in row and pd.notna(row.get(seed_col)):
-                    team["seed"] = str(row.get(seed_col)).strip()
-                if pd.notna(row.get("region")):
-                    team["region"] = str(row.get("region") or "").strip()
-                _record_advancement_slot(store, team, round_bucket)
-    return store
-
-
-def _record_advancement_slot(store: dict, team: dict, round_name: str) -> None:
-    tid = int(team["team_id"])
-    if tid not in store:
-        store[tid] = {
-            "team_id": tid,
-            "team": team["team_name"],
-            "seed": str(team.get("seed", "") or ""),
-            "region": str(team.get("region", "") or ""),
-            "First_Four": 0,
-            "First_Round": 0,
-            "Second_Round": 0,
-            "Sweet_16": 0,
-            "Elite_8": 0,
-            "Final_Four": 0,
-            "Championship": 0,
-            "Champion": 0,
-        }
-    else:
-        if (not str(store[tid].get("team", "") or "").strip()) and str(team.get("team_name", "") or "").strip():
-            store[tid]["team"] = team["team_name"]
-        if (not str(store[tid].get("seed", "") or "").strip()) and str(team.get("seed", "") or "").strip():
-            store[tid]["seed"] = str(team.get("seed", "") or "")
-        if (not str(store[tid].get("region", "") or "").strip()) and str(team.get("region", "") or "").strip():
-            store[tid]["region"] = str(team.get("region", "") or "")
-    if round_name in store[tid]:
-        store[tid][round_name] += 1
-
-
-def _merge_advancement_counts(total_store: dict, sim_store: dict) -> None:
-    for tid, row in (sim_store or {}).items():
-        tid = int(tid)
-        if tid not in total_store:
-            total_store[tid] = dict(row)
-            continue
-        cur = total_store[tid]
-        for meta_col in ["team", "seed", "region"]:
-            if (not str(cur.get(meta_col, "") or "").strip()) and str(row.get(meta_col, "") or "").strip():
-                cur[meta_col] = row.get(meta_col, "")
-        for round_col in ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]:
-            cur[round_col] = int(cur.get(round_col, 0) or 0) + int(row.get(round_col, 0) or 0)
-
-
-def _simulate_bracket_once(bracket_data: dict, team_lookup: dict, asof_date, completed_lookup: dict = None) -> tuple:
-    bracket_ff, first_four_df = _resolve_first_four(bracket_data, team_lookup, asof_date, completed_lookup=completed_lookup)
-    structure_df = bracket_ff["Structure"].copy()
-    games = _initial_bracket_games(bracket_ff, team_lookup)
-    edges, node_meta = _structure_destinations(structure_df)
-
-    for gk, meta in node_meta.items():
-        games.setdefault(gk, {
-            "game_key": meta.get("game_key", gk),
-            "game_key_norm": gk,
-            "round_name": meta.get("round_name", ""),
-            "region": meta.get("region", ""),
-            "team1": None,
-            "team2": None,
-        })
-
-    incoming_counts = structure_df.groupby("dest_game_norm").size().to_dict()
-    for gk, game in games.items():
-        if not game.get("round_name"):
-            meta_round = str(node_meta.get(gk, {}).get("round_name", "") or "").strip()
-            if meta_round:
-                game["round_name"] = meta_round
-            else:
-                preds = structure_df.loc[structure_df["dest_game_norm"] == gk, "source_game_norm"].tolist()
-                src_rounds = [games.get(src, {}).get("round_name", "") for src in preds if src in games]
-                src_rounds = [r for r in src_rounds if r]
-                if src_rounds:
-                    game["round_name"] = _next_advancement_bucket(src_rounds[0])
-        if not game.get("game_key"):
-            game["game_key"] = node_meta.get(gk, {}).get("game_key", gk)
-        if not game.get("game_key_norm"):
-            game["game_key_norm"] = gk
-
-    advancement = _single_bracket_advancement_template(bracket_ff, team_lookup)
-    if first_four_df is not None and len(first_four_df) > 0:
-        for _, row in first_four_df.iterrows():
-            winner_id = pd.to_numeric(row.get("winner_id"), errors="coerce")
-            winner_team = str(row.get("winner_team", "") or "").strip()
-            if pd.isna(winner_id) or not winner_team:
-                continue
-            _record_advancement_slot(advancement, {
-                "team_id": int(winner_id),
-                "team_name": winner_team,
-                "seed": str(row.get("winner_seed", "") or ""),
-                "region": str(row.get("winner_region", "") or ""),
-            }, "First_Round")
-
-    pending = set(games.keys())
-    game_rows = []
-    while pending:
-        progressed = False
-        for key in list(pending):
-            game = games[key]
-            if game.get("team1") is None or game.get("team2") is None:
-                continue
-            round_bucket = _normalize_round_name(game.get("round_name", ""))
-            locked_row = _lookup_completed_bracket_winner(
-                round_bucket,
-                game["team1"]["team_name"],
-                game["team2"]["team_name"],
-                completed_lookup or {},
-            )
-            locked_result = False
-            pred = None
-            if locked_row is not None:
-                winner_key = _bracket_team_canon(locked_row.get("winner_team", ""))
-                if winner_key == _bracket_team_canon(game["team1"]["team_name"]):
-                    winner = game["team1"]
-                elif winner_key == _bracket_team_canon(game["team2"]["team_name"]):
-                    winner = game["team2"]
-                else:
-                    raise ValueError(
-                        f"Completed bracket result winner mismatch for {game.get('game_key', key)}: "
-                        f"{locked_row.get('winner_team', '')} not in simulated participants."
-                    )
-                locked_result = True
-            else:
-                pred = _predict_neutral_matchup(game["team1"], game["team2"], asof_date)
-                winner = game["team1"] if np.random.random() < pred["p_team_a_win"] else game["team2"]
-            loser = game["team2"] if winner["team_id"] == game["team1"]["team_id"] else game["team1"]
-            next_round = _next_advancement_bucket(game.get("round_name", ""))
-            if next_round:
-                _record_advancement_slot(advancement, winner, next_round)
-            game_rows.append({
-                "game_key": game.get("game_key", key),
-                "game_key_norm": key,
-                "round_name": game.get("round_name", ""),
-                "region": str(game.get("region", "") or ""),
-                "team1": game["team1"]["team_name"],
-                "team2": game["team2"]["team_name"],
-                "team1_seed": str(game["team1"].get("seed", "") or ""),
-                "team2_seed": str(game["team2"].get("seed", "") or ""),
-                "winner": winner["team_name"],
-                "winner_team": winner["team_name"],
-                "winner_canon": canonical_team(winner["team_name"]),
-                "winner_id": int(winner["team_id"]),
-                "winner_seed": str(winner.get("seed", "") or ""),
-                "winner_region": str(winner.get("region", "") or ""),
-                "loser": loser["team_name"],
-                "loser_team": loser["team_name"],
-                "loser_canon": canonical_team(loser["team_name"]),
-                "loser_id": int(loser["team_id"]),
-                "loser_seed": str(loser.get("seed", "") or ""),
-                "loser_region": str(loser.get("region", "") or ""),
-                "win_prob": pred["p_team_a_win"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
-                    pred["p_team_b_win"] if pred is not None else np.nan
-                ),
-                "pred_margin": pred["pred_margin_team_a"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
-                    -pred["pred_margin_team_a"] if pred is not None else np.nan
-                ),
-                "proj_margin": pred["pred_margin_team_a"] if pred is not None and winner["team_id"] == game["team1"]["team_id"] else (
-                    -pred["pred_margin_team_a"] if pred is not None else np.nan
-                ),
-                "model_pick": pred.get("model_pick", pred.get("winner_pick", "")) if pred is not None else "",
-                "model_pick_prob": pred.get("model_pick_prob", np.nan) if pred is not None else np.nan,
-                "proj_score_team1": pred.get("proj_score_team_a", np.nan) if pred is not None else np.nan,
-                "proj_score_team2": pred.get("proj_score_team_b", np.nan) if pred is not None else np.nan,
-                "projected_final": pred.get("projected_final", "") if pred is not None else "",
-                "locked_result": bool(locked_result),
-                "result_source": "completed_game" if locked_result else "simulated",
-            })
-            for edge in edges.get(key, []):
-                dest = games[edge["dest_game"]]
-                winner_id = int(winner["team_id"])
-                team1_existing = dest.get("team1")
-                team2_existing = dest.get("team2")
-                if team1_existing is not None and int(team1_existing.get("team_id")) == winner_id:
-                    continue
-                if team2_existing is not None and int(team2_existing.get("team_id")) == winner_id:
-                    continue
-                if dest.get("team1") is None:
-                    dest["team1"] = dict(winner)
-                elif dest.get("team2") is None:
-                    dest["team2"] = dict(winner)
-                else:
-                    raise ValueError(f"Destination slot {dest.get('game_key', edge['dest_game'])} already has two teams assigned.")
-            pending.remove(key)
-            progressed = True
-        if not progressed:
-            unresolved = [
-                games[k].get("game_key", k) if games[k].get("game_key", k) == k
-                else f"{games[k].get('game_key', k)} [{k}]"
-                for k in pending
-            ]
-            raise ValueError(f"Bracket structure could not resolve all games. Pending: {', '.join(map(str, unresolved[:10]))}")
-
-    latest_run = pd.concat([first_four_df.assign(round_name="First_Four")] if len(first_four_df) else [], ignore_index=True) if len(first_four_df) else pd.DataFrame()
-    latest_games = pd.DataFrame(game_rows)
-    if len(latest_run) and len(latest_games):
-        latest_run = pd.concat([latest_run, latest_games], ignore_index=True, sort=False)
-    elif len(latest_games):
-        latest_run = latest_games
-    if len(latest_run):
-        if "winner_team" not in latest_run.columns:
-            latest_run["winner_team"] = ""
-        if "winner" not in latest_run.columns:
-            latest_run["winner"] = ""
-        latest_run["winner_team"] = latest_run["winner_team"].fillna("")
-        latest_run["winner"] = latest_run["winner"].fillna("")
-        fill_winner = latest_run["winner_team"].astype(str).str.strip().eq("") & latest_run["winner"].astype(str).str.strip().ne("")
-        latest_run.loc[fill_winner, "winner_team"] = latest_run.loc[fill_winner, "winner"]
-        if "winner_canon" not in latest_run.columns:
-            latest_run["winner_canon"] = ""
-        latest_run["winner_canon"] = latest_run["winner_canon"].fillna("")
-        fill_wcanon = latest_run["winner_canon"].astype(str).str.strip().eq("") & latest_run["winner_team"].astype(str).str.strip().ne("")
-        latest_run.loc[fill_wcanon, "winner_canon"] = latest_run.loc[fill_wcanon, "winner_team"].map(canonical_team)
-    return advancement, latest_run
-
-
-def _simulate_bracket_many(
-    bracket_data: dict,
-    team_lookup: dict,
-    asof_date,
-    sim_n: int,
-    completed_lookup: dict = None,
-    progress_callback=None,
-) -> tuple:
-    total_adv = {}
-    latest_run = pd.DataFrame()
-    total = int(sim_n)
-    progress_every = max(1, min(500, total // 20 if total >= 20 else 1))
-    for idx in range(total):
-        adv_store, latest_run = _simulate_bracket_once(bracket_data, team_lookup, asof_date, completed_lookup=completed_lookup)
-        _merge_advancement_counts(total_adv, adv_store)
-        done = idx + 1
-        if progress_callback is not None and (done == 1 or done % progress_every == 0 or done == total):
-            try:
-                progress_callback(done, total)
-            except Exception:
-                pass
-    if not total_adv:
-        return pd.DataFrame(), latest_run
-    return pd.DataFrame(list(total_adv.values())), latest_run
-
-
-def _apply_completed_bracket_advancement_locks(summary_df: pd.DataFrame, completed_games: pd.DataFrame, sim_n: int) -> pd.DataFrame:
-    if summary_df is None or len(summary_df) == 0 or completed_games is None or len(completed_games) == 0:
-        return summary_df
-
-    out = summary_df.copy()
-    out["team_id"] = pd.to_numeric(out.get("team_id"), errors="coerce")
-    round_order = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
-
-    later_cols_map = {
-        "First_Four": ["First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"],
-        "First_Round": ["Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"],
-        "Second_Round": ["Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"],
-        "Sweet_16": ["Elite_8", "Final_Four", "Championship", "Champion"],
-        "Elite_8": ["Final_Four", "Championship", "Champion"],
-        "Final_Four": ["Championship", "Champion"],
-        "Championship": ["Champion"],
-    }
-    reached_cols_map = {
-        rnd: [c for c in round_order if c != "Champion" and round_order.index(c) <= round_order.index(rnd)]
-        for rnd in later_cols_map.keys()
-    }
-
-    cg = completed_games.copy()
-    cg["winner_id"] = pd.to_numeric(cg.get("winner_id"), errors="coerce")
-    cg["loser_id"] = pd.to_numeric(cg.get("loser_id"), errors="coerce")
-    cg["round_bucket"] = cg.get("round_bucket", pd.Series("", index=cg.index)).fillna("").astype(str)
-
-    for _, row in cg.iterrows():
-        round_bucket = str(row.get("round_bucket", "") or "").strip()
-        later_cols = later_cols_map.get(round_bucket, [])
-        reached_cols = reached_cols_map.get(round_bucket, [])
-        if not later_cols:
-            continue
-
-        winner_id = row.get("winner_id")
-        loser_id = row.get("loser_id")
-
-        if pd.notna(winner_id):
-            win_mask = out["team_id"].eq(float(winner_id))
-            if win_mask.any():
-                for col in reached_cols:
-                    if col in out.columns:
-                        out.loc[win_mask, col] = int(sim_n)
-                    pct_col = f"{col}_Pct"
-                    if pct_col in out.columns:
-                        out.loc[win_mask, pct_col] = 100.0
-                next_col = later_cols[0]
-                if next_col in out.columns:
-                    out.loc[win_mask, next_col] = int(sim_n)
-                next_pct = f"{next_col}_Pct"
-                if next_pct in out.columns:
-                    out.loc[win_mask, next_pct] = 100.0
-                if next_col == "Championship" and "Finalist_Pct" in out.columns:
-                    out.loc[win_mask, "Finalist_Pct"] = 100.0
-
-        if pd.notna(loser_id):
-            lose_mask = out["team_id"].eq(float(loser_id))
-            if lose_mask.any():
-                for col in reached_cols:
-                    if col in out.columns:
-                        out.loc[lose_mask, col] = int(sim_n)
-                    pct_col = f"{col}_Pct"
-                    if pct_col in out.columns:
-                        out.loc[lose_mask, pct_col] = 100.0
-                for col in later_cols:
-                    if col in out.columns:
-                        out.loc[lose_mask, col] = 0
-                    pct_col = f"{col}_Pct"
-                    if pct_col in out.columns:
-                        out.loc[lose_mask, pct_col] = 0.0
-                    if col == "Championship" and "Finalist_Pct" in out.columns:
-                        out.loc[lose_mask, "Finalist_Pct"] = 0.0
-
-    if "Championship_Pct" in out.columns and "Finalist_Pct" in out.columns:
-        out["Finalist_Pct"] = pd.to_numeric(out["Championship_Pct"], errors="coerce").fillna(0.0)
-
-    return out
-
-
-def _summarize_bracket_simulations(adv_df: pd.DataFrame, sim_n: int, completed_games: pd.DataFrame = None) -> pd.DataFrame:
-    if adv_df is None or len(adv_df) == 0:
-        return pd.DataFrame()
-    value_cols = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
-    work = adv_df.copy()
-    for col in ["team", "seed", "region"]:
-        if col not in work.columns:
-            work[col] = ""
-        work[col] = work[col].fillna("").astype(str)
-    meta = (
-        work.assign(
-            _team_len=work["team"].astype(str).str.len(),
-            _seed_len=work["seed"].astype(str).str.len(),
-            _region_len=work["region"].astype(str).str.len(),
-        )
-        .sort_values(["_region_len", "_seed_len", "_team_len"], ascending=False)
-        .drop_duplicates(subset=["team_id"])
-        [["team_id", "team", "seed", "region"]]
-    )
-    summary = work.groupby(["team_id"], as_index=False, dropna=False)[value_cols].sum().merge(meta, on="team_id", how="left")
-    summary = summary[["team_id", "team", "seed", "region"] + value_cols]
-    for col in value_cols:
-        summary[f"{col}_Pct"] = (100.0 * summary[col] / float(sim_n)).round(1)
-    summary["Finalist_Pct"] = summary["Championship_Pct"]
-    summary = _apply_completed_bracket_advancement_locks(summary, completed_games, sim_n)
-    return summary.sort_values(
-        ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct", "Elite_8_Pct"],
-        ascending=False,
-    ).reset_index(drop=True)
-
-
-def _completed_results_runtime_signature(asof_date=None) -> dict:
-    asof_txt = str(pd.Timestamp(asof_date).date()) if asof_date is not None else ""
-    out = {
-        "asof_date": asof_txt,
-        "last_date": str(pd.Timestamp(LAST_DATE).date()) if "LAST_DATE" in globals() and LAST_DATE is not None else "",
-        "last_board_rows": int(len(LAST_BOARD)) if "LAST_BOARD" in globals() and LAST_BOARD is not None else 0,
-        "last_board_finals": 0,
-        "schedule_rows": int(len(schedule_cur)) if "schedule_cur" in globals() and schedule_cur is not None else 0,
-        "schedule_completed": 0,
-        "workbook_locks": _bracket_lock_state_signature(),
-    }
-    try:
-        if "LAST_BOARD" in globals() and LAST_BOARD is not None and len(LAST_BOARD) > 0:
-            out["last_board_finals"] = int(_real_final_mask(LAST_BOARD).sum())
-    except Exception:
-        out["last_board_finals"] = 0
-    try:
-        if "schedule_cur" in globals() and schedule_cur is not None and len(schedule_cur) > 0:
-            s = normalize_board_for_downstream(schedule_cur.copy())
-            completed = pd.Series(False, index=s.index)
-            completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
-            completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
-            hs = pd.to_numeric(s.get("home_score"), errors="coerce")
-            aw = pd.to_numeric(s.get("away_score"), errors="coerce")
-            completed |= hs.notna() & aw.notna() & ~(hs.eq(0) & aw.eq(0))
-            out["schedule_completed"] = int(completed.sum())
-    except Exception:
-        out["schedule_completed"] = 0
-    return out
-
-
-def _bracket_cache_signature(sim_n: int, asof_date, completed_games: pd.DataFrame = None) -> dict:
-    meta = _load_metadata()
-    return {
-        "logic_version": BRACKET_SIM_LOGIC_VERSION,
-        "workbook": _bracket_file_signature(_get_bracket_workbook_path()),
-        "sim_n": int(sim_n),
-        "asof_date": str(pd.Timestamp(asof_date).date()),
-        "lock_state": _bracket_lock_state_signature(),
-        "completed_game_locks": [
-            {
-                "round_bucket": str(row.get("round_bucket", "") or ""),
-                "winner_id": int(row.get("winner_id")) if pd.notna(row.get("winner_id")) else None,
-                "pair": list(tuple(sorted([
-                    _bracket_team_canon(row.get("home_team", "")),
-                    _bracket_team_canon(row.get("away_team", "")),
-                ]))),
-            }
-            for _, row in completed_games.iterrows()
-        ] if completed_games is not None and len(completed_games) > 0 else [],
-        "last_model_fit": meta.get("last_model_fit", ""),
-        "feature_cols_n": len(meta.get("feature_cols", feature_cols if "feature_cols" in globals() else [])),
-    }
-
-
-def _load_cached_bracket_sim(expected_sig: dict):
-    if not os.path.exists(BRACKET_CACHE_PATH):
-        return None
-    try:
-        payload = pd.read_pickle(BRACKET_CACHE_PATH)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("signature") != expected_sig:
-        return None
-    return payload
-
-
-def _save_cached_bracket_sim(signature: dict, summary_df: pd.DataFrame, latest_run_df: pd.DataFrame):
-    os.makedirs(BRACKET_OUTPUT_DIR, exist_ok=True)
-    payload = {
-        "signature": signature,
-        "summary_df": summary_df,
-        "latest_run_df": latest_run_df,
-    }
-    pd.to_pickle(payload, BRACKET_CACHE_PATH)
-    summary_df.to_csv(BRACKET_SUMMARY_CSV, index=False)
-
-
-def _render_bracket_results(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame):
-    if summary_df is None or len(summary_df) == 0:
-        bracket_summary_html.value = ""
-        with bracket_out:
-            clear_output(wait=True)
-            display(HTML("<div style='color:#AAA;'>No bracket simulation results available.</div>"))
-        return
-
-    summary_view = summary_df.copy()
-    pct_cols = [c for c in summary_view.columns if c.endswith("_Pct")]
-    for col in pct_cols:
-        summary_view[col] = pd.to_numeric(summary_view[col], errors="coerce")
-
-    champ_cols = [c for c in ["team", "seed", "region", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"] if c in summary_view.columns]
-    champs = (
-        summary_view.sort_values(["Champion_Pct", "Finalist_Pct"], ascending=False, na_position="last")[champ_cols]
-        .head(12)
-        .copy()
-    )
-    for col in [c for c in ["Champion_Pct", "Finalist_Pct", "Final_Four_Pct"] if c in champs.columns]:
-        champs[col] = champs[col].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
-    champs = champs.rename(columns={
-        "team": "Team",
-        "seed": "Seed",
-        "region": "Region",
-        "Final_Four_Pct": "Final Four",
-        "Finalist_Pct": "Finalist",
-        "Champion_Pct": "Champion",
-    })
-    bracket_summary_html.value = (
-        "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Champion Probability Summary</div>"
-        + df_to_html_table(champs, max_rows=len(champs))
-    )
-
-    show_cols = [
-        "team", "seed", "region",
-        "First_Round_Pct", "Second_Round_Pct", "Sweet_16_Pct",
-        "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct",
-    ]
-    show_cols = [c for c in show_cols if c in summary_df.columns]
-    adv_view = (
-        summary_view.sort_values(["Champion_Pct", "Final_Four_Pct"], ascending=False, na_position="last")[show_cols]
-        .copy()
-    )
-    for col in [c for c in show_cols if c.endswith("_Pct")]:
-        adv_view[col] = adv_view[col].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
-    adv_view = adv_view.rename(columns={
-        "team": "Team",
-        "seed": "Seed",
-        "region": "Region",
-        "First_Round_Pct": "1st Round",
-        "Second_Round_Pct": "2nd Round",
-        "Sweet_16_Pct": "Sweet 16",
-        "Elite_8_Pct": "Elite 8",
-        "Final_Four_Pct": "Final Four",
-        "Finalist_Pct": "Finalist",
-        "Champion_Pct": "Champion",
-    })
-    with bracket_out:
-        clear_output(wait=True)
-        display(HTML("<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Round Advancement Probabilities</div>"))
-        display(HTML(df_to_html_table(adv_view, max_rows=min(len(adv_view), 80))))
-        if latest_run_df is not None and len(latest_run_df) > 0:
-            run_view = latest_run_df.copy()
-            round_order_map = {
-                "First_Four": 1,
-                "First_Round": 2,
-                "Second_Round": 3,
-                "Sweet_16": 4,
-                "Elite_8": 5,
-                "Final_Four": 6,
-                "Championship": 7,
-            }
-            for col in run_view.columns:
-                if run_view[col].dtype == object:
-                    run_view[col] = run_view[col].fillna("")
-            if "round_name" in run_view.columns:
-                run_view["_round_order"] = run_view["round_name"].map(round_order_map).fillna(999)
-            else:
-                run_view["_round_order"] = 999
-
-            score_cols = [
-                "round_name",
-                "region",
-                "team1_seed",
-                "team1",
-                "team2_seed",
-                "team2",
-                "model_pick",
-                "model_pick_prob",
-                "projected_final",
-                "locked_result",
-                "result_source",
-            ]
-            score_cols = [c for c in score_cols if c in run_view.columns]
-            score_view = run_view.sort_values(["_round_order", "game_key"], na_position="last")[score_cols].copy()
-            if "model_pick_prob" in score_view.columns:
-                score_view["model_pick_prob"] = score_view["model_pick_prob"].map(lambda x: "" if pd.isna(x) else f"{100.0 * float(x):.1f}%")
-            score_view = score_view.rename(columns={
-                "round_name": "Round",
-                "region": "Region",
-                "team1_seed": "Seed 1",
-                "team1": "Team 1",
-                "team2_seed": "Seed 2",
-                "team2": "Team 2",
-                "model_pick": "Model Pick",
-                "model_pick_prob": "Pick Prob",
-                "projected_final": "Projected Final",
-                "locked_result": "Locked",
-                "result_source": "Source",
-            })
-            display(HTML("<div style='color:#EEE; font-weight:700; margin:14px 0 8px 0;'>Projected Matchup Finals By Round</div>"))
-            display(HTML(df_to_html_table(score_view, max_rows=len(score_view))))
-
-            run_show_cols = [
-                "game_key",
-                "round_name",
-                "region",
-                "team1_seed",
-                "team1",
-                "team2_seed",
-                "team2",
-                "winner",
-                "win_prob",
-                "model_pick",
-                "projected_final",
-                "locked_result",
-                "result_source",
-                "proj_margin",
-            ]
-            run_show_cols = [c for c in run_show_cols if c in run_view.columns]
-            run_view = run_view.sort_values(["_round_order", "game_key"], na_position="last")[run_show_cols].copy()
-            if "win_prob" in run_view.columns:
-                run_view["win_prob"] = run_view["win_prob"].map(lambda x: "" if pd.isna(x) else f"{100.0 * float(x):.1f}%")
-            run_view = run_view.rename(columns={
-                "game_key": "Game",
-                "round_name": "Round",
-                "region": "Region",
-                "team1_seed": "Seed 1",
-                "team1": "Team 1",
-                "team2_seed": "Seed 2",
-                "team2": "Team 2",
-                "winner": "Winner",
-                "win_prob": "Win Prob",
-                "model_pick": "Model Pick",
-                "projected_final": "Projected Final",
-                "locked_result": "Locked",
-                "result_source": "Source",
-                "proj_margin": "Proj Margin",
-            })
-            display(HTML("<div style='color:#EEE; font-weight:700; margin:14px 0 8px 0;'>Latest Simulated Bracket Run</div>"))
-            display(HTML(df_to_html_table(run_view, max_rows=len(run_view))))
-
-
-BRACKET_BUCKETS = ["First_Four", "First_Round", "Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship", "Champion"]
-BRACKET_COMPLETED_SOURCE_DEBUG = {}
-
-
-def _completed_workbook_round_locks(sheet_name: str, round_bucket: str, result_source: str) -> pd.DataFrame:
-    try:
-        bracket_data, _, errors = _load_bracket_workbook(_get_bracket_workbook_path())
-    except Exception:
-        return pd.DataFrame()
-
-    if errors or sheet_name not in bracket_data:
-        return pd.DataFrame()
-
-    ff = bracket_data[sheet_name].copy()
-    if ff is None or len(ff) == 0 or "winner_raw" not in ff.columns:
-        return pd.DataFrame()
-
-    ff["winner_raw"] = ff["winner_raw"].map(_clean_bracket_text)
-    ff = ff[ff["winner_raw"].astype(str).str.strip().ne("")].copy()
-    if len(ff) == 0:
-        return pd.DataFrame()
-
-    team_lookup = _build_bracket_team_lookup(
-        schedule_cur if "schedule_cur" in globals() else pd.DataFrame(),
-        team_snaps if "team_snaps" in globals() else pd.DataFrame(),
-    )
-
-    rows = []
-    for _, row in ff.iterrows():
-        team1_raw = str(row.get("team1_raw", "")).strip()
-        team2_raw = str(row.get("team2_raw", "")).strip()
-        winner_raw = _clean_bracket_text(row.get("winner_raw", ""))
-        if (
-            round_bucket in {"Second_Round", "Sweet_16", "Elite_8", "Final_Four", "Championship"}
-            and _should_infer_later_round_participants(team1_raw, team2_raw, team_lookup, winner_raw=winner_raw)
-        ):
-            inferred = _infer_workbook_slot_participants(bracket_data, row.get("game_key_norm", ""), team_lookup)
-            if len(inferred) >= 1:
-                team1_raw = str(inferred[0].get("team_name", "") or "").strip()
-            if len(inferred) >= 2:
-                team2_raw = str(inferred[1].get("team_name", "") or "").strip()
-        team1_key = _bracket_team_canon(team1_raw)
-        team2_key = _bracket_team_canon(team2_raw)
-        winner_key = _bracket_team_canon(winner_raw)
-        if not winner_key or winner_key not in {team1_key, team2_key}:
-            continue
-
-        team1 = _resolve_bracket_team_lookup_entry(team1_raw, team_lookup)
-        team2 = _resolve_bracket_team_lookup_entry(team2_raw, team_lookup)
-        winner = _resolve_bracket_team_lookup_entry(winner_raw, team_lookup)
-
-        if winner_key == team1_key:
-            winner_team_name = str(winner["team_name"]) if winner is not None else team1_raw
-            loser_team_name = str(team2["team_name"]) if team2 is not None else team2_raw
-            winner_id = int(winner["team_id"]) if winner is not None else (int(team1["team_id"]) if team1 is not None else np.nan)
-            loser_id = int(team2["team_id"]) if team2 is not None else np.nan
-        else:
-            winner_team_name = str(winner["team_name"]) if winner is not None else team2_raw
-            loser_team_name = str(team1["team_name"]) if team1 is not None else team1_raw
-            winner_id = int(winner["team_id"]) if winner is not None else (int(team2["team_id"]) if team2 is not None else np.nan)
-            loser_id = int(team1["team_id"]) if team1 is not None else np.nan
-
-        rows.append({
-            "game_id": str(row.get("game_key", "")),
-            "home_id": int(team1["team_id"]) if team1 is not None else np.nan,
-            "away_id": int(team2["team_id"]) if team2 is not None else np.nan,
-            "home_team": str(team1["team_name"]) if team1 is not None else team1_raw,
-            "away_team": str(team2["team_name"]) if team2 is not None else team2_raw,
-            "winner_id": winner_id,
-            "loser_id": loser_id,
-            "winner_team": winner_team_name,
-            "loser_team": loser_team_name,
-            "round_bucket": round_bucket,
-            "status_type_completed": True,
-            "status_type_state": "post",
-            "status_type_name": "WORKBOOK_LOCKED_WINNER",
-            "status_type_short_detail": "Workbook Winner",
-            "game_dt_et": pd.NaT,
-            "result_source": result_source,
-        })
-
-    out = pd.DataFrame(rows)
-    BRACKET_COMPLETED_SOURCE_DEBUG[result_source] = {
-        "source": result_source,
-        "rows": int(len(ff)),
-        "completed_rows": int(len(out)),
-        "tournament_rows": int(len(out)),
-        "first_round_rows": int(len(out)) if round_bucket == "First_Round" else 0,
-        "first_four_rows": int(len(out)) if round_bucket == "First_Four" else 0,
-        "final_rows": int(len(out)),
-    }
-    return out
-
-
-def _completed_first_four_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("First_Four", "First_Four", "workbook_first_four")
-
-
-def _completed_first_round_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("First_Round", "First_Round", "workbook_first_round")
-
-
-def _completed_second_round_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("Second_Round", "Second_Round", "workbook_second_round")
-
-
-def _completed_sweet_16_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("Sweet_16", "Sweet_16", "workbook_sweet_16")
-
-
-def _completed_elite_8_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("Elite_8", "Elite_8", "workbook_elite_8")
-
-
-def _completed_final_four_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("Final_Four", "Final_Four", "workbook_final_four")
-
-
-def _completed_championship_from_workbook() -> pd.DataFrame:
-    return _completed_workbook_round_locks("Championship", "Championship", "workbook_championship")
-
-
-def _extract_completed_tournament_games_from_frame(df: pd.DataFrame, debug_key: str = "") -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        if debug_key:
-            BRACKET_COMPLETED_SOURCE_DEBUG[debug_key] = {
-                "source": debug_key,
-                "rows": 0,
-                "completed_rows": 0,
-                "tournament_rows": 0,
-                "first_round_rows": 0,
-                "first_four_rows": 0,
-                "final_rows": 0,
-            }
-        return pd.DataFrame()
-
-    s = normalize_board_for_downstream(df.copy())
-    s = _coerce_schedule_tournament_flags(s, debug_key=debug_key or "bracket_accuracy_source")
-    source_stats = {
-        "source": str(debug_key or "completed_source"),
-        "rows": int(len(s)),
-        "completed_rows": 0,
-        "tournament_rows": 0,
-        "first_round_rows": 0,
-        "first_four_rows": 0,
-        "final_rows": 0,
-    }
-    if "season" in s.columns:
-        s["season"] = pd.to_numeric(s["season"], errors="coerce")
-        s = s[s["season"].fillna(CURRENT_SEASON).eq(CURRENT_SEASON)].copy()
-        source_stats["rows"] = int(len(s))
-
-    completed = pd.Series(False, index=s.index)
-    completed |= s.get("status_type_completed", pd.Series(False, index=s.index)).astype(str).str.lower().isin(["true", "1", "yes"])
-    completed |= s.get("status_type_state", pd.Series("", index=s.index)).astype(str).str.lower().isin(["post", "postgame", "final"])
-    home_score = pd.to_numeric(s.get("home_score"), errors="coerce")
-    away_score = pd.to_numeric(s.get("away_score"), errors="coerce")
-    completed |= home_score.notna() & away_score.notna() & ~(home_score.eq(0) & away_score.eq(0))
-    source_stats["completed_rows"] = int(completed.sum())
-
-    text_blob = (
-        s.get("status_type_short_detail", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("status_type_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("notes", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("game_note", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("game_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("event_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("season_type", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("round_name", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("round", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("tournament_round", pd.Series("", index=s.index)).astype(str).fillna("") + " " +
-        s.get("tourney_round", pd.Series("", index=s.index)).astype(str).fillna("")
-    )
-    s["round_bucket"] = text_blob.map(_normalize_round_name)
-
-    tourney = s.get("is_ncaa_tourney", pd.Series(0, index=s.index))
-    tourney = pd.to_numeric(tourney, errors="coerce").fillna(0).astype(int).eq(1)
-    source_stats["tournament_rows"] = int(tourney.sum())
-    source_stats["first_round_rows"] = int((tourney & completed & s["round_bucket"].eq("First_Round")).sum())
-    source_stats["first_four_rows"] = int((tourney & completed & s["round_bucket"].eq("First_Four")).sum())
-    s = s[tourney & completed].copy()
-    if len(s) == 0:
-        if debug_key:
-            BRACKET_COMPLETED_SOURCE_DEBUG[debug_key] = source_stats
-        return pd.DataFrame()
-
-    s["home_id"] = pd.to_numeric(s.get("home_id"), errors="coerce")
-    s["away_id"] = pd.to_numeric(s.get("away_id"), errors="coerce")
-    s["home_score"] = pd.to_numeric(s.get("home_score"), errors="coerce")
-    s["away_score"] = pd.to_numeric(s.get("away_score"), errors="coerce")
-    s = s.dropna(subset=["home_id", "away_id", "home_score", "away_score"]).copy()
-    if len(s) == 0:
-        return pd.DataFrame()
-
-    s["home_id"] = s["home_id"].astype(int)
-    s["away_id"] = s["away_id"].astype(int)
-    s["winner_id"] = np.where(s["home_score"] >= s["away_score"], s["home_id"], s["away_id"]).astype(int)
-    s["loser_id"] = np.where(s["home_score"] >= s["away_score"], s["away_id"], s["home_id"]).astype(int)
-    s["winner_team"] = np.where(s["home_score"] >= s["away_score"], s["home_team"], s["away_team"])
-    s["loser_team"] = np.where(s["home_score"] >= s["away_score"], s["away_team"], s["home_team"])
-    s["game_dt_et"] = pd.to_datetime(s.get("game_dt_et"), errors="coerce")
-    s["result_source"] = str(debug_key or "completed_source")
-    source_stats["final_rows"] = int(len(s))
-    if debug_key:
-        BRACKET_COMPLETED_SOURCE_DEBUG[debug_key] = source_stats
-    return s[[
-        "game_id", "home_id", "away_id", "home_team", "away_team",
-        "winner_id", "loser_id", "winner_team", "loser_team",
-        "round_bucket", "status_type_completed", "status_type_state",
-        "status_type_name", "status_type_short_detail", "game_dt_et", "result_source"
-    ]].copy()
-
-
-def _completed_tournament_games_for_accuracy(asof_date=None) -> pd.DataFrame:
-    global BRACKET_COMPLETED_SOURCE_DEBUG
-    BRACKET_COMPLETED_SOURCE_DEBUG = {}
-    frames = []
-
-    if "schedule_cur" in globals() and schedule_cur is not None and len(schedule_cur) > 0:
-        sched_games = _extract_completed_tournament_games_from_frame(schedule_cur, debug_key="bracket_accuracy_schedule")
-        if len(sched_games) > 0:
-            frames.append(sched_games)
-
-    seen_board_dates = set()
-    candidate_board_dates = []
-    if asof_date is not None:
-        candidate_board_dates.append(pd.Timestamp(asof_date).date())
-        candidate_board_dates.append((pd.Timestamp(asof_date) - pd.Timedelta(days=1)).date())
-    if "LAST_DATE" in globals() and LAST_DATE is not None:
-        candidate_board_dates.append(pd.Timestamp(LAST_DATE).date())
-
-    if "LAST_BOARD" in globals() and LAST_BOARD is not None and len(LAST_BOARD) > 0:
-        live_label = f"bracket_accuracy_live_board_{pd.Timestamp(LAST_DATE).date()}" if "LAST_DATE" in globals() and LAST_DATE is not None else "bracket_accuracy_live_board"
-        live_games = _extract_completed_tournament_games_from_frame(LAST_BOARD, debug_key=live_label)
-        if len(live_games) > 0:
-            frames.append(live_games)
-
-    for board_date in candidate_board_dates:
-        if board_date is None:
-            continue
-        board_date = pd.Timestamp(board_date).date()
-        if board_date in seen_board_dates:
-            continue
-        seen_board_dates.add(board_date)
-        try:
-            if "LAST_DATE" in globals() and LAST_DATE is not None and "LAST_BOARD" in globals() and LAST_BOARD is not None and len(LAST_BOARD) > 0:
-                if pd.Timestamp(LAST_DATE).date() == board_date:
-                    board_df = LAST_BOARD.copy()
-                else:
-                    board_df, _ = _get_board_for_date_cached(board_date, force_rebuild=False)
-            else:
-                board_df, _ = _get_board_for_date_cached(board_date, force_rebuild=False)
-            board_games = _extract_completed_tournament_games_from_frame(
-                board_df,
-                debug_key=f"bracket_accuracy_board_{board_date.isoformat()}",
-            )
-            if len(board_games) > 0:
-                frames.append(board_games)
-        except Exception:
-            pass
-
-    workbook_ff = _completed_first_four_from_workbook()
-    if workbook_ff is not None and len(workbook_ff) > 0:
-        frames.append(workbook_ff.copy())
-    workbook_fr = _completed_first_round_from_workbook()
-    if workbook_fr is not None and len(workbook_fr) > 0:
-        frames.append(workbook_fr.copy())
-    workbook_sr = _completed_second_round_from_workbook()
-    if workbook_sr is not None and len(workbook_sr) > 0:
-        frames.append(workbook_sr.copy())
-    workbook_s16 = _completed_sweet_16_from_workbook()
-    if workbook_s16 is not None and len(workbook_s16) > 0:
-        frames.append(workbook_s16.copy())
-    workbook_e8 = _completed_elite_8_from_workbook()
-    if workbook_e8 is not None and len(workbook_e8) > 0:
-        frames.append(workbook_e8.copy())
-    workbook_f4 = _completed_final_four_from_workbook()
-    if workbook_f4 is not None and len(workbook_f4) > 0:
-        frames.append(workbook_f4.copy())
-    workbook_ch = _completed_championship_from_workbook()
-    if workbook_ch is not None and len(workbook_ch) > 0:
-        frames.append(workbook_ch.copy())
-
-    if not frames:
-        return pd.DataFrame()
-
-    out = pd.concat(frames, ignore_index=True, sort=False)
-    out["game_dt_et"] = pd.to_datetime(out.get("game_dt_et"), errors="coerce")
-    out["winner_key"] = out.get("winner_team", pd.Series("", index=out.index)).map(_bracket_team_canon)
-    out["loser_key"] = out.get("loser_team", pd.Series("", index=out.index)).map(_bracket_team_canon)
-    out = out.sort_values(["game_dt_et", "winner_team", "loser_team"], na_position="last").drop_duplicates(
-        subset=["winner_key", "loser_key", "round_bucket"], keep="last"
-    )
-    out = out.drop(columns=["winner_key", "loser_key"], errors="ignore")
-    return out.reset_index(drop=True)
-
-
-def _completed_tournament_lock_lookup(asof_date=None) -> tuple:
-    cache_key = json.dumps(_completed_results_runtime_signature(asof_date), sort_keys=True, default=str)
-    cached = BRACKET_COMPLETED_LOOKUP_CACHE.get(cache_key)
-    if cached is not None:
-        lookup_cached, locks_cached = cached
-        return dict(lookup_cached), locks_cached.copy()
-
-    completed_games = _completed_tournament_games_for_accuracy(asof_date=asof_date)
-    if completed_games is None or len(completed_games) == 0:
-        return {}, pd.DataFrame()
-
-    locks = completed_games.copy()
-    locks["game_dt_et"] = pd.to_datetime(locks.get("game_dt_et"), errors="coerce")
-    if asof_date is not None:
-        asof_ts = pd.Timestamp(asof_date).normalize()
-        locks = locks[locks["game_dt_et"].isna() | (locks["game_dt_et"].dt.normalize() <= asof_ts)].copy()
-    if len(locks) == 0:
-        return {}, pd.DataFrame()
-
-    locks["round_bucket"] = locks.get("round_bucket", pd.Series("", index=locks.index)).astype(str).fillna("")
-    locks["team_pair_key"] = locks.apply(
-        lambda r: tuple(sorted([
-            _bracket_team_canon(r.get("home_team", "")),
-            _bracket_team_canon(r.get("away_team", "")),
-        ])),
-        axis=1,
-    )
-    locks["winner_key"] = locks.get("winner_team", pd.Series("", index=locks.index)).map(_bracket_team_canon)
-    locks = locks.sort_values(["game_dt_et", "winner_team", "loser_team"], na_position="last")
-    locks = locks.drop_duplicates(subset=["round_bucket", "team_pair_key"], keep="last").reset_index(drop=True)
-
-    lookup = {}
-    for _, row in locks.iterrows():
-        lookup[(str(row.get("round_bucket", "") or ""), tuple(row.get("team_pair_key", ())))] = row.to_dict()
-    BRACKET_COMPLETED_LOOKUP_CACHE.clear()
-    BRACKET_COMPLETED_LOOKUP_CACHE[cache_key] = (dict(lookup), locks.copy())
-    return lookup, locks
-
-
-def _lookup_completed_bracket_winner(round_bucket: str, team_a_name: str, team_b_name: str, completed_lookup: dict):
-    if not completed_lookup:
-        return None
-    pair_key = tuple(sorted([
-        _bracket_team_canon(team_a_name),
-        _bracket_team_canon(team_b_name),
-    ]))
-    exact = completed_lookup.get((str(round_bucket or ""), pair_key))
-    if exact is not None:
-        return exact
-    pair_matches = [row for (rb, pk), row in completed_lookup.items() if pk == pair_key]
-    if len(pair_matches) == 1:
-        return pair_matches[0]
-    return None
-
-
-def _completed_lock_debug_summary(asof_date, completed_games: pd.DataFrame, completed_lookup: dict) -> dict:
-    out = {
-        "asof_date": str(pd.Timestamp(asof_date).date()) if asof_date is not None else "",
-        "completed_games_detected": 0,
-        "lookup_rows": 0,
-        "round_buckets_found": "none",
-        "example_locked_pairs": "none",
-        "blank_round_rows": 0,
-        "first_round_count": 0,
-        "first_round_examples": "none",
-        "sources": "none",
-        "source_details": "none",
-        "first_round_sources": "none",
-    }
-    if completed_games is None or len(completed_games) == 0:
-        return out
-
-    cg = completed_games.copy()
-    cg["round_bucket"] = cg.get("round_bucket", pd.Series("", index=cg.index)).fillna("").astype(str)
-    out["completed_games_detected"] = int(len(cg))
-    out["lookup_rows"] = int(len(completed_lookup or {}))
-    out["blank_round_rows"] = int(cg["round_bucket"].str.strip().eq("").sum())
-
-    bucket_counts = cg["round_bucket"].replace("", "(blank)").value_counts()
-    if len(bucket_counts):
-        out["round_buckets_found"] = " | ".join([f"{idx}: {int(val)}" for idx, val in bucket_counts.head(8).items()])
-
-    sample = cg.head(5).copy()
-    if len(sample):
-        out["example_locked_pairs"] = " | ".join([
-            f"{str(r.get('round_bucket', '') or '(blank)')}: {str(r.get('away_team', '') or '').strip()} vs {str(r.get('home_team', '') or '').strip()} -> {str(r.get('winner_team', '') or '').strip()}"
-            for _, r in sample.iterrows()
-        ])
-
-    first_round = cg[cg["round_bucket"].eq("First_Round")].copy()
-    out["first_round_count"] = int(len(first_round))
-    if len(first_round):
-        out["first_round_examples"] = " | ".join([
-            f"{str(r.get('away_team', '') or '').strip()} vs {str(r.get('home_team', '') or '').strip()} -> {str(r.get('winner_team', '') or '').strip()}"
-            for _, r in first_round.head(5).iterrows()
-        ])
-
-    if "result_source" in cg.columns:
-        src_counts = cg["result_source"].fillna("").astype(str).replace("", "(unknown)").value_counts()
-        if len(src_counts):
-            out["sources"] = " | ".join([f"{idx}: {int(val)}" for idx, val in src_counts.items()])
-
-    src_debug = globals().get("BRACKET_COMPLETED_SOURCE_DEBUG", {}) or {}
-    if src_debug:
-        out["source_details"] = " | ".join([
-            f"{name}: rows={int(meta.get('rows', 0))}, completed={int(meta.get('completed_rows', 0))}, tourney={int(meta.get('tournament_rows', 0))}, first_round={int(meta.get('first_round_rows', 0))}, final={int(meta.get('final_rows', 0))}"
-            for name, meta in src_debug.items()
-        ])
-        first_round_sources = [name for name, meta in src_debug.items() if int(meta.get("first_round_rows", 0)) > 0]
-        if first_round_sources:
-            out["first_round_sources"] = " | ".join(first_round_sources)
-    return out
-
-
-def _build_bracket_accuracy_report(summary_df: pd.DataFrame, latest_run_df: pd.DataFrame, asof_date=None) -> dict:
-    # Keep accuracy/integrity counts aligned with the same authoritative lock source
-    # used by the Bracket Sim tab.
-    completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
-    report = {
-        "completed_games": int(len(completed_games)),
-        "locked_winners": int(len(completed_lookup or {})),
-        "integrity_counts": {},
-        "integrity_tables": {},
-        "calibration": {},
-        "status_note": "",
-    }
-
-    if completed_games is None or len(completed_games) == 0:
-        report["status_note"] = "No completed NCAA tournament games detected yet."
-        return report
-
-    # -----------------------
-    # Calibration section
-    # -----------------------
-    calib_rows = []
-    for _, row in completed_games.iterrows():
-        try:
-            pred = _predict_neutral_matchup(
-                {"team_id": int(row["home_id"]), "team_name": str(row["home_team"])},
-                {"team_id": int(row["away_id"]), "team_name": str(row["away_team"])},
-                row["game_dt_et"].date() if pd.notna(row["game_dt_et"]) else date_picker.value,
-            )
-        except Exception:
-            continue
-
-        p_home = float(pred.get("p_team_a_win", np.nan))
-        if pd.isna(p_home):
-            continue
-        actual_home = 1.0 if int(row["winner_id"]) == int(row["home_id"]) else 0.0
-        p_actual = p_home if actual_home == 1.0 else (1.0 - p_home)
-        favorite_team = str(row["home_team"]) if p_home >= 0.5 else str(row["away_team"])
-        favorite_won = 1.0 if str(row["winner_team"]) == favorite_team else 0.0
-        calib_rows.append({
-            "round_bucket": str(row.get("round_bucket", "") or ""),
-            "away_team": str(row["away_team"]),
-            "home_team": str(row["home_team"]),
-            "winner_team": str(row["winner_team"]),
-            "winner_id": int(row["winner_id"]),
-            "p_home_win": p_home,
-            "p_actual_winner": p_actual,
-            "predicted_win_prob": max(p_home, 1.0 - p_home),
-            "predicted_team": favorite_team,
-            "predicted_team_won": favorite_won,
-            "actual_home_win": actual_home,
-            "brier": (p_home - actual_home) ** 2,
-            "log_loss": -(actual_home * np.log(np.clip(p_home, 1e-6, 1 - 1e-6)) + (1 - actual_home) * np.log(np.clip(1 - p_home, 1e-6, 1 - 1e-6))),
-        })
-
-    calib_df = pd.DataFrame(calib_rows)
-    if len(calib_df):
-        report["calibration"]["brier"] = float(calib_df["brier"].mean())
-        report["calibration"]["log_loss"] = float(calib_df["log_loss"].mean())
-
-        bucket_edges = np.linspace(0.0, 1.0, 6)
-        calib_df["bucket"] = pd.cut(calib_df["predicted_win_prob"], bins=bucket_edges, include_lowest=True)
-        bucket_table = (
-            calib_df.groupby("bucket", dropna=False)
-            .agg(
-                Games=("predicted_win_prob", "size"),
-                AvgPred=("predicted_win_prob", "mean"),
-                WinRate=("predicted_team_won", "mean"),
-            )
-            .reset_index()
-        )
-        bucket_table["AvgPred"] = (100.0 * bucket_table["AvgPred"]).round(1)
-        bucket_table["WinRate"] = (100.0 * bucket_table["WinRate"]).round(1)
-        report["calibration"]["buckets"] = bucket_table
-
-        misses = calib_df.sort_values("p_actual_winner", ascending=True).head(12).copy()
-        misses["Pred Win%"] = (100.0 * misses["p_actual_winner"]).round(1)
-        report["calibration"]["biggest_misses"] = misses[[
-            "round_bucket", "away_team", "home_team", "winner_team", "Pred Win%"
-        ]].rename(columns={"round_bucket": "Round"})
-        actual_vs_sim = calib_df.copy()
-        actual_vs_sim["Pred Home Win%"] = (100.0 * actual_vs_sim["p_home_win"]).round(1)
-        actual_vs_sim["Pred Winner Win%"] = (100.0 * actual_vs_sim["p_actual_winner"]).round(1)
-        actual_vs_sim["Upset"] = np.where(actual_vs_sim["p_actual_winner"] < 0.5, "Yes", "")
-        report["calibration"]["actual_vs_sim"] = actual_vs_sim[[
-            "round_bucket", "away_team", "home_team", "winner_team", "Pred Home Win%", "Pred Winner Win%", "Upset"
-        ]].rename(columns={"round_bucket": "Round"})
-
-    # -----------------------
-    # Integrity section
-    # -----------------------
-    if summary_df is None or len(summary_df) == 0:
-        report["status_note"] = (report["status_note"] + " " if report["status_note"] else "") + "Run the bracket sim to populate integrity checks."
-        return report
-
-    s = summary_df.copy()
-    pct_cols = [c for c in s.columns if c.endswith("_Pct")]
-    for c in pct_cols:
-        s[c] = pd.to_numeric(s[c], errors="coerce").fillna(0.0)
-    s["team_id"] = pd.to_numeric(s["team_id"], errors="coerce")
-    s = s.dropna(subset=["team_id"]).copy()
-    s["team_id"] = s["team_id"].astype(int)
-
-    actual = {}
-    for _, row in completed_games.iterrows():
-        req_ids = pd.to_numeric(pd.Series([
-            row.get("home_id", np.nan),
-            row.get("away_id", np.nan),
-            row.get("winner_id", np.nan),
-            row.get("loser_id", np.nan),
-        ]), errors="coerce")
-        if req_ids.isna().any():
-            continue
-        cur_round = str(row.get("round_bucket", "") or "")
-        nxt_round = _next_advancement_bucket(cur_round)
-        for tid in [int(row["home_id"]), int(row["away_id"])]:
-            actual.setdefault(tid, {"reached": set(), "lost": False, "team": "", "winner_team": ""})
-            actual[tid]["reached"].add(cur_round)
-        actual[int(row["winner_id"])]["reached"].add(nxt_round)
-        actual[int(row["winner_id"])]["team"] = str(row["winner_team"])
-        actual[int(row["loser_id"])]["team"] = str(row["loser_team"])
-        actual[int(row["loser_id"])]["lost"] = True
-
-    future_cols = {
-        "First_Four": ["First_Round_Pct", "Second_Round_Pct", "Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
-        "First_Round": ["Second_Round_Pct", "Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
-        "Second_Round": ["Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
-        "Sweet_16": ["Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
-        "Elite_8": ["Final_Four_Pct", "Finalist_Pct", "Champion_Pct"],
-        "Final_Four": ["Finalist_Pct", "Champion_Pct"],
-        "Championship": ["Champion_Pct"],
-        "Champion": [],
-    }
-
-    eliminated_rows = []
-    alive_zero_rows = []
-    for _, row in s.iterrows():
-        tid = int(row["team_id"])
-        if tid not in actual:
-            continue
-        reached = [r for r in BRACKET_BUCKETS if r in actual[tid]["reached"]]
-        last_reached = reached[-1] if reached else ""
-
-        if actual[tid]["lost"] and last_reached:
-            future_prob = float(sum(pd.to_numeric(row.get(c, 0.0), errors="coerce") for c in future_cols.get(last_reached, [])))
-            if future_prob > 0.01:
-                eliminated_rows.append({
-                    "team": row.get("team", actual[tid].get("team", "")),
-                    "seed": row.get("seed", ""),
-                    "region": row.get("region", ""),
-                    "Last Reached": last_reached,
-                    "Future Prob Sum": round(future_prob, 2),
-                })
-
-        if not actual[tid]["lost"]:
-            for bucket in reached:
-                col = f"{bucket}_Pct"
-                if col in row and float(pd.to_numeric(row.get(col), errors="coerce")) <= 0.0:
-                    alive_zero_rows.append({
-                        "team": row.get("team", actual[tid].get("team", "")),
-                        "seed": row.get("seed", ""),
-                        "region": row.get("region", ""),
-                        "Reached": bucket,
-                        "Prob": float(pd.to_numeric(row.get(col), errors="coerce")),
-                    })
-                    break
-
-    monotonic_violations = []
-    monotonic_cols = ["First_Round_Pct", "Second_Round_Pct", "Sweet_16_Pct", "Elite_8_Pct", "Final_Four_Pct", "Finalist_Pct", "Champion_Pct"]
-    for _, row in s.iterrows():
-        vals = [float(pd.to_numeric(row.get(c), errors="coerce")) for c in monotonic_cols if c in s.columns]
-        if any(vals[i] < vals[i + 1] - 1e-9 for i in range(len(vals) - 1)):
-            monotonic_violations.append({
-                "team": row.get("team", ""),
-                "seed": row.get("seed", ""),
-                "region": row.get("region", ""),
-            })
-
-    report["integrity_counts"] = {
-        "completed_games": int(len(completed_games)),
-        "locked_winners": int(len(completed_lookup or {})),
-        "eliminated_with_future_prob": int(len(eliminated_rows)),
-        "alive_with_zero_reached_prob": int(len(alive_zero_rows)),
-        "round_probability_violations": int(len(monotonic_violations)),
-    }
-    report["integrity_tables"] = {
-        "eliminated": pd.DataFrame(eliminated_rows).head(20),
-        "alive_zero": pd.DataFrame(alive_zero_rows).head(20),
-        "monotonic": pd.DataFrame(monotonic_violations).head(20),
-    }
-    return report
-
-
-def _render_bracket_accuracy(_=None):
-    bracket_acc_status_html.value = ""
-    with bracket_acc_out:
-        clear_output(wait=True)
-        display(HTML("<div style='color:#AAA; padding:8px;'>Loading bracket accuracy...</div>"))
-
-    sim_n = int(bracket_sim_n.value)
-    asof_date = bracket_asof_date.value or date_picker.value
-    completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
-    signature = _bracket_cache_signature(sim_n, asof_date, completed_games=completed_games)
-
-    payload = None
-    try:
-        payload = _load_cached_bracket_sim(signature)
-    except Exception as e:
-        bracket_acc_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Could not load bracket sim cache: {e}</div>"
-
-    summary_df = payload.get("summary_df") if isinstance(payload, dict) else pd.DataFrame()
-    latest_run_df = payload.get("latest_run_df") if isinstance(payload, dict) else pd.DataFrame()
-    report = _build_bracket_accuracy_report(summary_df, latest_run_df, asof_date=asof_date)
-    if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
-        base_note = report.get("status_note", "")
-        extra_note = "Run the Bracket Sim tab for this as-of date and sim count to populate accuracy checks."
-        report["status_note"] = f"{base_note} {extra_note}".strip()
-
-    note = report.get("status_note", "")
-    if note:
-        bracket_acc_status_html.value = f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#CCC;'>{note}</div>"
-    else:
-        bracket_acc_status_html.value = ""
-
-    if not isinstance(payload, dict) or summary_df is None or len(summary_df) == 0:
-        with bracket_acc_out:
-            clear_output(wait=True)
-            display(HTML("<div style='color:#AAA; padding:8px;'>Run the Bracket Sim tab first to populate accuracy checks.</div>"))
-        return
-
-    integrity = report.get("integrity_counts", {})
-    calib = report.get("calibration", {})
-    brier_txt = ""
-    log_loss_txt = ""
-    if "brier" in calib and pd.notna(calib.get("brier")):
-        brier_txt = f"{float(calib['brier']):.4f}"
-    if "log_loss" in calib and pd.notna(calib.get("log_loss")):
-        log_loss_txt = f"{float(calib['log_loss']):.4f}"
-    with bracket_acc_out:
-        clear_output(wait=True)
-
-        display(HTML(
-            "<div style='color:#EEE; font-weight:700; margin:0 0 8px 0;'>Simulation Integrity</div>"
-            f"<div style='color:#CFCFCF; margin-bottom:10px;'>"
-            f"Completed tournament games detected: <b>{integrity.get('completed_games', report.get('completed_games', 0))}</b>"
-            f" &nbsp;|&nbsp; Locked winners applied: <b>{integrity.get('locked_winners', report.get('locked_winners', 0))}</b>"
-            f" &nbsp;|&nbsp; Eliminated teams with future probability: <b>{integrity.get('eliminated_with_future_prob', 0)}</b>"
-            f" &nbsp;|&nbsp; Alive teams with impossible zero reached-round probability: <b>{integrity.get('alive_with_zero_reached_prob', 0)}</b>"
-            f" &nbsp;|&nbsp; Round probability consistency violations: <b>{integrity.get('round_probability_violations', 0)}</b>"
-            f"</div>"
-        ))
-
-        for title, key in [
-            ("Eliminated But Still Showing Future Advancement", "eliminated"),
-            ("Alive But Zero In Already-Reached Rounds", "alive_zero"),
-            ("Round Probability Consistency Checks", "monotonic"),
-        ]:
-            df = report.get("integrity_tables", {}).get(key, pd.DataFrame())
-            if df is not None and len(df) > 0:
-                display(HTML(f"<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>{title}</div>"))
-                display(HTML(df_to_html_table(df, max_rows=min(len(df), 20))))
-
-        display(HTML("<div style='color:#EEE; font-weight:700; margin:16px 0 8px 0;'>Simulation Accuracy / Calibration</div>"))
-        display(HTML(
-            f"<div style='color:#CFCFCF; margin-bottom:10px;'>"
-            f"Brier score: <b>{brier_txt}</b>"
-            f" &nbsp;|&nbsp; Log loss: <b>{log_loss_txt}</b>"
-            f"</div>"
-        ))
-
-        buckets = calib.get("buckets", pd.DataFrame())
-        if buckets is not None and len(buckets) > 0:
-            buckets = buckets.rename(columns={
-                "bucket": "Bucket",
-                "AvgPred": "Avg Pred",
-                "WinRate": "Win Rate",
-            })
-            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Calibration Buckets</div>"))
-            display(HTML(df_to_html_table(buckets, max_rows=len(buckets))))
-
-        misses = calib.get("biggest_misses", pd.DataFrame())
-        if misses is not None and len(misses) > 0:
-            misses = misses.rename(columns={
-                "away_team": "Away",
-                "home_team": "Home",
-                "winner_team": "Winner",
-            })
-            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Biggest Misses / Upsets</div>"))
-            display(HTML(df_to_html_table(misses, max_rows=min(len(misses), 20))))
-
-        actual_vs_sim = calib.get("actual_vs_sim", pd.DataFrame())
-        if actual_vs_sim is not None and len(actual_vs_sim) > 0:
-            actual_vs_sim = actual_vs_sim.rename(columns={
-                "away_team": "Away",
-                "home_team": "Home",
-                "winner_team": "Winner",
-                "Pred Home Win%": "Pred Home",
-                "Pred Winner Win%": "Pred Winner",
-            })
-            display(HTML("<div style='color:#EEE; font-weight:700; margin:12px 0 8px 0;'>Actual Winners vs Simulated Win Probabilities</div>"))
-            display(HTML(df_to_html_table(actual_vs_sim, max_rows=min(len(actual_vs_sim), 30))))
-
-
-def run_bracket_simulation(_=None, force_run: bool = True):
-    status_lines = []
-    sim_progress_state = {"done": 0, "total": 0}
-
-    def _push_bracket_status(line: str):
-        status_lines.append(str(line))
-        _render_bracket_status()
-
-    def _render_bracket_status():
-        progress_html = ""
-        done = int(sim_progress_state.get("done", 0) or 0)
-        total = int(sim_progress_state.get("total", 0) or 0)
-        if total > 0:
-            pct = 100.0 * done / total if total else 0.0
-            progress_html = (
-                f"<div style='margin-top:8px;color:#CFCFCF;'>"
-                f"Sim progress: <b>{done:,}</b> / <b>{total:,}</b> "
-                f"(<b>{pct:.1f}%</b>)"
-                f"</div>"
-            )
-        with bracket_out:
-            clear_output(wait=True)
-            display(HTML(
-                "<div style='color:#AAA; padding:8px;'>" +
-                "<br>".join(status_lines) +
-                progress_html +
-                "</div>"
-            ))
-
-    bracket_status_html.value = ""
-    bracket_summary_html.value = ""
-    _push_bracket_status("Loading bracket workbook...")
-
-    sim_n = int(bracket_sim_n.value)
-    asof_date = bracket_asof_date.value or date_picker.value
-    team_lookup = _build_bracket_team_lookup(schedule_cur, team_snaps)
-
-    bracket_data, info_msgs, errors = _load_bracket_workbook(_get_bracket_workbook_path())
-    if errors:
-        bracket_status_html.value = (
-            "<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>"
-            + "<br>".join(errors) + "</div>"
-        )
-        with bracket_out:
-            clear_output(wait=True)
-        return
-
-    bracket_games, unresolved_df = _canonicalize_bracket_teams(bracket_data, team_lookup)
-    if unresolved_df is not None and len(unresolved_df) > 0:
-        bracket_status_html.value = (
-            "<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;font-weight:700;'>"
-            "Unresolved workbook teams found. Fix these names before simulating."
-            "</div>"
-        )
-        with bracket_out:
-            clear_output(wait=True)
-            display(HTML(df_to_html_table(unresolved_df, max_rows=len(unresolved_df))))
-        return
-
-    normalized_data = dict(bracket_data)
-    normalized_data["Bracket_Games"] = bracket_games
-    info_msgs.extend(_collect_second_round_participant_warnings(normalized_data, team_lookup))
-    completed_lookup, completed_games = _completed_tournament_lock_lookup(asof_date)
-    lock_debug = _completed_lock_debug_summary(asof_date, completed_games, completed_lookup)
-    round_counts = {}
-    source_counts = {}
-    if completed_games is not None and len(completed_games) > 0:
-        round_counts = (
-            completed_games.get("round_bucket", pd.Series("", index=completed_games.index))
-            .fillna("")
-            .astype(str)
-            .value_counts()
-            .to_dict()
-        )
-        if "result_source" in completed_games.columns:
-            source_counts = (
-                completed_games["result_source"]
-                .fillna("")
-                .astype(str)
-                .replace("", "(unknown)")
-                .value_counts()
-                .to_dict()
-            )
-    first_round_locked = int(round_counts.get("First_Round", 0))
-    first_four_locked = int(round_counts.get("First_Four", 0))
-    source_summary = " | ".join([f"{k}: {int(v)}" for k, v in source_counts.items()]) if source_counts else "none"
-    signature = _bracket_cache_signature(sim_n, asof_date, completed_games=completed_games)
-
-    payload = None
-    if not force_run:
-        _push_bracket_status("Checking cache...")
-        try:
-            payload = _load_cached_bracket_sim(signature)
-        except Exception as e:
-            bracket_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Bracket cache load failed: {e}</div>"
-            with bracket_out:
-                clear_output(wait=True)
-            return
-        if payload is not None:
-            _push_bracket_status("Cache hit loading saved simulation")
-            _push_bracket_status("Loading simulation from disk")
-            extra = ""
-            if info_msgs:
-                extra = "<br>" + "<br>".join(info_msgs)
-            warnings = _validate_bracket_summary(payload.get("summary_df"))
-            warn_html = _warning_html("Bracket validation", warnings)
-            cached_run = payload.get("latest_run_df", pd.DataFrame())
-            locked_count = 0
-            if cached_run is not None and len(cached_run) > 0 and "locked_result" in cached_run.columns:
-                locked_count = int(pd.to_numeric(cached_run["locked_result"], errors="coerce").fillna(0).astype(int).sum())
-            warning_line = "<br>WARNING: No First Round games locked" if first_round_locked == 0 else ""
-            bracket_status_html.value = (
-                f"<div style='background:#111;border-left:4px solid #555;padding:10px;color:#bbb;'>"
-                f"Loaded cached bracket simulation for {signature['asof_date']} ({sim_n} sims).<br>"
-                f"Locked games: <b>{locked_count}</b> (First Round: <b>{first_round_locked}</b> | First Four: <b>{first_four_locked}</b>)<br>"
-                f"Result sources: {source_summary}"
-                f"{warning_line}{extra}</div>"
-                + warn_html
-            )
-            # Verbose debug kept for later if needed:
-            # f"As-of date: <b>{lock_debug['asof_date']}</b><br>"
-            # f"Result sources: {lock_debug['sources']}<br>"
-            # f"Source details: {lock_debug['source_details']}<br>"
-            # f"Round buckets found: {lock_debug['round_buckets_found']}<br>"
-            # f"First_Round games detected: <b>{lock_debug['first_round_count']}</b><br>"
-            # f"First_Round supplied by: {lock_debug['first_round_sources']}<br>"
-            # f"Example First_Round locked pairs: {lock_debug['first_round_examples']}<br>"
-            # f"Blank round rows: <b>{lock_debug['blank_round_rows']}</b><br>"
-            # f"Example locked pairs: {lock_debug['example_locked_pairs']}"
-            _render_bracket_results(payload.get("summary_df"), payload.get("latest_run_df"))
-            _dashboard_log(
-                "bracket_sim",
-                selected_date=str(asof_date),
-                games_processed=int(len(payload.get("latest_run_df", pd.DataFrame()))),
-                warnings=warnings,
-                cache_hit=True,
-                sim_n=sim_n,
-            )
-            return
-        _push_bracket_status("Cache miss rebuilding bracket")
-    else:
-        _push_bracket_status("Cache miss rebuilding bracket")
-
-    try:
-        _push_bracket_status(f"Running simulations ({sim_n} sims)...")
-        sim_progress_state["done"] = 0
-        sim_progress_state["total"] = int(sim_n)
-
-        def _on_sim_progress(done, total):
-            sim_progress_state["done"] = int(done)
-            sim_progress_state["total"] = int(total)
-            _render_bracket_status()
-
-        adv_df, latest_run_df = _simulate_bracket_many(
-            normalized_data,
-            team_lookup,
-            asof_date,
-            sim_n,
-            completed_lookup=completed_lookup,
-            progress_callback=_on_sim_progress,
-        )
-        sim_progress_state["done"] = int(sim_n)
-        sim_progress_state["total"] = int(sim_n)
-        _render_bracket_status()
-        summary_df = _summarize_bracket_simulations(adv_df, sim_n, completed_games=completed_games)
-        _save_cached_bracket_sim(signature, summary_df, latest_run_df)
-        _push_bracket_status("Simulation complete")
-    except Exception as e:
-        bracket_status_html.value = f"<div style='background:#2a0000;border-left:4px solid #ff4d4f;padding:10px;color:#ffb4b4;'>Bracket simulation failed: {e}</div>"
-        with bracket_out:
-            clear_output(wait=True)
-        return
-
-    extra = ""
-    if info_msgs:
-        extra = "<br>" + "<br>".join(info_msgs)
-    warnings = _validate_bracket_summary(summary_df)
-    warn_html = _warning_html("Bracket validation", warnings)
-    locked_count = 0
-    if latest_run_df is not None and len(latest_run_df) > 0 and "locked_result" in latest_run_df.columns:
-        locked_count = int(pd.to_numeric(latest_run_df["locked_result"], errors="coerce").fillna(0).astype(int).sum())
-    warning_line = "<br>WARNING: No First Round games locked" if first_round_locked == 0 else ""
-    bracket_status_html.value = (
-        f"<div style='background:#111;border-left:4px solid #2ECC71;padding:10px;color:#bbb;'>"
-        f"Completed bracket simulation for {pd.Timestamp(asof_date).date()} ({sim_n} sims).<br>"
-        f"Locked games: <b>{locked_count}</b> (First Round: <b>{first_round_locked}</b> | First Four: <b>{first_four_locked}</b>)<br>"
-        f"Result sources: {source_summary}"
-        f"{warning_line}{extra}</div>"
-        + warn_html
-    )
-    # Verbose debug kept for later if needed:
-    # f"As-of date: <b>{lock_debug['asof_date']}</b><br>"
-    # f"Result sources: {lock_debug['sources']}<br>"
-    # f"Source details: {lock_debug['source_details']}<br>"
-    # f"Round buckets found: {lock_debug['round_buckets_found']}<br>"
-    # f"First_Round games detected: <b>{lock_debug['first_round_count']}</b><br>"
-    # f"First_Round supplied by: {lock_debug['first_round_sources']}<br>"
-    # f"Example First_Round locked pairs: {lock_debug['first_round_examples']}<br>"
-    # f"Blank round rows: <b>{lock_debug['blank_round_rows']}</b><br>"
-    # f"Example locked pairs: {lock_debug['example_locked_pairs']}<br>"
-    _render_bracket_results(summary_df, latest_run_df)
-    _dashboard_log(
-        "bracket_sim",
-        selected_date=str(asof_date),
-        games_processed=int(len(latest_run_df)),
-        warnings=warnings,
-        cache_hit=False,
-        sim_n=sim_n,
-    )
-    if "dashboard_tabs" in globals() and getattr(dashboard_tabs, "selected_index", None) == 3:
-        _render_bracket_accuracy()
-
-
-def force_retrain_clicked(_=None):
-    import html
-    import traceback
-
-    _dashboard_log("force_retrain", status="start", selected_date=str(date_picker.value))
-    with out:
-        clear_output(wait=True)
-        display(HTML("<div style='color:#FFD700;'>Starting force retrain...</div>"))
-        try:
-            result = check_and_retrain(force_data=True, force_model=True)
-            training_rows = int((result or {}).get("training_rows", 0) or 0)
-            injury_cols_in_features = list((result or {}).get("injury_cols_in_features", []) or [])
-            injury_cols_in_dataset = list((result or {}).get("injury_cols_in_dataset", []) or [])
-            sig = str((result or {}).get("training_input_signature", "") or "")
-            display(HTML(
-                "<div style='color:#9FD89F; padding:6px 0;'>"
-                f"Force retrain completed. Data refresh: <b>{html.escape(str((result or {}).get('data_refresh_action', 'unknown')))}</b>"
-                f" | Model refresh: <b>{html.escape(str((result or {}).get('model_refresh_action', 'unknown')))}</b>"
-                "</div>"
-            ))
-            display(HTML(
-                "<div style='color:#bbb; padding:2px 0 8px 0;'>"
-                f"Training rows: <b>{training_rows:,}</b><br>"
-                f"Injury columns in training dataset: <b>{html.escape(', '.join(injury_cols_in_dataset) if injury_cols_in_dataset else 'none')}</b><br>"
-                f"Injury columns in final trained feature set: <b>{html.escape(', '.join(injury_cols_in_features) if injury_cols_in_features else 'none')}</b><br>"
-                f"ATS edge threshold: <b>{html.escape(str((result or {}).get('ats_edge_threshold', 'unknown')))}</b><br>"
-                f"Spread ensemble LGB weight: <b>{html.escape(str((result or {}).get('spread_ensemble_weight_lgb', 'unknown')))}</b><br>"
-                f"Market blend: <b>{html.escape(str((result or {}).get('market_blend', 'unknown')))}</b><br>"
-                f"Saved model timestamp: <b>{html.escape(str((result or {}).get('last_model_fit', 'unknown')))}</b><br>"
-                f"Feature signature: <b>{html.escape(sig)}</b>"
-                "</div>"
-            ))
-        except Exception as e:
-            tb = traceback.format_exc()
-            _dashboard_log("force_retrain", status="error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
-            display(HTML(
-                "<div style='color:#ffb4b4; padding:6px 0;'>"
-                f"Force retrain failed: {html.escape(str(e))}</div>"
-                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
-            ))
-            return
-
-    try:
-        refresh(force_rebuild=True)
-    except Exception as e:
-        tb = traceback.format_exc()
-        _dashboard_log("force_retrain", status="refresh_error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
-        with out:
-            display(HTML(
-                "<div style='color:#ffb4b4; padding:6px 0;'>"
-                f"Retrain succeeded, but dashboard refresh failed: {html.escape(str(e))}</div>"
-                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
-            ))
-        return
-
-    with out:
-        display(HTML("<div style='color:#9FD89F; padding:6px 0;'>Force retrain flow finished.</div>"))
-    _dashboard_log("force_retrain", status="completed", selected_date=str(date_picker.value))
-
-
-def predictions_refresh_clicked(_=None):
-    import html
-    import traceback
-
-    FILTERED_BOARD_CACHE.clear()
-    HC_FILTER_CACHE.clear()
-    with out:
-        clear_output(wait=True)
-        display(HTML("<div style='color:#AAA; padding:8px;'>Predictions refresh clicked</div>"))
-    try:
-        refresh(force_rebuild=True)
-    except Exception as e:
-        tb = traceback.format_exc()
-        _dashboard_log("predictions_refresh", status="error", selected_date=str(date_picker.value), error=str(e), traceback=tb)
-        with out:
-            clear_output(wait=True)
-            display(HTML(
-                "<div style='color:#ffb4b4; padding:8px;'>"
-                f"Predictions refresh failed: {html.escape(str(e))}</div>"
-                f"<pre style='white-space:pre-wrap; color:#ffb4b4; background:#111; border:1px solid #333; padding:8px;'>{html.escape(tb)}</pre>"
-            ))
-
-
-def _rebind_button_click(button, handler):
-    if hasattr(button, "_click_handlers") and hasattr(button._click_handlers, "callbacks"):
-        button._click_handlers.callbacks = []
-    button.on_click(handler)
-
-
-def _rebind_observer(widget, handler, names="value"):
-    try:
-        widget.unobserve(handler, names=names)
-    except Exception:
-        pass
-    try:
-        if hasattr(widget, "_trait_notifiers"):
-            notifiers = widget._trait_notifiers.get(names, {})
-            if "change" in notifiers:
-                notifiers["change"] = []
-    except Exception:
-        pass
-    widget.observe(handler, names=names)
-
-
-def _on_filter_widget_change(change):
-    if change.get("name") != "value":
-        return
-    FILTERED_BOARD_CACHE.clear()
-    HC_FILTER_CACHE.clear()
-    refresh()
-
-
-def _on_date_change(change):
-    if change.get("name") != "value":
-        return
-    FILTERED_BOARD_CACHE.clear()
-    HC_FILTER_CACHE.clear()
-    refresh()
-
-
-def _on_tournament_mode_change(change):
-    if change.get("name") != "value":
-        return
-    FILTERED_BOARD_CACHE.clear()
-    HC_FILTER_CACHE.clear()
-    refresh(force_rebuild=True)
-
-
-_rebind_button_click(refresh_btn, predictions_refresh_clicked)
 _rebind_button_click(retrain_btn, force_retrain_clicked)
 _rebind_button_click(open_dashboard_btn, open_dashboard_clicked)
 _rebind_button_click(compare_btn, render_matchup)
 _rebind_button_click(run_bracket_btn, lambda _: run_bracket_simulation(force_run=True))
 _rebind_button_click(refresh_bracket_acc_btn, _render_bracket_accuracy)
+_rebind_button_click(season_viz_refresh_btn, lambda _: _render_season_visualizations(force=True))
 _rebind_observer(date_picker, _on_date_change, names="value")
 
 for widget in [min_conf, min_abs_margin, side_filter, neutral_only, show_inj,
                show_rw_missing, search_box, max_rows]:
     _rebind_observer(widget, _on_filter_widget_change, names="value")
 _rebind_observer(tournament_mode, _on_tournament_mode_change, names="value")
+for widget in [season_viz_team, season_viz_conf, season_viz_metric, season_viz_opponent]:
+    _rebind_observer(widget, _season_viz_filter_changed, names="value")
 
 # Layout
-controls_row1 = widgets.HBox([date_picker, refresh_btn, retrain_btn, open_dashboard_btn])
+controls_row1 = widgets.HBox([date_picker, retrain_btn, open_dashboard_btn])
 controls_row2 = widgets.HBox([min_conf, min_abs_margin, side_filter])
 controls_row3 = widgets.HBox([neutral_only, show_inj, show_rw_missing, tournament_mode, search_box, max_rows])
-matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, matchup_date_picker, compare_btn])
+matchup_controls = widgets.HBox([matchup_team_a, matchup_team_b, compare_btn])
+season_viz_controls = widgets.HBox([season_viz_team, season_viz_conf, season_viz_metric, season_viz_refresh_btn])
+season_viz_bottom_controls = widgets.HBox([season_viz_opponent])
 bracket_controls = widgets.HBox([bracket_sim_n, bracket_asof_date, run_bracket_btn])
 matchup_tab = widgets.VBox([matchup_controls, matchup_out, matchup_radar_section, matchup_snapshot_out])
+season_viz_tab = widgets.VBox([season_viz_controls, season_viz_status_html, season_viz_out, season_viz_bottom_controls])
 bracket_tab = widgets.VBox([bracket_controls, bracket_status_html, bracket_summary_html, bracket_out])
 bracket_acc_tab = widgets.VBox([refresh_bracket_acc_btn, bracket_acc_status_html, bracket_acc_out])
 predictions_tab = widgets.VBox([controls_row1, controls_row2, controls_row3, tournament_banner_html, out])
-dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab, bracket_tab, bracket_acc_tab])
+dashboard_tabs = widgets.Tab(children=[predictions_tab, matchup_tab, season_viz_tab, bracket_tab, bracket_acc_tab])
 dashboard_tabs.set_title(0, "Predictions")
 dashboard_tabs.set_title(1, "Matchup")
-dashboard_tabs.set_title(2, "Bracket Sim")
-dashboard_tabs.set_title(3, "Bracket Accuracy")
+dashboard_tabs.set_title(2, "Season Viz")
+dashboard_tabs.set_title(3, "Bracket Sim")
+dashboard_tabs.set_title(4, "Bracket Accuracy")
 
 
 def _maybe_load_bracket_cache(change):
@@ -11777,8 +9975,10 @@ def _maybe_load_bracket_cache(change):
     if change.get("new") == 1:
         _render_persisted_matchup_radar()
     elif change.get("new") == 2:
-        run_bracket_simulation(force_run=False)
+        _render_season_visualizations(force=False)
     elif change.get("new") == 3:
+        run_bracket_simulation(force_run=False)
+    elif change.get("new") == 4:
         _render_bracket_accuracy()
 
 
