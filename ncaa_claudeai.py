@@ -88,6 +88,7 @@ import xgboost as xgb
 import lightgbm as lgb
 import ipywidgets as widgets
 import plotly.io as pio
+from odds_api_client import fetch_odds
 
 from IPython.display import display, HTML, clear_output, Javascript
 from sklearn.impute import SimpleImputer
@@ -103,11 +104,18 @@ except Exception:
 
 DEV_MODE = str(os.environ.get("NCAABB_DEV_MODE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    
 # ============================================================
 # CELL 2: CONFIG All paths live here
 # ============================================================
 
-CURRENT_SEASON = 2026
+CURRENT_SEASON = int(os.environ.get("NCAABB_CURRENT_SEASON", "2026"))
 
 if IN_COLAB:
     BASE_DIR = "/content/drive/MyDrive/NCAABB"
@@ -5067,6 +5075,19 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
     outb = outb.drop(columns=[c for c in (rw_cols + prior_rw_cols) if c in outb.columns], errors="ignore")
 
     mkt = load_rotowire_all_for_date(slate_date_et, ROTOWIRE_DIR)
+    if mkt is None or len(mkt) == 0:
+        api = fetch_odds(
+            "basketball_ncaab",
+            pd.Timestamp(slate_date_et, tz="UTC"),
+            pd.Timestamp(slate_date_et, tz="UTC") + pd.Timedelta(days=1),
+        )
+        if not api.empty:
+            mkt = api.rename(columns={
+                "odds_api_away_ml": "rw_away_ml",
+                "odds_api_home_ml": "rw_home_ml",
+                "odds_api_spread_home": "rw_spread_home",
+                "odds_api_total": "rw_total",
+            })
     debug_date_key = str(pd.Timestamp(slate_date_et).date())
     debug_files = [os.path.basename(f) for f in find_rotowire_files_for_date(slate_date_et, ROTOWIRE_DIR)]
     target_key = "||".join(sorted([canonical_team("Howard Bison"), canonical_team("Michigan Wolverines")]))
@@ -5077,7 +5098,7 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
             "board_before_attach": [],
             "board_after_attach": [],
         }
-        outb["rw_missing_reason"] = "No RW odds in file"
+        outb["rw_missing_reason"] = "No Rotowire or Odds API odds"
         return outb
 
     b = outb.copy()
@@ -5232,7 +5253,7 @@ def _attach_rotowire_to_board(board: pd.DataFrame, slate_date_et) -> pd.DataFram
         label="has_rw_final",
         context="_attach_rotowire_to_board",
     )
-    merged["rw_missing_reason"] = np.where(has_rw, "", "No RW odds in file")
+    merged["rw_missing_reason"] = np.where(has_rw, "", "No Rotowire or Odds API odds")
     return merged
 
 

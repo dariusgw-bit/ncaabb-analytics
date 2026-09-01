@@ -1147,3 +1147,43 @@ body {
 
 .rankings-layout{display:grid;gap:18px}.rankings-list{display:grid;gap:10px}.ranking-row{display:grid;grid-template-columns:64px minmax(0,1fr) 90px 90px 90px;align-items:center;gap:18px;padding:14px 16px;border:1px solid rgba(142,160,255,.16);border-radius:14px;background:rgba(16,22,43,.28)}.ranking-number{font-size:22px;font-weight:800;color:#f5a623}.ranking-team{display:flex;align-items:center;gap:12px;min-width:0}.ranking-team strong,.ranking-team span{display:block}.ranking-team strong{font-size:17px}.ranking-team span{margin-top:3px;color:#9da9cd;font-size:13px}.ranking-team-logo{width:40px;height:40px;object-fit:contain;flex:0 0 auto}.ranking-record{font-weight:700;color:#eef2ff}.ranking-metrics{text-align:right}.ranking-streak{min-width:70px}.ranking-metrics span{display:block;color:#9da9cd;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.ranking-metrics strong{font-size:15px}.rankings-source{margin-top:16px;color:#8f9bc0;font-size:12px}
 @media (max-width:760px){.ranking-row{grid-template-columns:48px minmax(0,1fr) 72px;gap:10px}.ranking-metrics{display:none}.ranking-team-logo{width:34px;height:34px}.ranking-team strong{font-size:15px}}
+
+/* Mobile product pass: keep the analysis surface readable on phones. */
+@media (max-width: 720px) {
+  body { min-width: 320px; }
+  .dashboard-shell { display: block; }
+  .sidebar { min-height: auto; padding: 18px 16px 12px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand-block h1 { font-size: 26px; }
+  .brand-block p { display: none; }
+  .tab-nav { display: flex; gap: 8px; margin-top: 14px; overflow-x: auto; padding-bottom: 4px; }
+  .tab-button { flex: 0 0 auto; min-height: 42px; padding: 10px 13px; }
+  .canvas { padding: 16px; padding-bottom: 88px; }
+  .hero-grid, .prediction-hero-grid, .content-grid { grid-template-columns: 1fr; }
+  .panel { min-width: 0; }
+  .table-panel { overflow-x: auto; }
+  table { min-width: 620px; }
+}
+
+/* Shared mobile navigation */
+.mobile-nav { display: none; }
+@media (max-width: 720px) {
+  .mobile-nav { position: fixed; z-index: 20; left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 7px; border: 1px solid var(--line); border-radius: 18px; background: rgba(16, 19, 32, .94); backdrop-filter: blur(16px); box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+  .mobile-nav button { border: 0; background: transparent; color: #a9aaa2; min-height: 48px; border-radius: 12px; display: grid; place-items: center; gap: 2px; font-size: 10px; font-weight: 700; }
+  .mobile-nav button.active { color: #fff; background: rgba(245,166,35,.18); }
+  .mobile-nav-icon { font-size: 18px; line-height: 1; }
+}
+
+/* Real mobile More menu */
+.mobile-more-menu { display: none; }
+@media (max-width: 860px) {
+  .mobile-more-menu {
+    position: fixed; z-index: 21; left: 10px; right: 10px; bottom: 78px;
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+    padding: 10px; border: 1px solid rgba(148, 163, 184, .24); border-radius: 16px;
+    background: rgba(15, 23, 42, .97); box-shadow: 0 16px 40px rgba(2, 6, 23, .4);
+  }
+  .mobile-more-menu button {
+    min-height: 42px; border: 1px solid rgba(148, 163, 184, .2); border-radius: 10px;
+    background: rgba(30, 41, 59, .95); color: inherit; font: inherit; font-size: .8rem; font-weight: 700;
+  }
+}
