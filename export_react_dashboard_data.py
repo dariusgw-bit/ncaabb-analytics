@@ -16,6 +16,7 @@ HOME_AWAY_PATH = os.path.join(RAW_DIR, "derived", "home_away_records", f"mbb_hom
 TEAM_RANKINGS_PATH = os.path.join(RAW_DIR, "derived", "team_rankings", f"mbb_team_rankings_{CURRENT_SEASON}.parquet")
 OFFICIAL_RANKINGS_PATH = os.path.join(RAW_DIR, "rankings", "mbb_rankings.parquet")
 OUT_PATH = Path(__file__).parent / "dashboard-react" / "public" / "data" / f"season-dashboard-{CURRENT_SEASON}.json"
+STABLE_OUT_PATH = Path(__file__).parent / "dashboard-react" / "public" / "data" / "season-dashboard.json"
 
 
 def safe_hex(value, default="#f5a623"):
@@ -89,6 +90,8 @@ def build_games(team_box_df):
             games[col] = pd.to_numeric(games[col], errors="coerce")
     games["point_diff"] = pd.to_numeric(games.get("team_score"), errors="coerce") - pd.to_numeric(games.get("opponent_team_score"), errors="coerce")
     games["win"] = games["point_diff"].gt(0).fillna(False).astype(int)
+    if "game_id" not in games.columns:
+        games["game_id"] = games.index.astype(str)
     games = games.sort_values(["team_id", "game_dt_et", "game_id"], kind="stable").reset_index(drop=True)
     games["game_no"] = games.groupby("team_id").cumcount() + 1
     games["rolling_points_for"] = games.groupby("team_id")["team_score"].transform(lambda s: s.rolling(5, min_periods=1).mean())
@@ -562,6 +565,7 @@ def build_prediction_slates(schedule_df: pd.DataFrame, summary: pd.DataFrame) ->
         home_score = pd.to_numeric(pd.Series([row.get("home_score")]), errors="coerce").iloc[0]
         away_score = pd.to_numeric(pd.Series([row.get("away_score")]), errors="coerce").iloc[0]
         vegas_spread_home = pd.to_numeric(pd.Series([row.get("vegas_spread_home", row.get("rw_spread_home"))]), errors="coerce").iloc[0]
+        vegas_total = pd.to_numeric(pd.Series([row.get("vegas_total", row.get("rw_total"))]), errors="coerce").iloc[0]
         rows.append({
             "game_id": str(row.get("game_id") or f"{tip_dt.isoformat()}_{row['away_id']}_{row['home_id']}"),
             "slate_date": tip_dt.date().isoformat(),
@@ -575,6 +579,7 @@ def build_prediction_slates(schedule_df: pd.DataFrame, summary: pd.DataFrame) ->
             "pred_margin_display": f"{projection['pred_margin_home']:+.1f}",
             "model_line": projection["model_line"],
             "vegas_spread_home": None if pd.isna(vegas_spread_home) else float(vegas_spread_home),
+            "vegas_total": None if pd.isna(vegas_total) else float(vegas_total),
             "projected_home_score": projection["projected_home_score"],
             "projected_away_score": projection["projected_away_score"],
             "final_score": final_score,
@@ -730,8 +735,12 @@ def main():
       "prediction_default_date": prediction_default_date,
     }
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUT_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    serialized = json.dumps(payload, indent=2)
+    OUT_PATH.write_text(serialized, encoding="utf-8")
+    # Keep React on a season-neutral URL after each refreshed export.
+    STABLE_OUT_PATH.write_text(serialized, encoding="utf-8")
     print(f"Wrote dashboard JSON to {OUT_PATH}")
+    print(f"Updated stable dashboard JSON at {STABLE_OUT_PATH}")
 
 
 if __name__ == "__main__":
