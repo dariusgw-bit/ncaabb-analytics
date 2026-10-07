@@ -1,9 +1,15 @@
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
+
+COLLEGE_CODES_ROOT = os.environ.get("COLLEGE_CODES_ROOT", r"C:\Users\dariu\Documents\GitHub\combinations")
+if COLLEGE_CODES_ROOT not in sys.path:
+    sys.path.insert(0, COLLEGE_CODES_ROOT)
+from college_codes import resolve_club_code
 
 CURRENT_SEASON = int(os.environ.get("NCAABB_CURRENT_SEASON", "2026"))
 BASE_DIR = os.environ.get("NCAABB_BASE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "NCAABB")
@@ -573,6 +579,9 @@ def build_prediction_slates(schedule_df: pd.DataFrame, summary: pd.DataFrame) ->
             "tip_sort": tip_dt.isoformat(),
             "away_team": away_name,
             "home_team": home_name,
+            "away_club_cod": resolve_club_code(away_name),
+            "home_club_cod": resolve_club_code(home_name),
+            "Club_Cod": f"{resolve_club_code(away_name) or '?'} / {resolve_club_code(home_name) or '?'}",
             "winner_pick": projection["winner_pick"],
             "confidence": projection["confidence"],
             "pred_margin_home": projection["pred_margin_home"],

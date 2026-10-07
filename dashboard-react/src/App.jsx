@@ -522,6 +522,15 @@ function SelectionTokenInput({value="",onChange,options=[],placeholder="Select t
 function PicksView({picks,form,setForm,legs,setLegs,onAdd,onDelete,onGrade,selectionOptions=[]}){const graded=picks.filter(p=>p.result==="win"||p.result==="loss"),wins=graded.filter(p=>p.result==="win").length;const addLeg=()=>{if(!form.legSelection.trim())return;setLegs([...legs,{selection:form.legSelection.trim(),market:form.legMarket.trim(),odds:form.legOdds.trim()}]);setForm({...form,legSelection:"",legMarket:"",legOdds:""});};return <section className="picks-layout"><article className="panel prediction-summary-strip picks-summary"><div className="prediction-summary-item"><span>Total Picks</span><strong>{picks.length}</strong></div><div className="prediction-summary-item"><span>Graded</span><strong>{graded.length}</strong></div><div className="prediction-summary-item"><span>Wins</span><strong>{wins}</strong></div><div className="prediction-summary-item"><span>Win Rate</span><strong>{graded.length?String((wins/graded.length*100).toFixed(1))+"%":"--"}</strong></div></article><div className="picks-grid"><article className="panel pick-entry-panel"><div className="panel-label">Add Pick</div><div className="panel-title small">Track your picks or another capper</div><div className="form-grid"><label className="control"><span>Capper</span><input className="control-input" value={form.capper} onChange={e=>setForm({...form,capper:e.target.value})} placeholder="Me / capper name"/></label><label className="control"><span>Type</span><select value={form.type} onChange={e=>setForm({...form,type:e.target.value})}><option value="single">Single</option><option value="parlay">Parlay</option></select></label><label className="control"><span>Stake</span><input className="control-input" type="number" value={form.stake} onChange={e=>setForm({...form,stake:e.target.value})}/></label><label className="control"><span>Result</span><select value={form.result} onChange={e=>setForm({...form,result:e.target.value})}><option value="pending">Pending</option><option value="win">Win</option><option value="loss">Loss</option><option value="push">Push</option></select></label></div>{form.type==="single"?<div className="form-grid"><label className="control"><span>Selection</span><SelectionTokenInput value={form.selection} onChange={value=>setForm({...form,selection:value})} options={selectionOptions} placeholder="Select team or player"/></label><label className="control"><span>Market</span><input className="control-input" value={form.market} onChange={e=>setForm({...form,market:e.target.value})} placeholder="Spread, ML, total"/></label><label className="control"><span>Odds</span><input className="control-input" value={form.odds} onChange={e=>setForm({...form,odds:e.target.value})} placeholder="-110"/></label></div>:<div className="parlay-builder"><div className="form-grid"><label className="control"><span>Leg selection</span><SelectionTokenInput value={form.legSelection} onChange={value=>setForm({...form,legSelection:value})} options={selectionOptions} placeholder="Select team or player"/></label><label className="control"><span>Market</span><input className="control-input" value={form.legMarket} onChange={e=>setForm({...form,legMarket:e.target.value})}/></label><label className="control"><span>Odds</span><input className="control-input" value={form.legOdds} onChange={e=>setForm({...form,legOdds:e.target.value})}/></label><button type="button" className="secondary-button" onClick={addLeg}>Add Leg</button></div>{legs.length?<div className="leg-list">{legs.map((l,i)=><span className="leg-chip" key={l.selection+i}>{l.selection}{l.market?" - "+l.market:""}<button type="button" onClick={()=>setLegs(legs.filter((_,j)=>j!==i))}>x</button></span>)}</div>:<div className="token-hint">Add two or more legs to create a parlay.</div>}</div>}<div className="pick-form-actions"><button type="button" className="secondary-button" onClick={()=>{if(form.type!=="parlay"){setForm({...form,type:"parlay"});if(!legs.length&&form.selection.trim())setLegs([{selection:form.selection.trim(),market:form.market.trim(),odds:form.odds.trim()}]);}else{addLeg();}}}>+ Add parlay leg</button><button type="button" className="primary-button" onClick={onAdd}>Save {form.type==="parlay"?"Parlay":"Pick"}</button></div></article><article className="panel table-panel"><div className="panel-label">Pick Tracker</div><div className="panel-title small">Your board</div>{picks.length?<div className="pick-card-list">{picks.map(p=><div className="pick-card" key={p.id}><div><span className="pick-card-kicker">{p.capper||"Me"} - {p.type==="parlay"?p.legs.length+"-leg parlay":"Single"}</span>{p.type==="parlay"?<div className="pick-card-legs">{(p.legs||[]).map((leg,index)=><div className="pick-card-leg" key={leg.selection+index}><strong>{index+1}. {leg.selection}</strong><span>{leg.market||"Pick"}{leg.odds?" - "+leg.odds:""}</span></div>)}</div>:<><strong>{p.selection}</strong><span>{(p.market||"Pick")+(p.odds?" - "+p.odds:"")}</span></>}</div><div className="pick-card-right"><span className={"pick-result "+p.result}>{p.result}</span></div><div className="pick-card-actions"><span>Grade result:</span>{["win","loss","push"].map(result=><button type="button" className={p.result===result?"selected":""} key={result} onClick={()=>onGrade(p.id,result)}>{result[0].toUpperCase()+result.slice(1)}</button>)}<button type="button" className="delete-button" onClick={()=>onDelete(p.id)}>Delete</button></div></div>)}</div>:<div className="empty-state"><strong>No picks tracked yet.</strong><span>Add a single, capper pick, or multi-leg parlay above.</span></div>}</article></div></section>;}
 
 function App() {
+  useEffect(() => {
+    const exitDashboard = async () => { try { await fetch("/api/shutdown", { method: "POST", keepalive: true }); } catch {} window.close(); setTimeout(() => { document.body.innerHTML = "<main style='padding:3rem;font:16px system-ui'>Dashboard closed. You can close this tab.</main>"; }, 300); };
+    const button = document.createElement("button");
+    button.textContent = "Exit Dashboard";
+    button.style.cssText = "position:fixed;top:12px;right:12px;z-index:9999;padding:8px 12px;cursor:pointer";
+    button.onclick = exitDashboard;
+    document.body.appendChild(button);
+    return () => button.remove();
+  }, []);
   const [moreOpen, setMoreOpen] = useState(false);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -529,7 +538,7 @@ function App() {
   const [activeTab, setActiveTab] = useState("predictions");
   const [playerStats,setPlayerStats]=useState([]);const [careerStats,setCareerStats]=useState([]);const [careerStatsLoaded,setCareerStatsLoaded]=useState(false);const [careerLoading,setCareerLoading]=useState(false);const [expandedPlayerId,setExpandedPlayerId]=useState("");const [playerSearchTokens,setPlayerSearchTokens]=useState([]);const [playerSearchDraft,setPlayerSearchDraft]=useState("");
   const deferredPlayerSearchDraft=useDeferredValue(playerSearchDraft);
-  const [picks,setPicks]=useState(()=>{try{return JSON.parse(localStorage.getItem(PICKS_STORAGE_KEY)||"[]")}catch{return []}});const [parlayLegs,setParlayLegs]=useState([]);const [pickForm,setPickForm]=useState({capper:"Me",type:"single",selection:"",market:"",odds:"",stake:"1",result:"pending",legSelection:"",legMarket:"",legOdds:""});
+  const [picks,setPicks]=useState(()=>{try{return JSON.parse(localStorage.getItem(PICKS_STORAGE_KEY)||"[]")}catch{return []}});const [picksLoaded,setPicksLoaded]=useState(false);const [parlayLegs,setParlayLegs]=useState([]);const [pickForm,setPickForm]=useState({capper:"Me",type:"single",selection:"",market:"",odds:"",stake:"1",result:"pending",legSelection:"",legMarket:"",legOdds:""});
   const [predictionDate, setPredictionDate] = useState("");
   const [predictionSearch, setPredictionSearch] = useState("");
   const [conference, setConference] = useState("__all__");
@@ -537,6 +546,7 @@ function App() {
   const [seasonCompareId, setSeasonCompareId] = useState("__avg__");
   const [predictionOpponentId, setPredictionOpponentId] = useState("");
   const [seasonTrendMetric, setSeasonTrendMetric] = useState("offense");
+  const selectTab = (nextTab) => { setActiveTab(nextTab); setMoreOpen(false); };
 
   useEffect(() => {
     fetch(DATA_URL)
@@ -558,7 +568,8 @@ function App() {
       .finally(() => setLoading(false));
   }, []);
   useEffect(()=>{fetch(PLAYER_DATA_URL).then(r=>r.ok?r.json():[]).then(p=>setPlayerStats(Array.isArray(p)?p:p?.players||[])).catch(()=>setPlayerStats([]));},[]);
-  useEffect(()=>{localStorage.setItem(PICKS_STORAGE_KEY,JSON.stringify(picks));},[picks]);
+  useEffect(()=>{let active=true;fetch("/api/picks?t="+Date.now()).then(response=>response.ok?response.json():Promise.reject(new Error("Picks ledger unavailable"))).then(payload=>{if(!active)return;const browserPicks=JSON.parse(localStorage.getItem(PICKS_STORAGE_KEY)||"[]");const merged=new Map();for(const pick of [...(Array.isArray(payload.picks)?payload.picks:[]),...(Array.isArray(browserPicks)?browserPicks:[])])if(pick&&pick.id!=null)merged.set(String(pick.id),pick);const combined=[...merged.values()];localStorage.setItem(PICKS_STORAGE_KEY,JSON.stringify(combined));setPicks(combined);}).catch(()=>{}).finally(()=>{if(active)setPicksLoaded(true);});return()=>{active=false;};},[]);
+  useEffect(()=>{if(!picksLoaded)return;const serialized=JSON.stringify(picks);localStorage.setItem(PICKS_STORAGE_KEY,serialized);const timer=setTimeout(()=>{fetch("/api/picks",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({picks})}).catch(()=>{});},120);return()=>clearTimeout(timer);},[picks,picksLoaded]);
 
   const allTeams = data?.teams || [];
   const pickSelectionOptions=useMemo(()=>Array.from(new Set([...allTeams.map(team=>dropdownLabel(team)),...playerStats.map(player=>String(player.player_name||"").trim()).filter(Boolean)])).sort((a,b)=>a.localeCompare(b)),[allTeams,playerStats]);
@@ -794,8 +805,8 @@ function App() {
         </div>
 
         <div className="tab-nav">
-          <button className={activeTab === "predictions" ? "tab-button active" : "tab-button"} onClick={() => setActiveTab("predictions")}>Predictions</button>
-          <button className={activeTab === "matchup" ? "tab-button active" : "tab-button"} onClick={() => setActiveTab("matchup")}>Matchup</button><button className={activeTab === "players" ? "tab-button active" : "tab-button"} onClick={() => setActiveTab("players")}>Player Stats</button><button className={activeTab === "rankings" ? "tab-button active" : "tab-button"} onClick={() => setActiveTab("rankings")}>Rankings</button><button className={activeTab === "picks" ? "tab-button active" : "tab-button"} onClick={() => setActiveTab("picks")}>Picks</button>
+          <button type="button" className={activeTab === "predictions" ? "tab-button active" : "tab-button"} onClick={() => selectTab("predictions")}>Predictions</button>
+          <button type="button" className={activeTab === "matchup" ? "tab-button active" : "tab-button"} onClick={() => selectTab("matchup")}>Matchup</button><button type="button" className={activeTab === "players" ? "tab-button active" : "tab-button"} onClick={() => selectTab("players")}>Player Stats</button><button type="button" className={activeTab === "rankings" ? "tab-button active" : "tab-button"} onClick={() => selectTab("rankings")}>Rankings</button><button type="button" className={activeTab === "picks" ? "tab-button active" : "tab-button"} onClick={() => selectTab("picks")}>Picks</button>
         </div>
 
         {activeTab === "predictions" ? (
@@ -1136,17 +1147,17 @@ function App() {
         )}
       </main>
       <nav className="mobile-nav" aria-label="Mobile navigation">
-        <button className={activeTab === "predictions" ? "active" : ""} onClick={() => setActiveTab("predictions")}><span className="mobile-nav-icon">⌂</span><span>Home</span></button>
+        <button type="button" className={activeTab === "predictions" ? "active" : ""} onClick={() => selectTab("predictions")}><span className="mobile-nav-icon">⌂</span><span>Home</span></button>
         <button className={activeTab === "matchup" ? "active" : ""} onClick={() => setActiveTab("matchup")}><span className="mobile-nav-icon">↔</span><span>Matchup</span></button>
         <button className={activeTab === "players" ? "active" : ""} onClick={() => setActiveTab("players")}><span className="mobile-nav-icon">♙</span><span>Players</span></button>
-        <button className={activeTab === "picks" ? "active" : ""} onClick={() => setActiveTab("picks")}><span className="mobile-nav-icon">✓</span><span>Picks</span></button>
+        <button type="button" className={activeTab === "picks" ? "active" : ""} onClick={() => selectTab("picks")}><span className="mobile-nav-icon">✓</span><span>Picks</span></button>
         <button className={moreOpen ? "active" : ""} onClick={() => setMoreOpen((open) => !open)}><span className="mobile-nav-icon">⋯</span><span>More</span></button>
       </nav>
       {moreOpen && <div className="mobile-more-menu" role="menu" aria-label="More basketball views">
         <button role="menuitem" onClick={() => { setActiveTab("rankings"); setMoreOpen(false); }}>Rankings</button>
         <button role="menuitem" onClick={() => { setActiveTab("matchup"); setMoreOpen(false); }}>Team matchup</button>
         <button role="menuitem" onClick={() => { setActiveTab("players"); setMoreOpen(false); }}>Player stats</button>
-        <button role="menuitem" onClick={() => { setActiveTab("picks"); setMoreOpen(false); }}>Pick tracker</button>
+        <button type="button" role="menuitem" onClick={() => selectTab("picks")}>Pick tracker</button>
       </div>}
     </div>
   );

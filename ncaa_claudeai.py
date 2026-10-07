@@ -9,38 +9,13 @@ Original file is located at
 # MAIN CODE
 """
 
-# =========================================
-# INSTALL REQUIRED R PACKAGES (run once)
-# =========================================
-
-from rpy2.robjects import r
-
-r('''
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-
-if (!requireNamespace("hoopR", quietly = TRUE)) {
-    install.packages("hoopR")
-}
-
-if (!requireNamespace("dplyr", quietly = TRUE)) {
-    install.packages("dplyr")
-}
-
-suppressPackageStartupMessages({
-    library(hoopR)
-    library(dplyr)
-})
-''')
-
-print("hoopR installed and loaded")
-
 # -*- coding: utf-8 -*-
 """
 NCAA_BB_v3.py Self-Sufficient NCAABB Prediction Notebook
 ============================================================
 Improvements over v2:
   1. Auto-retraining scheduler (daily for current season data refresh,
-     weekly for full model refit) runs automatically on startup.
+     weekly for full model refit) is available for explicit/manual runs.
   2. Injury CSV import using same directory convention as odds CSVs.
   3. Injury impact features: roster-weighted minutes-lost score per team.
   4. Elo rating system: per-team Elo updated each game, fed into model.
@@ -104,6 +79,12 @@ except Exception:
 
 DEV_MODE = str(os.environ.get("NCAABB_DEV_MODE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
+# Opening the dashboard must not start a network refresh or import the
+# optional rpy2/hoopR stack.  Refreshes remain available through the explicit
+# Force Retrain control or by setting this flag to 1 for a deliberate startup
+# refresh.
+NCAABB_AUTO_REFRESH = str(os.environ.get("NCAABB_AUTO_REFRESH", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -138,6 +119,17 @@ OFFICIAL_RANKINGS_PATH = os.path.join(RAW_DIR, "rankings", "mbb_rankings.parquet
 # Retraining schedule
 RETRAIN_DATA_HOURS   = 24    # re-pull current-season data every 24h
 RETRAIN_MODEL_DAYS   = 7     # full model refit every 7 days
+
+# College basketball is normally inactive from the end of March through
+# October. During that window startup must not reach out for a new "current"
+# season or silently retrain. Set NCAABB_ALLOW_OFFSEASON_REFRESH=1 only when
+# intentionally testing a future-season feed.
+NCAABB_OFFSEASON_MONTHS = {4, 5, 6, 7, 8, 9, 10}
+NCAABB_ALLOW_OFFSEASON_REFRESH = str(os.environ.get("NCAABB_ALLOW_OFFSEASON_REFRESH", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ncaabb_offseason() -> bool:
+    return (not NCAABB_ALLOW_OFFSEASON_REFRESH) and datetime.now().month in NCAABB_OFFSEASON_MONTHS
 
 HIST_SEASONS    = list(range(2020, CURRENT_SEASON + 1))
 ROLL_WINDOW     = 10          # games for rolling stats
@@ -3780,7 +3772,6 @@ def load_models(model_dir: str):
 # !pip -q install rpy2 pyarrow pandas
 
 import os
-from rpy2.robjects import r
 
 def run_hoopr_refresh(
     raw_dir: str,
@@ -4514,13 +4505,19 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     )
     _dashboard_log("retrain_check", status="start", force_data=bool(force_data), force_model=bool(force_model))
 
-    need_data = force_data or _hours_since(meta.get("last_data_refresh")) >= RETRAIN_DATA_HOURS
-    need_model = force_model or _days_since(meta.get("last_model_fit")) >= RETRAIN_MODEL_DAYS
+    offseason = ncaabb_offseason()
+    # Startup should load the cached data/models without reaching out to
+    # hoopR or retraining. Explicit force actions still bypass this guard.
+    need_data = force_data or (NCAABB_AUTO_REFRESH and (not offseason) and _hours_since(meta.get("last_data_refresh")) >= RETRAIN_DATA_HOURS)
+    need_model = force_model or (NCAABB_AUTO_REFRESH and (not offseason) and _days_since(meta.get("last_model_fit")) >= RETRAIN_MODEL_DAYS)
     training_rows = 0
     injury_cols_in_dataset = []
     injury_cols_in_features = []
 
-    if need_data:
+    if offseason and not force_data:
+        print("OFFSEASON MODE\nAutomatic current-season data refresh disabled. Using the latest completed season on disk.")
+        meta["last_data_refresh_action"] = "skipped_offseason"
+    elif need_data:
         print(f"DATA REFRESH\nTriggered (last: {meta.get('last_data_refresh', 'never')})")
 
         run_hoopr_refresh(
@@ -4574,7 +4571,9 @@ def check_and_retrain(force_data: bool = False, force_model: bool = False):
     if "_refresh_season_viz_options" in globals():
         _refresh_season_viz_options(force=True)
 
-    if not force_model and need_model:
+    if offseason and not force_model:
+        meta["last_model_refresh_action"] = "skipped_offseason"
+    if force_model or (need_model and not offseason):
         saved_training_sig = meta.get("training_input_signature")
         model_paths = [
             os.path.join(MODEL_DIR, "spread_booster.json"),
@@ -5738,8 +5737,6 @@ def attach_actual_scores_from_team_box(board: pd.DataFrame, team_box_df: pd.Data
 #   - dedupes scoreboard / fresh games cleanly
 # ============================================================
 
-from rpy2.robjects import r
-import rpy2.rinterface_lib.callbacks as rcb
 from contextlib import contextmanager
 
 
@@ -5748,6 +5745,8 @@ def suppress_r_console():
     """
     Temporarily suppress R console output forwarded through rpy2.
     """
+    import rpy2.rinterface_lib.callbacks as rcb
+
     old_print = rcb.consolewrite_print
     old_warn = rcb.consolewrite_warnerror
     rcb.consolewrite_print = lambda x: None

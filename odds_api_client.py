@@ -62,6 +62,26 @@ def fetch_odds(sport, start=None, end=None):
     cache_key = (sport, str(start), str(end))
     if cache_key in _CACHE:
         return _CACHE[cache_key].copy()
+
+    # This account is limited to today's odds.  Do not send historical or
+    # future slate windows to the provider; historical boards use Rotowire.
+    today_et = pd.Timestamp.now(tz="America/New_York").date()
+    start_ts = pd.Timestamp(start) if start is not None else None
+    end_ts = pd.Timestamp(end) if end is not None else None
+    for name, value in (("start", start_ts), ("end", end_ts)):
+        if value is None:
+            continue
+        value = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+        if name == "start":
+            start_ts = value.tz_convert("America/New_York")
+        else:
+            end_ts = value.tz_convert("America/New_York")
+    if ((start_ts is not None and start_ts.date() > today_et)
+            or (end_ts is not None and end_ts.date() < today_et)):
+        empty = pd.DataFrame()
+        _CACHE[cache_key] = empty
+        return empty.copy()
+
     params = {
         "apiKey": api_key, "regions": os.environ.get("ODDS_API_REGIONS", "us"),
         "markets": os.environ.get("ODDS_API_MARKETS", "h2h,spreads,totals"),
